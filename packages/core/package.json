@@ -1,0 +1,9 @@
+{
+  "name": "@pulsecortex/core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "dependencies": { "@pulsecortex/domain": "workspace:*", "@pulsecortex/persistence": "workspace:*", "pino": "9.9.4" }
+}

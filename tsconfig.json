@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/domain" },
+    { "path": "packages/config" },
+    { "path": "packages/persistence" },
+    { "path": "packages/codex-driver" },
+    { "path": "packages/feishu-adapter" },
+    { "path": "packages/core" },
+    { "path": "packages/installer" },
+    { "path": "packages/daemon" },
+    { "path": "packages/cli" }
+  ]
+}

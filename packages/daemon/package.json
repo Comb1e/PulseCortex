@@ -1,0 +1,15 @@
+{
+  "name": "@pulsecortex/daemon",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/main.js",
+  "dependencies": {
+    "@pulsecortex/codex-driver": "workspace:*",
+    "@pulsecortex/config": "workspace:*",
+    "@pulsecortex/core": "workspace:*",
+    "@pulsecortex/domain": "workspace:*",
+    "@pulsecortex/feishu-adapter": "workspace:*",
+    "@pulsecortex/persistence": "workspace:*",
+    "pino": "9.9.4"
+  }
+}

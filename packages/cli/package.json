@@ -1,0 +1,15 @@
+{
+  "name": "@pulsecortex/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/main.js",
+  "bin": { "pulsectl": "dist/main.js" },
+  "dependencies": {
+    "@pulsecortex/codex-driver": "workspace:*",
+    "@pulsecortex/config": "workspace:*",
+    "@pulsecortex/domain": "workspace:*",
+    "@pulsecortex/installer": "workspace:*",
+    "@pulsecortex/persistence": "workspace:*",
+    "commander": "14.0.2"
+  }
+}
