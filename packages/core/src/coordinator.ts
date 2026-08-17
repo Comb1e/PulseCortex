@@ -5,6 +5,7 @@ import {
   redact,
   type AgentDriver,
   type AgentEvent,
+  type ApprovalResolutionView,
   type ApprovalView,
   type ChannelAction,
   type ChannelCommand,
@@ -40,42 +41,61 @@ interface RuntimeTurn {
   phase: TurnPhase;
   startedAt: number;
   safeSummary: string;
+  replies: Array<{ id: string; text: string }>;
   recentCommands: string[];
   diff: string;
   changedFileCount: number;
   testSummary: string;
   statusRef: MessageRef | null;
   actionTokens: SessionView["actionTokens"];
-  pendingApproval?: { id: string; kind: ApprovalView["kind"]; summary: string };
+  pendingApproval?: { id: string; kind: ApprovalView["kind"]; summary: string; ref?: MessageRef };
   pendingInput?: PendingInputState;
   dirty: boolean;
 }
 
-type DeliveryKind = "text" | "status" | "status.update" | "approval" | "result" | "choices" | "question" | "output";
+interface ProjectSession {
+  session: StoredSession;
+  project: Project;
+  updatedAt: number;
+}
+
+interface SessionRefreshResult {
+  newlyControllable: ProjectSession[];
+  newlyUncontrollable: ProjectSession[];
+}
+
+type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "result" | "choices" | "question" | "output";
+const SESSION_DISCOVERY_INTERVAL_MS = 2_000;
 
 const HELP = `PulseCortex commands:
 /projects - choose a locally registered project
-/new <project> [task] - create a bot-owned Codex session
-/sessions - list bot-created sessions
+/new [task] - create a Codex session in the chosen project (or use /new <project> [task])
+/sessions - discover and select allowlisted Codex sessions
 /resume [session-id] - resume a session
+/send <message> - message the selected session
 /send <session-id> <message> - message a specific session
-/status - show the active turn
-/stop - interrupt the active turn
+/status - show the selected session's active turn
+/stop - interrupt the selected session's active turn
 /logs - show bounded command output
 /diff - show the current unified diff
 /help - show this help
 
-Ordinary direct messages start work or steer the active turn.`;
+Ordinary direct messages start work or steer the selected session.`;
 
 export class SessionCoordinator {
-  private runtime: RuntimeTurn | null = null;
+  private readonly runtimes = new Map<string, RuntimeTurn>();
+  private controllableSessions = new Map<string, ProjectSession>();
+  private uncontrollableSessions = new Map<string, ProjectSession>();
   private selectedSession: StoredSession | null = null;
   private pendingPrompt: string | null = null;
   private readonly tokens: ActionTokenService;
   private readonly redactions: RegExp[];
   private readonly statusTimer: NodeJS.Timeout;
   private readonly deliveryTimer: NodeJS.Timeout;
-  private statusFlush: Promise<void> | null = null;
+  private readonly discoveryTimer: NodeJS.Timeout;
+  private readonly statusFlushes = new Map<string, Promise<void>>();
+  private sessionRefresh: Promise<SessionRefreshResult> | null = null;
+  private initialization: Promise<void> | null = null;
   private driverRestart: Promise<void> | null = null;
   private stopped = false;
 
@@ -93,17 +113,51 @@ export class SessionCoordinator {
     this.messaging.onCommand(async (command) => this.handleCommand(command));
     this.messaging.onAction(async (action) => this.handleAction(action));
     this.driver.subscribe((event) => { void this.handleAgentEvent(event).catch((error) => this.logger.error({ err: error }, "agent event handling failed")); });
-    this.statusTimer = setInterval(() => { void this.flushStatus(); }, options.statusUpdateIntervalMs);
+    this.statusTimer = setInterval(() => { void this.flushStatuses(); }, options.statusUpdateIntervalMs);
     this.statusTimer.unref();
     this.deliveryTimer = setInterval(() => { void this.flushDeliveries(); }, 5_000);
     this.deliveryTimer.unref();
+    this.discoveryTimer = setInterval(() => {
+      void this.syncRunningSessions().catch((error) => this.logger.warn({ errorMessage: redact((error as Error).message, this.redactions) }, "Running Codex discovery failed"));
+    }, SESSION_DISCOVERY_INTERVAL_MS);
+    this.discoveryTimer.unref();
+  }
+
+  async initialize(): Promise<void> {
+    if (this.initialization) return this.initialization;
+    const operation = this.syncRunningSessions();
+    this.initialization = operation;
+    try { await operation; }
+    catch (error) { this.initialization = null; throw error; }
+  }
+
+  async syncRunningSessions(): Promise<void> {
+    const { newlyControllable, newlyUncontrollable } = await this.refreshSessions();
+    if (newlyControllable.length) {
+      if (newlyControllable.length === 1) {
+        const running = newlyControllable[0]!;
+        this.selectedSession = running.session;
+        const message = runningSessionSelectedMessage(running);
+        await this.safeSend("text", message, () => this.messaging.sendText(message));
+      } else {
+        const message = `Detected ${newlyControllable.length} controllable Codex sessions in registered projects. Use /sessions to choose the default.`;
+        await this.safeSend("text", message, () => this.messaging.sendText(message));
+      }
+    }
+    if (newlyUncontrollable.length) {
+      const message = newlyUncontrollable.length === 1
+        ? standaloneSessionMessage(newlyUncontrollable[0]!)
+        : `Detected ${newlyUncontrollable.length} active Codex sessions in registered projects, but they were launched outside the PulseCortex shared app-server and cannot receive Feishu messages. Close them and relaunch with pnpm pulsectl codex or install the PulseCortex shell integration.`;
+      await this.safeSend("text", message, () => this.messaging.sendText(message));
+    }
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
     clearInterval(this.statusTimer);
     clearInterval(this.deliveryTimer);
-    await this.statusFlush;
+    clearInterval(this.discoveryTimer);
+    await Promise.all(this.statusFlushes.values());
   }
 
   async handleCommand(command: ChannelCommand): Promise<void> {
@@ -119,8 +173,8 @@ export class SessionCoordinator {
       case "send": await this.handleSend(command); break;
       case "status": await this.handleStatus(); break;
       case "stop": await this.stopActiveTurn("command"); break;
-      case "logs": await this.sendPagedOutput("logs.show", this.runtime?.session.id ?? this.selectedSession?.id, 1); break;
-      case "diff": await this.sendPagedOutput("diff.show", this.runtime?.session.id ?? this.selectedSession?.id, 1); break;
+      case "logs": await this.sendPagedOutput("logs.show", this.selectedSession?.id, 1); break;
+      case "diff": await this.sendPagedOutput("diff.show", this.selectedSession?.id, 1); break;
       case "help": await this.safeSend("text", HELP, () => this.messaging.sendText(HELP)); break;
       case "unknown": await this.safeSend("text", "Unknown command. Use /help.", () => this.messaging.sendText("Unknown command. Use /help.")); break;
       case "text": await this.handleText(command.text); break;
@@ -143,6 +197,7 @@ export class SessionCoordinator {
       case "session.select": await this.resumeStoredSession(record.requestId); break;
       case "session.continue": await this.resumeStoredSession(record.sessionId); break;
       case "task.new": await this.sendProjectChoices(); break;
+      case "sessions.more": await this.sendSessionChoices(Number(record.payload["page"] ?? 1), false); break;
       case "input.answer": await this.answerStructuredInput(record); break;
     }
   }
@@ -172,36 +227,40 @@ export class SessionCoordinator {
   }
 
   private async handleNew(args: string[]): Promise<void> {
-    if (this.runtime && isActiveState(this.runtime.phase)) { await this.messaging.sendText("A turn is already active. Send text to steer it or use /stop."); return; }
-    const projectName = args[0];
-    if (!projectName) { await this.sendProjectChoices(); return; }
-    const project = this.store.getProject(projectName);
-    if (!project) { await this.messaging.sendText(`Unknown project '${redact(projectName)}'. Use /projects.`); return; }
-    const prompt = args.slice(1).join(" ").trim();
+    const firstArg = args[0]?.trim();
+    const explicitlyNamedProject = firstArg ? this.store.getProject(firstArg) : null;
+    const project = explicitlyNamedProject ?? this.selectedProject();
+    if (!project) {
+      if (!firstArg) { await this.sendProjectChoices(); return; }
+      await this.messaging.sendText(`Unknown project '${redact(firstArg)}'. Use /projects.`);
+      return;
+    }
+    const prompt = (explicitlyNamedProject ? args.slice(1) : args).join(" ").trim();
     await this.createSelectedSession(project, prompt || null);
   }
 
   private async handleResume(id?: string): Promise<void> {
-    if (this.runtime && isActiveState(this.runtime.phase)) { await this.messaging.sendText("Stop the active turn before resuming another session."); return; }
     if (!id) { await this.sendSessionChoices(); return; }
     await this.resumeStoredSession(id);
   }
 
   private async handleSend(command: ChannelCommand): Promise<void> {
-    const addressedMessage = command.text.match(/^\/\S+\s+(\S+)\s+([\s\S]+)$/u);
-    const sessionId = addressedMessage?.[1];
-    const text = addressedMessage?.[2]?.trim() ?? "";
-    if (!sessionId || !text) { await this.messaging.sendText("Usage: /send <session-id> <message>"); return; }
-    const session = this.store.getSession(sessionId);
-    if (!session) { await this.messaging.sendText("That session is unavailable or was not created by this bot."); return; }
-    if (this.runtime) {
-      if (this.runtime.session.id !== session.id) {
-        await this.messaging.sendText(`Another session has the active turn (${this.runtime.session.id}). Use /stop before messaging ${session.id}.`);
-        return;
-      }
-      if (this.runtime.pendingInput) { await this.answerFreeformInput(text); return; }
-      if (!isActiveState(this.runtime.phase)) { await this.messaging.sendText("That turn is finishing. Try again shortly."); return; }
-      await this.steerRuntime(text, `Message sent to ${session.id}.`);
+    const body = command.text.match(/^\/\S+(?:\s+([\s\S]*))?$/u)?.[1]?.trim() ?? "";
+    if (!body) { await this.messaging.sendText("Usage: /send <message> or /send <session-id> <message>"); return; }
+    await this.refreshSessions();
+    this.selectSoleControllableSession();
+    const addressedMessage = body.match(/^(\S+)\s+([\s\S]+)$/u);
+    const addressedSession = addressedMessage ? this.store.getSession(addressedMessage[1]!) : null;
+    const selectedRuntime = this.selectedRuntime();
+    const session = addressedSession ?? (this.selectedSession ? this.store.getSession(this.selectedSession.id) : null) ?? selectedRuntime?.session ?? null;
+    const text = addressedSession ? addressedMessage![2]!.trim() : body;
+    if (!session) { await this.messaging.sendText("No session selected. Use /sessions, /projects, or /send <session-id> <message>."); return; }
+    const runtime = this.runtimes.get(session.id);
+    if (runtime) {
+      this.selectedSession = runtime.session;
+      if (runtime.pendingInput) { await this.answerFreeformInput(runtime, text); return; }
+      if (!isActiveState(runtime.phase)) { await this.messaging.sendText("That turn is finishing. Try again shortly."); return; }
+      await this.steerRuntime(runtime, text, `Message sent to ${session.id}.`);
       return;
     }
     this.selectedSession = session;
@@ -209,9 +268,10 @@ export class SessionCoordinator {
   }
 
   private async handleStatus(): Promise<void> {
-    if (this.runtime) {
-      const view = this.makeStatusView(this.runtime);
-      await this.safeSend("status", view, async () => { this.runtime!.statusRef = await this.messaging.sendStatus(view); }, view, `turn:${view.turnId}:status`);
+    const runtime = this.selectedRuntime();
+    if (runtime) {
+      const view = this.makeStatusView(runtime);
+      await this.safeSend("status", view, async () => { runtime.statusRef = await this.messaging.sendStatus(view); }, view, `turn:${view.turnId}:status`);
       return;
     }
     const session = this.selectedSession ?? this.store.listSessions(1)[0];
@@ -221,21 +281,30 @@ export class SessionCoordinator {
 
   private async handleText(text: string): Promise<void> {
     if (!text.trim()) return;
-    if (this.runtime?.pendingInput) { await this.answerFreeformInput(text); return; }
-    if (this.runtime && isActiveState(this.runtime.phase)) {
-      await this.steerRuntime(text, "Steering update sent.");
+    await this.refreshSessions();
+    this.selectSoleControllableSession();
+    const runtime = this.selectedRuntime();
+    if (runtime?.pendingInput) { await this.answerFreeformInput(runtime, text); return; }
+    if (runtime && isActiveState(runtime.phase)) {
+      await this.steerRuntime(runtime, text, "Steering update sent.");
       return;
     }
-    if (this.selectedSession) { await this.startTurn(this.selectedSession, text); return; }
+    if (this.selectedSession) {
+      const selectedId = this.selectedSession.id;
+      const liveRuntime = this.runtimes.get(selectedId);
+      if (liveRuntime?.pendingInput) { await this.answerFreeformInput(liveRuntime, text); return; }
+      if (liveRuntime && isActiveState(liveRuntime.phase)) { await this.steerRuntime(liveRuntime, text, "Steering update sent."); return; }
+      const refreshed = this.store.getSession(selectedId);
+      if (refreshed) { this.selectedSession = refreshed; await this.startTurn(refreshed, text); return; }
+      this.selectedSession = null;
+    }
     const projects = this.store.listProjects();
     if (projects.length === 1) { await this.createSelectedSession(projects[0]!, text); return; }
     this.pendingPrompt = text;
     await this.sendProjectChoices("Choose the project for this task.");
   }
 
-  private async steerRuntime(text: string, acknowledgement: string): Promise<void> {
-    const runtime = this.runtime;
-    if (!runtime) return;
+  private async steerRuntime(runtime: RuntimeTurn, text: string, acknowledgement: string): Promise<void> {
     await this.driver.steerTurn(runtime.session.id, text);
     this.store.audit({ eventType: "turn.steered", summary: "Owner steered active turn", sessionId: runtime.session.id, turnId: runtime.turnId, sensitiveData: text });
     await this.messaging.sendText(acknowledgement);
@@ -251,38 +320,30 @@ export class SessionCoordinator {
   }
 
   private async startTurn(session: StoredSession, prompt: string): Promise<void> {
+    if (this.runtimes.has(session.id)) throw new Error("This session already has an active turn");
     const project = this.store.getProject(session.projectId);
     if (!project) throw new Error("Session project is no longer registered");
-    await this.driver.resumeSession(session.id, project).catch((error: unknown) => {
-      if (!String((error as Error).message).includes("already")) throw error;
-    });
+    await this.driver.resumeSession(session.id, project);
     const turnId = await this.driver.startTurn(session.id, prompt);
     this.store.createTurn({ id: turnId, sessionId: session.id, prompt });
-    const expiresAt = Date.now() + 14 * 86_400_000;
-    this.runtime = {
-      session: { ...session, lastTurnId: turnId, state: "starting", updatedAt: Date.now() }, project, turnId, phase: "starting", startedAt: Date.now(), safeSummary: "Codex is starting...", recentCommands: [], diff: "", changedFileCount: 0, testSummary: "", statusRef: null,
-      actionTokens: {
-        stop: this.issue("turn.stop", session.id, turnId, turnId, expiresAt, {}),
-        logs: this.issue("logs.show", session.id, turnId, turnId, expiresAt, { page: 1 }),
-        diff: this.issue("diff.show", session.id, turnId, turnId, expiresAt, { page: 1 }),
-      },
-      dirty: true,
-    };
-    const view = this.makeStatusView(this.runtime);
-    await this.safeSend("status", view, async () => { if (this.runtime?.turnId === turnId) this.runtime.statusRef = await this.messaging.sendStatus(view); }, view, `turn:${turnId}:status`);
+    const runtime = this.makeRuntime(session, project, turnId, "starting", Date.now(), "Codex is starting...");
+    this.runtimes.set(session.id, runtime);
+    this.selectedSession = runtime.session;
+    const view = this.makeStatusView(runtime);
+    await this.safeSend("status", view, async () => { if (this.runtimes.get(session.id)?.turnId === turnId) runtime.statusRef = await this.messaging.sendStatus(view); }, view, `turn:${turnId}:status`);
   }
 
   private async handleAgentEvent(event: AgentEvent): Promise<void> {
     if (event.type === "driver.crashed") {
-      if (this.runtime) await this.failRuntime(`Codex app-server crashed: ${event.error}`);
+      for (const runtime of [...this.runtimes.values()]) await this.failRuntime(runtime, `Codex app-server crashed: ${event.error}`);
       void this.restartDriver();
       return;
     }
-    const runtime = this.runtime;
+    const runtime = this.runtimes.get(event.sessionId);
     if (!runtime || event.sessionId !== runtime.session.id || event.turnId !== runtime.turnId) return;
     switch (event.type) {
-      case "turn.started": runtime.phase = "working"; runtime.safeSummary = "Codex is working..."; runtime.dirty = true; this.store.updateTurn(runtime.turnId, { state: "working" }); await this.flushStatus(true); break;
-      case "agent.message.delta": runtime.safeSummary = redact(`${runtime.safeSummary}${event.delta}`, this.redactions).slice(-1_500); runtime.dirty = true; break;
+      case "turn.started": runtime.phase = "working"; runtime.safeSummary = "Codex is working..."; runtime.dirty = true; this.store.updateTurn(runtime.turnId, { state: "working" }); await this.flushStatus(runtime.session.id, true); break;
+      case "agent.message.delta": this.appendReply(runtime, event.messageId ?? "default", event.delta); runtime.dirty = true; break;
       case "command.started": runtime.recentCommands = [...runtime.recentCommands.slice(-4), event.command]; runtime.phase = "working"; runtime.dirty = true; break;
       case "command.completed": {
         const command = runtime.recentCommands.at(-1) ?? "";
@@ -292,8 +353,8 @@ export class SessionCoordinator {
       case "approval.requested": await this.handleApprovalEvent(runtime, event); break;
       case "input.requested": await this.handleInputEvent(runtime, event); break;
       case "diff.updated": runtime.diff = redact(event.diff, this.redactions); runtime.changedFileCount = countChangedFiles(runtime.diff); runtime.dirty = true; break;
-      case "turn.completed": await this.completeRuntime(event.status); break;
-      case "turn.failed": await this.failRuntime(event.error); break;
+      case "turn.completed": await this.completeRuntime(runtime, event.status); break;
+      case "turn.failed": await this.failRuntime(runtime, event.error); break;
     }
   }
 
@@ -315,21 +376,26 @@ export class SessionCoordinator {
         cancel: this.issueForOwner(owner, "turn.stop", runtime.session.id, runtime.turnId, event.approvalId, expiresAt, { approvalId: event.approvalId }),
       }, expiresAt,
     };
-    await this.safeSend("approval", view, () => this.messaging.sendApproval(view).then(() => undefined));
-    await this.flushStatus(true);
+    await this.safeSend("approval", view, async () => {
+      const ref = await this.messaging.sendApproval(view);
+      if (runtime.pendingApproval?.id === event.approvalId) runtime.pendingApproval.ref = ref;
+    });
+    await this.flushStatus(runtime.session.id, true);
   }
 
   private async resolveApproval(record: InteractionRecord, decision: "accept" | "decline", actor: { tenantId: string; userId: string }): Promise<void> {
-    const runtime = this.runtime;
+    const runtime = this.runtimes.get(record.sessionId);
     if (!runtime || record.sessionId !== runtime.session.id || record.turnId !== runtime.turnId || runtime.pendingApproval?.id !== record.requestId) return;
+    const pending = runtime.pendingApproval;
     await this.driver.resolveApproval(record.requestId, decision);
+    await this.resolveApprovalCard(pending, decision);
     delete runtime.pendingApproval;
     runtime.phase = "working";
     runtime.safeSummary = decision === "accept" ? "Approval granted once. Codex is continuing..." : "Request denied. Codex is continuing...";
     runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "working" });
     this.store.audit({ eventType: "approval.decided", summary: decision, actor, sessionId: runtime.session.id, turnId: runtime.turnId });
-    await this.flushStatus(true);
+    await this.flushStatus(runtime.session.id, true);
   }
 
   private async handleInputEvent(runtime: RuntimeTurn, event: Extract<AgentEvent, { type: "input.requested" }>): Promise<void> {
@@ -347,78 +413,82 @@ export class SessionCoordinator {
       };
       await this.safeSend("question", view, () => this.messaging.sendQuestion(view));
     }
-    await this.flushStatus(true);
+    await this.flushStatus(runtime.session.id, true);
   }
 
   private async answerStructuredInput(record: InteractionRecord): Promise<void> {
-    const pending = this.runtime?.pendingInput;
-    if (!this.runtime || !pending || pending.requestId !== record.requestId) return;
+    const runtime = this.runtimes.get(record.sessionId);
+    const pending = runtime?.pendingInput;
+    if (!runtime || !pending || pending.requestId !== record.requestId) return;
     const questionId = String(record.payload["questionId"] ?? "");
     const answer = String(record.payload["answer"] ?? "");
     if (!pending.questions.some((question) => question.id === questionId)) return;
     pending.answers[questionId] = answer;
-    await this.finishInputIfComplete();
+    await this.finishInputIfComplete(runtime);
   }
 
-  private async answerFreeformInput(text: string): Promise<void> {
-    const pending = this.runtime?.pendingInput;
+  private async answerFreeformInput(runtime: RuntimeTurn, text: string): Promise<void> {
+    const pending = runtime.pendingInput;
     if (!pending) return;
     const question = pending.questions.find((item) => !(item.id in pending.answers) && item.allowFreeform);
     if (!question) { await this.messaging.sendText("Please use one of the answer buttons on the question card."); return; }
     pending.answers[question.id] = text;
-    await this.finishInputIfComplete();
+    await this.finishInputIfComplete(runtime);
   }
 
-  private async finishInputIfComplete(): Promise<void> {
-    const runtime = this.runtime; const pending = runtime?.pendingInput;
-    if (!runtime || !pending || pending.questions.some((question) => !(question.id in pending.answers))) return;
+  private async finishInputIfComplete(runtime: RuntimeTurn): Promise<void> {
+    const pending = runtime.pendingInput;
+    if (!pending || pending.questions.some((question) => !(question.id in pending.answers))) return;
     await this.driver.resolveInput(pending.requestId, pending.answers);
     this.store.audit({ eventType: "input.answered", summary: `${pending.questions.length} agent question(s) answered`, sessionId: runtime.session.id, turnId: runtime.turnId });
     delete runtime.pendingInput; runtime.phase = "working"; runtime.safeSummary = "Answer sent. Codex is continuing..."; runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "working" });
-    await this.flushStatus(true);
+    await this.flushStatus(runtime.session.id, true);
   }
 
   private async stopActiveTurn(source: string, record?: InteractionRecord): Promise<void> {
-    const runtime = this.runtime;
+    const runtime = record ? this.runtimes.get(record.sessionId) : this.selectedRuntime();
     if (!runtime || !isActiveState(runtime.phase)) { await this.messaging.sendText("No active turn to stop."); return; }
     if (record && (record.sessionId !== runtime.session.id || record.turnId !== runtime.turnId)) return;
     runtime.phase = "stopping"; runtime.safeSummary = "Stopping Codex..."; runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "stopping" });
-    if (runtime.pendingApproval) await this.driver.resolveApproval(runtime.pendingApproval.id, "cancel").catch(() => undefined);
+    if (runtime.pendingApproval) {
+      const pending = runtime.pendingApproval;
+      await this.driver.resolveApproval(pending.id, "cancel").catch(() => undefined);
+      await this.resolveApprovalCard(pending, "cancel");
+      delete runtime.pendingApproval;
+    }
     await this.driver.interruptTurn(runtime.session.id);
     this.store.audit({ eventType: "turn.stopped", summary: `Stop requested from ${source}`, sessionId: runtime.session.id, turnId: runtime.turnId });
-    await this.flushStatus(true);
+    await this.flushStatus(runtime.session.id, true);
   }
 
-  private async completeRuntime(status: "completed" | "stopped"): Promise<void> {
-    const runtime = this.runtime; if (!runtime) return;
+  private async completeRuntime(runtime: RuntimeTurn, status: "completed" | "stopped"): Promise<void> {
     runtime.phase = "completed"; runtime.safeSummary ||= status === "stopped" ? "Turn stopped." : "Turn completed."; runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "completed", safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary, completed: true });
     this.store.addMilestone(runtime.session.id, runtime.turnId, "turn.completed", { status, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary });
     this.store.audit({ eventType: "turn.completed", summary: status, sessionId: runtime.session.id, turnId: runtime.turnId });
-    await this.flushStatus(true);
+    await this.flushStatus(runtime.session.id, true);
     await this.sendResult(runtime, status === "stopped" ? "stopped" : "completed");
-    this.selectedSession = { ...runtime.session, state: "completed", lastTurnId: runtime.turnId, updatedAt: Date.now() };
-    this.runtime = null;
+    if (this.selectedSession?.id === runtime.session.id) this.selectedSession = { ...runtime.session, state: "completed", lastTurnId: runtime.turnId, updatedAt: Date.now() };
+    this.runtimes.delete(runtime.session.id);
   }
 
-  private async failRuntime(error: string): Promise<void> {
-    const runtime = this.runtime; if (!runtime) return;
+  private async failRuntime(runtime: RuntimeTurn, error: string): Promise<void> {
     runtime.phase = "failed"; runtime.safeSummary = redact(error, this.redactions).slice(0, 1_500); runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "failed", safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary, completed: true });
     this.store.addMilestone(runtime.session.id, runtime.turnId, "turn.failed", { error: runtime.safeSummary });
     this.store.audit({ eventType: "turn.failed", summary: runtime.safeSummary, sessionId: runtime.session.id, turnId: runtime.turnId });
-    await this.flushStatus(true);
+    await this.flushStatus(runtime.session.id, true);
     await this.sendResult(runtime, "failed");
-    this.selectedSession = { ...runtime.session, state: "failed", lastTurnId: runtime.turnId, updatedAt: Date.now() };
-    this.runtime = null;
+    if (this.selectedSession?.id === runtime.session.id) this.selectedSession = { ...runtime.session, state: "failed", lastTurnId: runtime.turnId, updatedAt: Date.now() };
+    this.runtimes.delete(runtime.session.id);
   }
 
   private async sendResult(runtime: RuntimeTurn, status: TurnResultView["status"]): Promise<void> {
     const expiresAt = Date.now() + 14 * 86_400_000;
     const view: TurnResultView = {
-      sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, status, summary: runtime.safeSummary, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary,
+      sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, status, summary: status === "failed" ? runtime.safeSummary : this.replySummary(runtime) || runtime.safeSummary, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary,
       actionTokens: {
         diff: this.issue("diff.show", runtime.session.id, runtime.turnId, runtime.turnId, expiresAt, { page: 1 }),
         logs: this.issue("logs.show", runtime.session.id, runtime.turnId, runtime.turnId, expiresAt, { page: 1 }),
@@ -438,53 +508,200 @@ export class SessionCoordinator {
   }
 
   private async selectProject(projectId: string): Promise<void> {
-    if (this.runtime && isActiveState(this.runtime.phase)) return;
     const project = this.store.getProject(projectId); if (!project) return;
     const prompt = this.pendingPrompt; this.pendingPrompt = null;
+    await this.refreshSessions();
+    const running = [...this.controllableSessions.values()]
+      .filter((candidate) => candidate.project.id === project.id)
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (running) {
+      this.selectedSession = running.session;
+      const runtime = this.runtimes.get(running.session.id);
+      if (prompt) {
+        if (runtime?.pendingInput) await this.answerFreeformInput(runtime, prompt);
+        else if (runtime) await this.steerRuntime(runtime, prompt, `Using running Codex session ${running.session.id} in ${project.name}. Your message was sent.`);
+        else await this.startTurn(running.session, prompt);
+      } else {
+        const message = runningSessionSelectedMessage(running);
+        await this.safeSend("text", message, () => this.messaging.sendText(message));
+      }
+      return;
+    }
+    const standalone = [...this.uncontrollableSessions.values()]
+      .filter((candidate) => candidate.project.id === project.id)
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (standalone) {
+      await this.messaging.sendText(standaloneSessionMessage(standalone));
+      return;
+    }
     await this.createSelectedSession(project, prompt);
   }
 
-  private async sendSessionChoices(): Promise<void> {
-    const sessions = this.store.listSessions();
-    if (!sessions.length) { await this.messaging.sendText("No bot-created sessions yet."); return; }
+  private async sendSessionChoices(page = 1, refresh = true): Promise<void> {
+    if (refresh) await this.refreshSessions();
+    const sessions = this.store.listSessions(100);
+    if (!sessions.length) { await this.messaging.sendText("No Codex sessions were found in registered projects."); return; }
+    const pageSize = 3;
+    const totalPages = Math.ceil(sessions.length / pageSize);
+    const boundedPage = Math.min(totalPages, Math.max(1, Math.floor(page)));
+    const visible = sessions.slice((boundedPage - 1) * pageSize, boundedPage * pageSize);
     const expiresAt = Date.now() + 15 * 60_000;
-    const view: ChoiceView = { title: "Resume a session", actionKind: "session.select", choices: sessions.map((session) => ({ label: session.title, description: `ID: ${session.id}\n${session.state} - ${new Date(session.updatedAt).toLocaleString()}`, value: session.id, token: this.issue("session.select", session.id, session.lastTurnId ?? "none", session.id, expiresAt, {}) })) };
+    const view: ChoiceView = {
+      title: `Select a Codex session (${boundedPage}/${totalPages})`, actionKind: "session.select",
+      choices: visible.map((session) => ({ label: truncateWords(session.title, 100), description: `ID: ${session.id}\n${session.state} - ${new Date(session.updatedAt).toLocaleString()}`, value: session.id, token: this.issue("session.select", session.id, session.lastTurnId ?? "none", session.id, expiresAt, {}) })),
+      ...(boundedPage > 1 ? { previousToken: this.issue("sessions.more", "sessions", "none", "sessions", expiresAt, { page: boundedPage - 1 }) } : {}),
+      ...(boundedPage < totalPages ? { nextToken: this.issue("sessions.more", "sessions", "none", "sessions", expiresAt, { page: boundedPage + 1 }) } : {}),
+    };
     await this.safeSend("choices", view, () => this.messaging.sendChoices(view));
   }
 
   private async resumeStoredSession(id: string): Promise<void> {
-    if (this.runtime && isActiveState(this.runtime.phase)) return;
-    const session = this.store.getSession(id); if (!session) { await this.messaging.sendText("That session is unavailable or was not created by this bot."); return; }
+    await this.refreshSessions();
+    const session = this.store.getSession(id);
+    if (!session) { await this.messaging.sendText("That session is unavailable or is outside the registered projects."); return; }
+    const runtime = this.runtimes.get(session.id);
+    if (runtime) {
+      this.selectedSession = runtime.session;
+      await this.messaging.sendText(`Selected active session ${session.title}. New messages will steer it.`);
+      return;
+    }
     const project = this.store.getProject(session.projectId); if (!project) { await this.messaging.sendText("The session project is no longer registered."); return; }
-    await this.driver.resumeSession(session.id, project);
+    try { await this.driver.resumeSession(session.id, project); }
+    catch (error) {
+      const errorMessage = redact((error as Error).message, this.redactions).slice(0, 500);
+      this.store.audit({ eventType: "session.select.failed", summary: errorMessage, sessionId: session.id, ...(session.lastTurnId ? { turnId: session.lastTurnId } : {}) });
+      this.logger.warn({ sessionId: session.id, errorMessage }, "Could not select Codex session");
+      await this.messaging.sendText(sessionSelectionFailure(session.title, errorMessage));
+      return;
+    }
     this.selectedSession = session;
     await this.messaging.sendText(`Resumed ${session.title}. Send a message to start the next turn.`);
   }
 
+  private async refreshSessions(): Promise<SessionRefreshResult> {
+    if (this.sessionRefresh) return this.sessionRefresh;
+    const operation = this.performSessionRefresh();
+    this.sessionRefresh = operation;
+    try { return await operation; }
+    finally { if (this.sessionRefresh === operation) this.sessionRefresh = null; }
+  }
+
+  private async performSessionRefresh(): Promise<SessionRefreshResult> {
+    const projects = this.store.listProjects();
+    const discovered = await this.driver.listSessions(projects);
+    const previousControllable = this.controllableSessions;
+    const previousUncontrollable = this.uncontrollableSessions;
+    const currentControllable = new Map<string, ProjectSession>();
+    const currentUncontrollable = new Map<string, ProjectSession>();
+    const newlyControllable: ProjectSession[] = [];
+    const newlyUncontrollable: ProjectSession[] = [];
+    for (const info of discovered) {
+      const session = this.store.upsertDiscoveredSession(info);
+      const project = this.store.getProject(info.projectId);
+      if (!project) continue;
+      const controllable = info.loaded && info.canAcceptDirectInput;
+      const candidate = { session, project, updatedAt: info.updatedAt };
+      if (controllable) {
+        currentControllable.set(info.id, candidate);
+        if (!previousControllable.has(info.id) && !this.runtimes.has(info.id) && this.selectedSession?.id !== info.id) newlyControllable.push(candidate);
+      } else if (isActiveState(info.state)) {
+        currentUncontrollable.set(info.id, candidate);
+        if (!previousUncontrollable.has(info.id)) newlyUncontrollable.push(candidate);
+      }
+      if (this.selectedSession?.id === info.id) this.selectedSession = session;
+      if (!controllable || !info.activeTurnId || info.state === "idle" || !isActiveState(info.state) || this.runtimes.has(info.id)) continue;
+      try { await this.driver.resumeSession(info.id, project); }
+      catch (error) {
+        this.logger.debug({ sessionId: info.id, errorMessage: redact((error as Error).message, this.redactions).slice(0, 500) }, "Active Codex session is owned by another runtime");
+        continue;
+      }
+      this.store.attachTurn({ id: info.activeTurnId, sessionId: info.id, state: info.state, startedAt: info.updatedAt });
+      const runtime = this.makeRuntime(session, project, info.activeTurnId, info.state, info.updatedAt, "Connected to a running Codex turn.");
+      this.runtimes.set(info.id, runtime);
+    }
+    this.controllableSessions = currentControllable;
+    this.uncontrollableSessions = currentUncontrollable;
+    return { newlyControllable, newlyUncontrollable };
+  }
+
   private async sendPagedOutput(kind: "logs.show" | "diff.show", sessionId: string | undefined, requestedPage: number): Promise<void> {
     if (!sessionId) { await this.messaging.sendText("No session selected."); return; }
-    const session = this.store.getSession(sessionId); const turnId = this.runtime?.session.id === sessionId ? this.runtime.turnId : session?.lastTurnId;
+    const session = this.store.getSession(sessionId); const turnId = this.runtimes.get(sessionId)?.turnId ?? session?.lastTurnId;
     if (!session || !turnId) { await this.messaging.sendText("No turn output is available."); return; }
     const view = await this.makeOutputView(kind, sessionId, turnId, requestedPage);
     await this.safeSend("output", view, () => this.messaging.sendOutput(view), { actionKind: kind, sessionId, turnId, page: view.page });
   }
 
   private makeStatusView(runtime: RuntimeTurn): SessionView {
-    return { sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, phase: runtime.phase, startedAt: runtime.startedAt, updatedAt: Date.now(), safeSummary: runtime.safeSummary, recentCommands: runtime.recentCommands, ...(runtime.pendingApproval ? { pendingApproval: runtime.pendingApproval } : {}), actionTokens: runtime.actionTokens };
+    return { sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, phase: runtime.phase, startedAt: runtime.startedAt, updatedAt: Date.now(), safeSummary: runtime.safeSummary, ...(runtime.replies.length ? { replies: runtime.replies.map((reply) => reply.text) } : {}), recentCommands: runtime.recentCommands, ...(runtime.pendingApproval ? { pendingApproval: { id: runtime.pendingApproval.id, kind: runtime.pendingApproval.kind, summary: runtime.pendingApproval.summary } } : {}), actionTokens: runtime.actionTokens };
   }
 
-  private async flushStatus(force = false): Promise<void> {
-    const runtime = this.runtime;
-    if (!runtime || (!runtime.dirty && !force) || this.statusFlush) return;
+  private appendReply(runtime: RuntimeTurn, messageId: string, delta: string): void {
+    const safeDelta = redact(delta, this.redactions);
+    const current = runtime.replies.at(-1);
+    if (current?.id === messageId) current.text += safeDelta;
+    else runtime.replies.push({ id: messageId, text: safeDelta });
+    while (this.replySummary(runtime).length > 1_500 && runtime.replies.length > 1) runtime.replies.shift();
+    const newest = runtime.replies.at(-1);
+    if (newest && this.replySummary(runtime).length > 1_500) newest.text = newest.text.slice(-1_500);
+    runtime.safeSummary = this.replySummary(runtime);
+  }
+
+  private replySummary(runtime: RuntimeTurn): string {
+    return runtime.replies.map((reply) => reply.text).join("\n\n");
+  }
+
+  private async resolveApprovalCard(pending: NonNullable<RuntimeTurn["pendingApproval"]>, decision: ApprovalResolutionView["decision"]): Promise<void> {
+    if (!pending.ref) return;
+    const resolution: ApprovalResolutionView = { title: pending.summary, decision, resolvedAt: Date.now() };
+    await this.safeSend("approval.update", { ref: pending.ref, resolution }, () => this.messaging.updateApproval(pending.ref!, resolution), { ref: pending.ref, resolution }, `approval:${pending.id}:resolution`);
+  }
+
+  private makeRuntime(session: StoredSession, project: Project, turnId: string, phase: TurnPhase, startedAt: number, safeSummary: string): RuntimeTurn {
+    const expiresAt = Date.now() + 14 * 86_400_000;
+    return {
+      session: { ...session, lastTurnId: turnId, state: phase, updatedAt: Date.now() }, project, turnId, phase, startedAt, safeSummary,
+      replies: [], recentCommands: [], diff: "", changedFileCount: 0, testSummary: "", statusRef: null,
+      actionTokens: {
+        stop: this.issue("turn.stop", session.id, turnId, turnId, expiresAt, {}),
+        logs: this.issue("logs.show", session.id, turnId, turnId, expiresAt, { page: 1 }),
+        diff: this.issue("diff.show", session.id, turnId, turnId, expiresAt, { page: 1 }),
+      },
+      dirty: true,
+    };
+  }
+
+  private async flushStatuses(): Promise<void> {
+    await Promise.all([...this.runtimes.keys()].map(async (sessionId) => this.flushStatus(sessionId)));
+  }
+
+  private async flushStatus(sessionId: string, force = false): Promise<void> {
+    const runtime = this.runtimes.get(sessionId);
+    if (!runtime || (!runtime.dirty && !force) || this.statusFlushes.has(sessionId)) return;
     runtime.dirty = false;
     const view = this.makeStatusView(runtime);
     this.store.updateTurn(runtime.turnId, { state: runtime.phase, safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary });
-    this.statusFlush = (async () => {
+    const flush = (async () => {
       const queueKey = `turn:${runtime.turnId}:status`;
       if (runtime.statusRef) await this.safeSend("status.update", { ref: runtime.statusRef, view }, () => this.messaging.updateStatus(runtime.statusRef!, view), { ref: runtime.statusRef, view }, queueKey);
       else await this.safeSend("status", view, async () => { runtime.statusRef = await this.messaging.sendStatus(view); }, view, queueKey);
-    })().finally(() => { this.statusFlush = null; });
-    await this.statusFlush;
+    })().finally(() => { this.statusFlushes.delete(sessionId); });
+    this.statusFlushes.set(sessionId, flush);
+    await flush;
+  }
+
+  private selectedRuntime(): RuntimeTurn | null {
+    if (this.selectedSession) return this.runtimes.get(this.selectedSession.id) ?? null;
+    return this.runtimes.size === 1 && this.controllableSessions.size <= 1 ? this.runtimes.values().next().value ?? null : null;
+  }
+
+  private selectedProject(): Project | null {
+    return this.selectedSession ? this.store.getProject(this.selectedSession.projectId) : null;
+  }
+
+  private selectSoleControllableSession(): void {
+    if (this.selectedSession || this.controllableSessions.size !== 1) return;
+    this.selectedSession = this.controllableSessions.values().next().value?.session ?? null;
   }
 
   private issue(kind: string, sessionId: string, turnId: string, requestId: string, expiresAt: number, payload: Record<string, unknown>): string {
@@ -510,9 +727,22 @@ export class SessionCoordinator {
   private async deliver(kind: DeliveryKind, payload: Record<string, unknown>): Promise<void> {
     switch (kind) {
       case "text": await this.messaging.sendText(String(payload)); break;
-      case "status": { const ref = await this.messaging.sendStatus(payload as unknown as SessionView); if (this.runtime?.turnId === (payload as unknown as SessionView).turnId) this.runtime.statusRef = ref; break; }
+      case "status": {
+        const view = payload as unknown as SessionView;
+        const ref = await this.messaging.sendStatus(view);
+        const runtime = this.runtimes.get(view.sessionId);
+        if (runtime?.turnId === view.turnId) runtime.statusRef = ref;
+        break;
+      }
       case "status.update": { const value = payload as unknown as { ref: MessageRef; view: SessionView }; await this.messaging.updateStatus(value.ref, value.view); break; }
-      case "approval": await this.messaging.sendApproval(payload as unknown as ApprovalView); break;
+      case "approval": {
+        const view = payload as unknown as ApprovalView;
+        const ref = await this.messaging.sendApproval(view);
+        const runtime = this.runtimes.get(view.sessionId);
+        if (runtime?.turnId === view.turnId && runtime.pendingApproval?.id === view.approvalId) runtime.pendingApproval.ref = ref;
+        break;
+      }
+      case "approval.update": { const value = payload as unknown as { ref: MessageRef; resolution: ApprovalResolutionView }; await this.messaging.updateApproval(value.ref, value.resolution); break; }
       case "result": await this.messaging.sendResult(payload as unknown as TurnResultView); break;
       case "choices": await this.messaging.sendChoices(payload as unknown as ChoiceView); break;
       case "question": await this.messaging.sendQuestion(payload as unknown as QuestionView); break;
@@ -525,7 +755,8 @@ export class SessionCoordinator {
   }
 
   private async makeOutputView(kind: "logs.show" | "diff.show", sessionId: string, turnId: string, requestedPage: number): Promise<OutputView> {
-    const activeDiff = this.runtime?.session.id === sessionId && this.runtime.turnId === turnId ? this.runtime.diff : "";
+    const runtime = this.runtimes.get(sessionId);
+    const activeDiff = runtime?.turnId === turnId ? runtime.diff : "";
     const storedDiff = String(this.store.getTurn(turnId)?.["diff_text"] ?? "");
     const content = kind === "logs.show" ? await this.commandLogs.read(turnId) : activeDiff || storedDiff || "No diff recorded.";
     const page = paginate(redact(content, this.redactions), requestedPage);
@@ -559,4 +790,28 @@ export class SessionCoordinator {
 
 function countChangedFiles(diff: string): number {
   return new Set([...diff.matchAll(/^diff --git a\/(.+?) b\//gmu)].map((match) => match[1])).size;
+}
+
+function truncateWords(value: string, limit: number): string {
+  const words = value.trim().split(/\s+/u).filter(Boolean);
+  return words.length > limit ? `${words.slice(0, limit).join(" ")}...` : words.join(" ");
+}
+
+function sessionSelectionFailure(title: string, errorMessage: string): string {
+  const name = redact(title).slice(0, 120);
+  if (/active writer|already (?:has|owned by).*writer|already loaded/iu.test(errorMessage)) return `Cannot select ${name}: it is open in a separate Codex runtime. Close that session and relaunch it with the PulseCortex Codex integration.`;
+  if (/no rollout found/iu.test(errorMessage)) return `Cannot select ${name}: its saved Codex history is no longer available.`;
+  return `Cannot select ${name}: Codex could not resume this session. Check the local PulseCortex log for details.`;
+}
+
+function runningSessionSelectedMessage(running: ProjectSession): string {
+  const title = redact(running.session.title).slice(0, 120);
+  const project = redact(running.project.name).slice(0, 120);
+  return `Using running Codex session ${title} in ${project} (${running.session.id}) by default. Send /send <message> to message it.`;
+}
+
+function standaloneSessionMessage(running: ProjectSession): string {
+  const title = redact(running.session.title).slice(0, 120);
+  const project = redact(running.project.name).slice(0, 120);
+  return `Detected active Codex session ${title} in ${project} (${running.session.id}), but it was launched outside the PulseCortex shared app-server and cannot receive Feishu messages. Close it and relaunch with pnpm pulsectl codex ${project}, or install the PulseCortex shell integration and run codex again.`;
 }

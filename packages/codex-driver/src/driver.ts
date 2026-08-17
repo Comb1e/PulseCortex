@@ -1,12 +1,14 @@
 import { execFile } from "node:child_process";
+import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type {
-  AgentCapabilities, AgentDriver, AgentEvent, ApprovalId, NetworkDestination, Project, SessionId, SessionOptions, TurnId, Unsubscribe,
+  AgentCapabilities, AgentDriver, AgentEvent, AgentSessionInfo, ApprovalId, NetworkDestination, Project, SessionId, SessionOptions, TurnId, Unsubscribe,
 } from "@pulsecortex/domain";
-import { isPathInside, summarizeCommand } from "@pulsecortex/domain";
+import { canonicalProjectPath, isPathInside, summarizeCommand } from "@pulsecortex/domain";
 import type { CommandLogStore } from "@pulsecortex/persistence";
 import type { InitializeResponse } from "./generated/InitializeResponse";
+import type { AgentMessageDeltaNotification } from "./generated/v2/AgentMessageDeltaNotification";
 import type { CommandExecutionRequestApprovalParams } from "./generated/v2/CommandExecutionRequestApprovalParams";
 import type { AdditionalFileSystemPermissions } from "./generated/v2/AdditionalFileSystemPermissions";
 import type { FileChangeRequestApprovalParams } from "./generated/v2/FileChangeRequestApprovalParams";
@@ -14,6 +16,9 @@ import type { ItemCompletedNotification } from "./generated/v2/ItemCompletedNoti
 import type { ItemStartedNotification } from "./generated/v2/ItemStartedNotification";
 import type { PermissionsRequestApprovalParams } from "./generated/v2/PermissionsRequestApprovalParams";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse";
+import type { ThreadListResponse } from "./generated/v2/ThreadListResponse";
+import type { ThreadLoadedListResponse } from "./generated/v2/ThreadLoadedListResponse";
+import type { ThreadReadResponse } from "./generated/v2/ThreadReadResponse";
 import type { ThreadStartResponse } from "./generated/v2/ThreadStartResponse";
 import type { ToolRequestUserInputParams } from "./generated/v2/ToolRequestUserInputParams";
 import type { TurnCompletedNotification } from "./generated/v2/TurnCompletedNotification";
@@ -87,8 +92,10 @@ export class CodexAppServerDriver implements AgentDriver {
   private readonly pending = new Map<string, PendingServerRequest>();
   private readonly activeTurns = new Map<SessionId, TurnId>();
   private readonly projectRoots = new Map<SessionId, string>();
+  private readonly directInputSessions = new Set<SessionId>();
   private readonly eventBuffers = new Map<SessionId, AgentEvent[]>();
   private cliVersion = "unknown";
+  private codexHome: string | null = null;
   private started = false;
 
   constructor(private readonly options: CodexDriverOptions = {}) {
@@ -109,13 +116,14 @@ export class CodexAppServerDriver implements AgentDriver {
         throw new Error(`Unsupported Codex CLI ${this.cliVersion}; PulseCortex protocol snapshot requires ${supported}.x`);
       }
     } else this.cliVersion = this.options.supportedCliSeries ?? `${SUPPORTED_CODEX_CLI_SERIES}.0`;
-    this.transport.start();
     try {
+      await this.transport.start();
       const initialized = await this.transport.request<InitializeResponse>("initialize", {
         clientInfo: { name: "pulsecortex", title: "PulseCortex", version: "0.1.0" },
         capabilities: { experimentalApi: true, requestAttestation: false },
       });
       this.transport.notify("initialized");
+      this.codexHome = initialized.codexHome;
       this.started = true;
       return { cliVersion: this.cliVersion, protocolMajor: SUPPORTED_PROTOCOL_MAJOR, userAgent: initialized.userAgent, supportsSteer: true, supportsApprovals: true };
     } catch (error) {
@@ -124,7 +132,7 @@ export class CodexAppServerDriver implements AgentDriver {
     }
   }
 
-  async stop(): Promise<void> { this.started = false; this.eventBuffers.clear(); await this.transport.stop(); }
+  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.activeTurns.clear(); this.projectRoots.clear(); this.directInputSessions.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
 
   async createSession(project: Project, options: SessionOptions): Promise<SessionId> {
     this.assertStarted();
@@ -141,16 +149,112 @@ export class CodexAppServerDriver implements AgentDriver {
     });
     if (!isPathInside(project.canonicalPath, response.cwd)) throw new Error("Codex returned a working directory outside the registered project");
     this.projectRoots.set(response.thread.id, project.canonicalPath);
+    this.directInputSessions.add(response.thread.id);
     return response.thread.id;
   }
 
   async resumeSession(id: SessionId, project: Project): Promise<void> {
+    await this.resumeSessionAtCwd(id, project, project.canonicalPath);
+  }
+
+  private async resumeSessionAtCwd(id: SessionId, project: Project, cwd: string): Promise<void> {
     this.assertStarted();
+    const loadedRoot = this.projectRoots.get(id);
+    if (loadedRoot) {
+      if (!isPathInside(loadedRoot, project.canonicalPath) || !isPathInside(project.canonicalPath, loadedRoot)) throw new Error("Loaded session project does not match the registered project");
+      if (this.directInputSessions.has(id)) return;
+    }
     const response = await this.transport.request<ThreadResumeResponse>("thread/resume", {
-      threadId: id, cwd: project.canonicalPath, runtimeWorkspaceRoots: [project.canonicalPath], approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: "workspace-write", excludeTurns: true,
+      threadId: id, cwd, runtimeWorkspaceRoots: [project.canonicalPath], approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: "workspace-write", excludeTurns: false,
     });
     if (response.thread.id !== id || !isPathInside(project.canonicalPath, response.cwd)) throw new Error("Codex resume did not match the registered session and project");
+    if (response.thread.canAcceptDirectInput === false) throw new Error("Codex rejoined the session without granting direct input");
     this.projectRoots.set(id, project.canonicalPath);
+    this.directInputSessions.add(id);
+    const activeTurn = response.thread.turns?.findLast((turn) => turn.status === "inProgress");
+    if (activeTurn) this.activeTurns.set(id, activeTurn.id);
+  }
+
+  async listSessions(projects: Project[]): Promise<AgentSessionInfo[]> {
+    this.assertStarted();
+    if (!projects.length) return [];
+    const loaded = new Set<string>();
+    let loadedCursor: string | null = null;
+    do {
+      const response: ThreadLoadedListResponse = await this.transport.request<ThreadLoadedListResponse>("thread/loaded/list", { cursor: loadedCursor, limit: 100 });
+      for (const id of response.data) loaded.add(id);
+      loadedCursor = response.nextCursor;
+    } while (loadedCursor);
+    const writerLocked = await this.listWriterLockedThreads();
+    for (const id of [...this.projectRoots.keys()]) {
+      if (loaded.has(id)) continue;
+      this.projectRoots.delete(id);
+      this.directInputSessions.delete(id);
+      this.activeTurns.delete(id);
+    }
+    const sessions: AgentSessionInfo[] = [];
+    let cursor: string | null = null;
+    do {
+      const response: ThreadListResponse = await this.transport.request<ThreadListResponse>("thread/list", {
+        cursor, limit: 100, sortKey: "updated_at", sortDirection: "desc", sourceKinds: ["cli", "vscode", "appServer"], archived: false, useStateDbOnly: true,
+      });
+      for (const thread of response.data) {
+        let canonicalCwd: string;
+        try { canonicalCwd = await canonicalProjectPath(thread.cwd); }
+        catch { continue; }
+        const project = projects.find((candidate) => isPathInside(candidate.canonicalPath, canonicalCwd));
+        if (!project) continue;
+        const isLoaded = loaded.has(thread.id);
+        const isExternallyRunning = !isLoaded && writerLocked.has(thread.id);
+        if (isLoaded) this.projectRoots.set(thread.id, project.canonicalPath);
+        else this.directInputSessions.delete(thread.id);
+        let detail: ThreadReadResponse | undefined;
+        if (thread.status.type === "active" || (isLoaded && thread.canAcceptDirectInput !== true)) {
+          detail = await this.transport.request<ThreadReadResponse>("thread/read", { threadId: thread.id, includeTurns: thread.status.type === "active" });
+        }
+        let canAcceptDirectInput = isLoaded && (detail?.thread.canAcceptDirectInput ?? thread.canAcceptDirectInput) === true;
+        if (canAcceptDirectInput) this.directInputSessions.add(thread.id);
+        else if (isLoaded) {
+          this.directInputSessions.delete(thread.id);
+          try {
+            await this.resumeSessionAtCwd(thread.id, project, canonicalCwd);
+            detail = await this.transport.request<ThreadReadResponse>("thread/read", { threadId: thread.id, includeTurns: thread.status.type === "active" });
+            canAcceptDirectInput = this.directInputSessions.has(thread.id) && detail.thread.canAcceptDirectInput !== false;
+          } catch (error) {
+            if (!isWriterConflict(error)) throw error;
+          }
+        }
+        let activeTurnId: string | undefined;
+        if (thread.status.type === "active") {
+          activeTurnId = detail!.thread.turns.findLast((turn) => turn.status === "inProgress")?.id;
+          if (activeTurnId && canAcceptDirectInput) this.activeTurns.set(thread.id, activeTurnId);
+        }
+        const state = thread.status.type === "active"
+          ? thread.status.activeFlags.includes("waitingOnApproval") ? "awaiting_approval" : thread.status.activeFlags.includes("waitingOnUserInput") ? "awaiting_input" : "working"
+          : isExternallyRunning ? "working"
+          : thread.status.type === "systemError" ? "failed" : "idle";
+        sessions.push({
+          id: thread.id, projectId: project.id, title: thread.name?.trim() || thread.preview.trim() || `Codex ${thread.id.slice(0, 8)}`, state, loaded: isLoaded, canAcceptDirectInput,
+          ...(activeTurnId ? { activeTurnId } : {}), createdAt: thread.createdAt * 1_000, updatedAt: thread.updatedAt * 1_000,
+          botCreated: thread.threadSource === "pulsecortex",
+        });
+      }
+      cursor = response.nextCursor;
+    } while (cursor);
+    return sessions;
+  }
+
+  private async listWriterLockedThreads(): Promise<Set<string>> {
+    if (!this.codexHome) return new Set();
+    try {
+      const entries = await readdir(path.join(this.codexHome, "thread-writer-locks"), { withFileTypes: true });
+      return new Set(entries
+        .filter((entry) => entry.isFile() && entry.name !== ".coordination.lock" && entry.name.endsWith(".lock"))
+        .map((entry) => entry.name.slice(0, -".lock".length)));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+      throw error;
+    }
   }
 
   async startTurn(id: SessionId, prompt: string): Promise<TurnId> {
@@ -236,12 +340,12 @@ export class CodexAppServerDriver implements AgentDriver {
       const root = this.projectRoots.get(sessionId);
       if (input.additionalPermissions?.network?.enabled && network.length === 0) {
         this.transport.respondError(request.id, -32004, "Broad network permission is disabled; use a destination-specific network request");
-        this.emit({ type: "agent.message.delta", sessionId, turnId, delta: " PulseCortex denied a broad network grant without a destination.", occurredAt: now() });
+        this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied a broad network grant without a destination.", occurredAt: now() });
         return;
       }
       if (!root || !filesystemPermissionIsSafe(input.additionalPermissions?.fileSystem, root)) {
         this.transport.respondError(request.id, -32003, "Filesystem permission outside the registered project is disabled");
-        this.emit({ type: "agent.message.delta", sessionId, turnId, delta: " PulseCortex denied filesystem access outside the registered project.", occurredAt: now() });
+        this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied filesystem access outside the registered project.", occurredAt: now() });
         return;
       }
       this.pending.set(approvalId, { rpcId: request.id, method: request.method, params });
@@ -253,7 +357,7 @@ export class CodexAppServerDriver implements AgentDriver {
       const root = this.projectRoots.get(sessionId);
       if (input.grantRoot && root && !requestedPathInside(root, input.grantRoot)) {
         this.transport.respondError(request.id, -32003, "Write permission outside the registered project is disabled");
-        this.emit({ type: "agent.message.delta", sessionId, turnId, delta: " PulseCortex denied a write root outside the registered project.", occurredAt: now() });
+        this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied a write root outside the registered project.", occurredAt: now() });
         return;
       }
       this.pending.set(approvalId, { rpcId: request.id, method: request.method, params });
@@ -264,7 +368,7 @@ export class CodexAppServerDriver implements AgentDriver {
       const input = request.params as PermissionsRequestApprovalParams;
       if (input.permissions.network?.enabled) {
         this.transport.respondError(request.id, -32004, "Broad network permission is disabled; use a destination-specific network request");
-        this.emit({ type: "agent.message.delta", sessionId, turnId, delta: " PulseCortex denied a broad network grant without a destination.", occurredAt: now() });
+        this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied a broad network grant without a destination.", occurredAt: now() });
         return;
       }
       const kind = input.permissions.network?.enabled ? "network" : "filesystem";
@@ -272,7 +376,7 @@ export class CodexAppServerDriver implements AgentDriver {
       const root = this.projectRoots.get(sessionId);
       if (!root || !filesystemPermissionIsSafe(input.permissions.fileSystem, root) || paths.some((candidate) => !requestedPathInside(root, candidate))) {
         this.transport.respondError(request.id, -32003, "Filesystem permission outside the registered project is disabled");
-        this.emit({ type: "agent.message.delta", sessionId, turnId, delta: " PulseCortex denied filesystem access outside the registered project.", occurredAt: now() });
+        this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied filesystem access outside the registered project.", occurredAt: now() });
         return;
       }
       this.pending.set(approvalId, { rpcId: request.id, method: request.method, params });
@@ -283,7 +387,7 @@ export class CodexAppServerDriver implements AgentDriver {
       const root = this.projectRoots.get(sessionId);
       if (request.method === "applyPatchApproval" && (!root || Object.keys((params["fileChanges"] as object | undefined) ?? {}).some((candidate) => !requestedPathInside(root, candidate)))) {
         this.transport.respondError(request.id, -32003, "File change outside the registered project is disabled");
-        this.emit({ type: "agent.message.delta", sessionId, turnId, delta: " PulseCortex denied a file change outside the registered project.", occurredAt: now() });
+        this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied a file change outside the registered project.", occurredAt: now() });
         return;
       }
       this.pending.set(approvalId, { rpcId: request.id, method: request.method, params });
@@ -301,7 +405,11 @@ export class CodexAppServerDriver implements AgentDriver {
     const turnId = String(params["turnId"] ?? (params["turn"] as Record<string, unknown> | undefined)?.["id"] ?? this.activeTurns.get(sessionId) ?? "");
     switch (message.method) {
       case "turn/started": this.activeTurns.set(sessionId, turnId); this.emit({ type: "turn.started", sessionId, turnId, occurredAt: now() }); break;
-      case "item/agentMessage/delta": this.emit({ type: "agent.message.delta", sessionId, turnId, delta: String(params["delta"] ?? ""), occurredAt: now() }); break;
+      case "item/agentMessage/delta": {
+        const input = message.params as AgentMessageDeltaNotification;
+        this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: input.itemId, delta: input.delta, occurredAt: now() });
+        break;
+      }
       case "turn/diff/updated": this.emit({ type: "diff.updated", sessionId, turnId, diff: String(params["diff"] ?? ""), occurredAt: now() }); break;
       case "item/commandExecution/outputDelta": void this.options.commandLogs?.append(turnId, "stdout", String(params["delta"] ?? "")).catch(() => undefined); break;
       case "item/started": this.handleItemStarted(message.params as ItemStartedNotification); break;
@@ -346,6 +454,8 @@ export class CodexAppServerDriver implements AgentDriver {
     if (!this.started) return;
     this.started = false;
     this.activeTurns.clear();
+    this.projectRoots.clear();
+    this.directInputSessions.clear();
     this.pending.clear();
     this.eventBuffers.clear();
     this.emit({ type: "driver.crashed", error: error.message, occurredAt: now() });
@@ -354,6 +464,8 @@ export class CodexAppServerDriver implements AgentDriver {
     if (!this.started) return;
     this.started = false;
     this.activeTurns.clear();
+    this.projectRoots.clear();
+    this.directInputSessions.clear();
     this.pending.clear();
     this.eventBuffers.clear();
     await this.transport.stop();
@@ -361,4 +473,8 @@ export class CodexAppServerDriver implements AgentDriver {
   }
   private assertStarted(): void { if (!this.started) throw new Error("Codex driver is not started"); }
   private assertSession(id: SessionId): void { this.assertStarted(); if (!this.projectRoots.has(id)) throw new Error("Session is not loaded by PulseCortex"); }
+}
+
+function isWriterConflict(error: unknown): boolean {
+  return /active writer|already (?:has|owned by).*writer|already loaded/iu.test((error as Error).message);
 }

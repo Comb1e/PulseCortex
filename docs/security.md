@@ -4,18 +4,18 @@ PulseCortex is remote code execution mediated by Codex. Treat the Feishu account
 
 ## Enforced Controls
 
-- The daemon opens no inbound listener. Feishu events and callbacks arrive over official SDK outbound WebSockets; Codex uses local stdio.
+- Feishu events and callbacks arrive over official SDK outbound WebSockets. The only inbound listener is the shared Codex app-server, validated as loopback-only with an explicit port; it is never exposed on the LAN or internet.
 - Only a paired tenant and owner `open_id` can submit commands or consume actions. Group messages are rejected.
 - Feishu cannot register a path. Canonical projects are added locally and nested/duplicate roots are rejected.
-- Only bot-created session mappings are resumable remotely.
-- One active turn prevents cross-turn approval confusion.
+- Only sessions whose real working directory is at or below a locally registered canonical project root are exposed or controllable remotely.
+- Concurrent turns are isolated by session, and every approval remains bound to its session, turn, request, owner, and tenant.
 - Actions are signed, owner/session/turn/request-bound, expiring, and transactionally single-use.
 - Approval cards expose Allow once, Deny, and Stop only. Session-wide approval is never returned.
 - Network cards use app-server destination host/protocol. Broad network grants without a destination are denied.
 - Secret-input questions are denied and interrupt the turn instead of asking for credentials over Feishu.
 - ANSI/control characters are removed; common and configured credential patterns are redacted; mobile payloads are bounded.
 - App credentials and the action signing key load only from process environment or a restricted local environment file. They are not command arguments, repository config, SQLite values, cards, or logs.
-- Audit rows record pairing, prompts by hash, sessions, approvals, stops, failures, and delivery outcomes.
+- Audit rows record pairing, prompts by hash, sessions, approvals, stops, failures, and delivery outcomes. Every successfully delivered Feishu text or card is also recorded in the structured daemon log after redaction and action-token removal.
 
 ## Residual Risk
 
@@ -35,6 +35,6 @@ Service artifacts contain only the environment-file path, Node path, and daemon 
 
 ## Acceptance Tests
 
-Automated tests cover command parsing, state transitions, canonical path containment, nested allowlist rejection, redaction/pagination, owner authorization, event deduplication, forged/replayed action rejection, Codex destination-specific approval normalization, card schema, and all platform service artifact generators.
+Automated tests cover command parsing, concurrent state transitions, session discovery and pagination, canonical path containment, nested allowlist rejection, redaction, owner authorization, event deduplication, forged/replayed action rejection, Codex destination-specific approval normalization, card schema, and all platform service artifact generators.
 
 Before a release tag, also run the developer-tenant trial in [Feishu setup](feishu-setup.md), authenticated temporary-repository Codex integration tests, restart/crash tests, and OS-supervised startup tests on physical or virtual Windows, macOS, and Linux hosts.

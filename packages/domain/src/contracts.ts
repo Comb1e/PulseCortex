@@ -1,7 +1,9 @@
 import type {
   AgentCapabilities,
   AgentEvent,
+  AgentSessionInfo,
   ApprovalId,
+  ApprovalResolutionView,
   ApprovalView,
   ChoiceView,
   ChannelAction,
@@ -24,6 +26,7 @@ export interface MessagingAdapter {
   sendStatus(view: SessionView): Promise<MessageRef>;
   updateStatus(ref: MessageRef, view: SessionView): Promise<void>;
   sendApproval(request: ApprovalView): Promise<MessageRef>;
+  updateApproval(ref: MessageRef, resolution: ApprovalResolutionView): Promise<void>;
   sendResult(result: TurnResultView): Promise<void>;
   sendChoices(view: ChoiceView): Promise<void>;
   sendQuestion(view: QuestionView): Promise<void>;
@@ -38,6 +41,7 @@ export interface AgentDriver {
   stop(): Promise<void>;
   createSession(project: Project, options: SessionOptions): Promise<SessionId>;
   resumeSession(id: SessionId, project: Project): Promise<void>;
+  listSessions(projects: Project[]): Promise<AgentSessionInfo[]>;
   startTurn(id: SessionId, prompt: string): Promise<TurnId>;
   steerTurn(id: SessionId, text: string): Promise<void>;
   interruptTurn(id: SessionId): Promise<void>;

@@ -1,12 +1,12 @@
 # PulseCortex
 
-PulseCortex is a local TypeScript daemon that lets one paired owner control allowlisted Codex sessions from Feishu direct messages. Both Feishu event delivery and card callbacks use outbound WebSocket long connections. The workstation opens no inbound port.
+PulseCortex is a local TypeScript daemon that lets one paired owner control allowlisted Codex sessions from Feishu direct messages. Feishu event delivery and card callbacks use outbound WebSocket long connections. Codex clients share a loopback-only app-server listener so the terminal and Feishu can control the same live thread.
 
-The first release intentionally supports one host, one owner, one active turn, bot-created sessions, and locally registered projects. It does not expose an arbitrary shell endpoint; commands, edits, network requests, and approvals originate in `codex app-server`.
+The daemon supports one host, one owner, concurrent sessions in locally registered projects, and both PulseCortex-created and shared-runtime Codex sessions. It does not expose an arbitrary shell endpoint; commands, edits, network requests, and approvals originate in `codex app-server`.
 
 ## Privacy Warning
 
-Prompts, agent messages, source excerpts, command summaries, diffs, test results, and any output you request from `/logs` leave the workstation through Feishu. Built-in and configurable redaction is defense in depth, not a guarantee. Do not use PulseCortex with repositories or credentials that your Feishu tenant is not authorized to receive.
+Prompts, agent messages, source excerpts, command summaries, diffs, test results, and any output you request from `/logs` leave the workstation through Feishu. Every successful outbound Feishu text/card delivery is also written to the daemon log without signed action tokens. Built-in and configurable redaction is defense in depth, not a guarantee. Do not use PulseCortex with repositories or credentials that your Feishu tenant is not authorized to receive.
 
 ## Requirements
 
@@ -83,11 +83,22 @@ pnpm pulsectl pair
 
 Start the daemon with `pnpm start`, direct-message `/pair <code>` to the bot, then use `/projects` or `/new pulsecortex`. During development, `pnpm dev` runs the TypeScript source directly.
 
+After building, install the reversible shell integration once:
+
+```powershell
+pnpm pulsectl shell install
+```
+
+Open a new terminal and run `codex` normally. Interactive, resume, fork, archive, and delete commands automatically use the loopback PulseCortex app-server; maintenance and non-interactive commands continue to use Codex directly. On Windows, the installer also uses marked, reversible PowerShell profile entries so the wrapper takes precedence over machine-wide Codex shims. If the daemon is unavailable, the shim prints a warning and launches standalone Codex. `pnpm pulsectl codex` remains an explicit fallback and now infers the registered project from the current directory.
+
+Codex sessions already connected to the PulseCortex shared app-server are rejoined automatically, including sessions that were running before PulseCortex discovered them. A session active in a separate standalone app-server cannot be adopted mid-turn because Codex enforces a single runtime writer for each thread. PulseCortex detects and reports that condition proactively in Feishu, avoids creating a duplicate for the chosen project, and tells the owner to relaunch through `pnpm pulsectl codex <project>` or the installed shell integration.
+
 Install user-level startup after building:
 
 ```powershell
 pnpm pulsectl service install
 pnpm pulsectl service status
+pnpm pulsectl shell install
 ```
 
 See [Feishu setup](docs/feishu-setup.md), [operations](docs/operations.md), [security](docs/security.md), and [architecture](docs/architecture.md).
@@ -97,17 +108,18 @@ See [Feishu setup](docs/feishu-setup.md), [operations](docs/operations.md), [sec
 | Command | Behavior |
 | --- | --- |
 | `/projects` | Select a locally registered project |
-| `/new <project> [task]` | Create a bot-owned session and optionally start work |
-| `/sessions` | Select from bot-created sessions |
-| `/resume [session-id]` | Resume a bot-created session |
-| `/send <session-id> <message>` | Start or steer work in a specific bot-created session |
-| `/status` | Send the current status card |
-| `/stop` | Interrupt the active turn |
+| `/new [task]` | Create a concurrent session in the chosen project and optionally start work; use `/new <project> [task]` to override it |
+| `/sessions` | Discover sessions in registered projects, three per page with 100-word previews and Show more navigation |
+| `/resume [session-id]` | Resume or select an allowlisted session |
+| `/send <message>` | Start or steer work in the selected session |
+| `/send <session-id> <message>` | Start or steer work in a specific allowlisted session |
+| `/status` | Send the selected session's status card |
+| `/stop` | Interrupt the selected session's active turn |
 | `/logs` | Show bounded, paginated local command logs |
 | `/diff` | Show the bounded, paginated unified diff |
 | `/help` | Show command help |
 
-Ordinary text starts a turn in the selected session or steers the current turn. Use the session ID shown on status, result, and session-selection cards with `/send` to address a session directly. The daemon still permits only one active turn, so a message for another session is rejected until the current turn stops or finishes. If Codex requests structured input, PulseCortex sends selectable cards and accepts direct-message free-form answers when allowed. Secret-input questions are stopped locally and are never rendered into Feishu cards.
+Selecting a session makes it the default for `/send <message>` and ordinary text. The explicit `/send <session-id> <message>` form selects and addresses another session. PulseCortex continuously discovers Codex sessions that are loaded on its shared app-server and can accept direct input, including idle sessions launched after the daemon and sessions started from subdirectories of a registered project. A sole newly discovered session becomes the default and is announced in Feishu; otherwise Feishu asks the owner to choose through `/sessions`. Choosing a project adopts its newest controllable session instead of creating a duplicate. Multiple sessions can work concurrently, including sessions in different registered projects. If Codex requests structured input, PulseCortex sends selectable cards and accepts direct-message free-form answers when allowed. Secret-input questions are stopped locally and are never rendered into Feishu cards.
 
 ## Development
 
@@ -124,7 +136,7 @@ Package boundaries:
 
 - `domain`: normalized contracts, events, state rules, paths, and safe text
 - `persistence`: SQLite migrations, audit/delivery state, signed interactions, command logs
-- `codex-driver`: generated protocol snapshot and JSONL stdio driver
+- `codex-driver`: generated protocol snapshot and shared local WebSocket driver
 - `feishu-adapter`: official SDK long connection, v2 cards, inbound normalization
 - `core`: authorization and session coordinator
 - `daemon`: supervised process entry point

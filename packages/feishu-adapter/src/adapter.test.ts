@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CardActionEvent, NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { ControllerStore } from "@pulsecortex/persistence";
 import { FeishuAdapter } from "./adapter.js";
-import { approvalCard, statusCard } from "./cards.js";
+import { approvalCard, resolvedApprovalCard, statusCard } from "./cards.js";
 
 const stores: ControllerStore[] = [];
 afterEach(() => { while (stores.length) stores.pop()?.close(); });
@@ -42,6 +42,23 @@ describe("Feishu inbound contract", () => {
 });
 
 describe("Feishu card rendering", () => {
+  it("reports every delivered message without action tokens", async () => {
+    const db = store();
+    const { code } = db.createPairingCode();
+    db.consumePairingCode(code, { tenantId: "tenant", userId: "owner" });
+    db.setOwnerChat({ tenantId: "tenant", userId: "owner" }, "chat");
+    const outbound: unknown[] = [];
+    const testChannel = { ...channel, send: vi.fn().mockResolvedValue({ messageId: "sent" }), updateCard: vi.fn().mockResolvedValue(undefined) };
+    const adapter = new FeishuAdapter({ appId: "id", appSecret: "secret", store: db, channel: testChannel, onOutboundMessage: (message) => outbound.push(message) });
+
+    await adapter.sendText("hello");
+    await adapter.sendStatus({ sessionId: "session", turnId: "turn", title: "Task", projectName: "app", phase: "working", startedAt: 0, updatedAt: 1, safeSummary: "Working", recentCommands: [], actionTokens: { stop: "secret-stop", logs: "secret-logs", diff: "secret-diff" } });
+
+    expect(outbound).toHaveLength(2);
+    expect(JSON.stringify(outbound)).toContain("hello");
+    expect(JSON.stringify(outbound)).not.toContain("secret-stop");
+  });
+
   it("uses v2 callback behaviors and never offers session approval", () => {
     const approval = approvalCard({ approvalId: "a", sessionId: "s", turnId: "t", kind: "network", title: "Network", network: [{ host: "example.com", protocol: "https" }], actionTokens: { accept: "one", decline: "no", cancel: "stop" }, expiresAt: Date.now() + 60_000 });
     const json = JSON.stringify(approval);
@@ -51,9 +68,24 @@ describe("Feishu card rendering", () => {
     expect(json).not.toContain("Allow session");
   });
 
+  it("replaces an approval with a static executed-choice card", () => {
+    const card = resolvedApprovalCard({ title: "Command approval requested", decision: "accept", resolvedAt: 1 });
+    const json = JSON.stringify(card);
+    expect(json).toContain("Choice executed");
+    expect(json).toContain("Allowed once");
+    expect(json).not.toContain('"tag":"button"');
+  });
+
   it("renders bounded status actions", () => {
     const card = statusCard({ sessionId: "s", turnId: "t", title: "Task", projectName: "app", phase: "working", startedAt: 0, updatedAt: 10_000, safeSummary: "Working", recentCommands: ["pnpm test"], actionTokens: { stop: "s", logs: "l", diff: "d" } });
     expect(JSON.stringify(card)).toContain("pnpm test");
     expect(JSON.stringify(card)).toContain("**Session:** s");
+  });
+
+  it("partitions each Codex reply in the status card", () => {
+    const card = statusCard({ sessionId: "s", turnId: "t", title: "Task", projectName: "app", phase: "working", startedAt: 0, updatedAt: 10_000, safeSummary: "First reply\n\nSecond reply", replies: ["First reply", "Second reply"], recentCommands: [], actionTokens: { stop: "s", logs: "l", diff: "d" } });
+    const json = JSON.stringify(card);
+    expect(json.match(/"tag":"hr"/gu)).toHaveLength(3);
+    expect(json).not.toContain("First reply\\n\\nSecond reply");
   });
 });

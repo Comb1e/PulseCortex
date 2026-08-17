@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import pino from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentCapabilities, AgentDriver, AgentEvent, ApprovalId, ApprovalView, ChannelAction, ChannelCommand, ChoiceView, MessageRef, MessagingAdapter, OutputView, Project, QuestionView, SessionId, SessionOptions, SessionView, TurnId, TurnResultView, Unsubscribe } from "@pulsecortex/domain";
+import type { AgentCapabilities, AgentDriver, AgentEvent, AgentSessionInfo, ApprovalId, ApprovalResolutionView, ApprovalView, ChannelAction, ChannelCommand, ChoiceView, MessageRef, MessagingAdapter, OutputView, Project, QuestionView, SessionId, SessionOptions, SessionView, TurnId, TurnResultView, Unsubscribe } from "@pulsecortex/domain";
 import { CommandLogStore, ControllerStore } from "@pulsecortex/persistence";
 import { SessionCoordinator } from "./coordinator.js";
 
@@ -13,11 +13,14 @@ class FakeDriver implements AgentDriver {
   resumed: Array<{ id: SessionId; project: Project }> = [];
   started: Array<{ id: SessionId; prompt: string }> = [];
   steered: Array<{ id: SessionId; text: string }> = [];
+  discovered: AgentSessionInfo[] = [];
+  resumeError: Error | null = null;
   async start(): Promise<AgentCapabilities> { return { cliVersion: "0.147.0", protocolMajor: 2, userAgent: "fake", supportsSteer: true, supportsApprovals: true }; }
   async stop(): Promise<void> {}
   async createSession(_project: Project, _options: SessionOptions): Promise<SessionId> { return "session"; }
-  async resumeSession(id: SessionId, project: Project): Promise<void> { this.resumed.push({ id, project }); }
-  async startTurn(id: SessionId, prompt: string): Promise<TurnId> { this.started.push({ id, prompt }); return "turn"; }
+  async resumeSession(id: SessionId, project: Project): Promise<void> { this.resumed.push({ id, project }); if (this.resumeError) throw this.resumeError; }
+  async listSessions(_projects: Project[]): Promise<AgentSessionInfo[]> { return this.discovered; }
+  async startTurn(id: SessionId, prompt: string): Promise<TurnId> { this.started.push({ id, prompt }); return this.started.length === 1 ? "turn" : `turn-${this.started.length}`; }
   async steerTurn(id: SessionId, text: string): Promise<void> { this.steered.push({ id, text }); }
   async interruptTurn(_id: SessionId): Promise<void> {}
   async resolveApproval(id: ApprovalId, decision: "accept" | "decline" | "cancel"): Promise<void> { this.decisions.push({ id, decision }); }
@@ -30,15 +33,18 @@ class FakeMessaging implements MessagingAdapter {
   command?: (command: ChannelCommand) => Promise<void>;
   action?: (action: ChannelAction) => Promise<void>;
   approvals: ApprovalView[] = [];
+  approvalUpdates: ApprovalResolutionView[] = [];
   statuses: SessionView[] = [];
+  choices: ChoiceView[] = [];
   texts: string[] = [];
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
   async sendStatus(view: SessionView): Promise<MessageRef> { this.statuses.push(view); return { messageId: "message", chatId: "chat" }; }
   async updateStatus(_ref: MessageRef, view: SessionView): Promise<void> { this.statuses.push(view); }
   async sendApproval(view: ApprovalView): Promise<MessageRef> { this.approvals.push(view); return { messageId: "approval", chatId: "chat" }; }
+  async updateApproval(_ref: MessageRef, view: ApprovalResolutionView): Promise<void> { this.approvalUpdates.push(view); }
   async sendResult(_view: TurnResultView): Promise<void> {}
-  async sendChoices(_view: ChoiceView): Promise<void> {}
+  async sendChoices(view: ChoiceView): Promise<void> { this.choices.push(view); }
   async sendQuestion(_view: QuestionView): Promise<void> {}
   async sendOutput(_view: OutputView): Promise<void> {}
   async sendText(text: string): Promise<void> { this.texts.push(text); }
@@ -70,10 +76,31 @@ describe("session coordinator", () => {
     await messaging.action!(action);
     await messaging.action!({ ...action, eventId: "a-replay" });
     expect(driver.decisions).toEqual([{ id: "approval", decision: "accept" }]);
+    expect(messaging.approvalUpdates).toEqual([expect.objectContaining({ title: "Run tests", decision: "accept" })]);
     expect(db.inspectAudit().some((row) => row["event_type"] === "action.rejected")).toBe(true);
   });
 
-  it("sends a Feishu message to the addressed session only", async () => {
+  it("keeps separate Codex replies in the status view", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "work", receivedAt: Date.now() });
+
+    driver.emit({ type: "agent.message.delta", sessionId: "session", turnId: "turn", messageId: "reply-1", delta: "First ", occurredAt: Date.now() });
+    driver.emit({ type: "agent.message.delta", sessionId: "session", turnId: "turn", messageId: "reply-1", delta: "reply", occurredAt: Date.now() });
+    driver.emit({ type: "agent.message.delta", sessionId: "session", turnId: "turn", messageId: "reply-2", delta: "Second reply", occurredAt: Date.now() });
+    await messaging.command!({ eventId: "status", messageId: "status", actor, name: "status", args: [], text: "/status", receivedAt: Date.now() });
+
+    expect(messaging.statuses.at(-1)?.replies).toEqual(["First reply", "Second reply"]);
+  });
+
+  it("runs and addresses multiple Codex sessions independently", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();
     const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
@@ -96,6 +123,254 @@ describe("session coordinator", () => {
 
     await messaging.command!({ eventId: "other", messageId: "other", actor, name: "send", args: ["other-session", "wrong", "target"], text: "/send other-session wrong target", receivedAt: Date.now() });
     expect(driver.steered).toHaveLength(1);
-    expect(messaging.texts.at(-1)).toContain("target-session");
+    expect(driver.started.at(-1)).toEqual({ id: "other-session", prompt: "wrong target" });
+
+    await messaging.command!({ eventId: "selected", messageId: "selected", actor, name: "text", args: [], text: "message the selected session", receivedAt: Date.now() });
+    expect(driver.steered.at(-1)).toEqual({ id: "other-session", text: "message the selected session" });
+  });
+
+  it("discovers and steers an allowlisted Codex session started by another client", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [{ id: "live-codex", projectId: project.id, title: "Current Codex", state: "working", loaded: true, canAcceptDirectInput: true, activeTurnId: "live-turn", createdAt: 1, updatedAt: 2, botCreated: false }];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "sessions", messageId: "sessions", actor, name: "sessions", args: [], text: "/sessions", receivedAt: Date.now() });
+    expect(db.getSession("live-codex")).toMatchObject({ botCreated: false, state: "working", lastTurnId: "live-turn" });
+    const choice = messaging.choices[0]!.choices[0]!;
+    expect(choice.value).toBe("live-codex");
+    expect(driver.resumed[0]?.id).toBe("live-codex");
+
+    await messaging.action!({ eventId: "select-live", actor, kind: "session.select", token: choice.token, receivedAt: Date.now() });
+    await messaging.command!({ eventId: "send-live", messageId: "send-live", actor, name: "send", args: ["phone", "message"], text: "/send phone message", receivedAt: Date.now() });
+    expect(driver.steered.at(-1)).toEqual({ id: "live-codex", text: "phone message" });
+  });
+
+  it("selects and announces the sole running Codex session during startup", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [{ id: "startup-codex", projectId: project.id, title: "Already running", state: "working", loaded: true, canAcceptDirectInput: true, activeTurnId: "startup-turn", createdAt: 1, updatedAt: 2, botCreated: false }];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await coordinator.initialize();
+
+    expect(messaging.texts.at(-1)).toContain("Using running Codex session Already running in repo");
+    expect(messaging.texts.at(-1)).toContain("/send <message>");
+    await messaging.command!({ eventId: "send-default", messageId: "send-default", actor, name: "send", args: ["continue", "work"], text: "/send continue work", receivedAt: Date.now() });
+    expect(driver.steered.at(-1)).toEqual({ id: "startup-codex", text: "continue work" });
+  });
+
+  it("detects an idle controllable Codex session launched after startup", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await coordinator.initialize();
+
+    driver.discovered = [{ id: "idle-codex", projectId: project.id, title: "Idle terminal", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 3, botCreated: false }];
+    await coordinator.syncRunningSessions();
+
+    expect(messaging.texts.at(-1)).toContain("Using running Codex session Idle terminal in repo");
+    await messaging.command!({ eventId: "send-idle", messageId: "send-idle", actor, name: "send", args: ["start", "from", "Feishu"], text: "/send start from Feishu", receivedAt: Date.now() });
+    expect(driver.started.at(-1)).toEqual({ id: "idle-codex", prompt: "start from Feishu" });
+  });
+
+  it("makes a newly launched Codex the default when another session was selected", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    db.createSession({ id: "previous-default", projectId: project.id, title: "Previous default" });
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "resume-old", messageId: "resume-old", actor, name: "resume", args: ["previous-default"], text: "/resume previous-default", receivedAt: Date.now() });
+    driver.discovered = [{ id: "new-working-codex", projectId: project.id, title: "New working Codex", state: "working", loaded: true, canAcceptDirectInput: true, activeTurnId: "new-turn", createdAt: 1, updatedAt: 3, botCreated: false }];
+
+    await coordinator.syncRunningSessions();
+
+    expect(messaging.texts.at(-1)).toContain("Using running Codex session New working Codex in repo");
+    await messaging.command!({ eventId: "send-new-default", messageId: "send-new-default", actor, name: "send", args: ["continue", "from", "Feishu"], text: "/send continue from Feishu", receivedAt: Date.now() });
+    expect(driver.steered.at(-1)).toEqual({ id: "new-working-codex", text: "continue from Feishu" });
+  });
+
+  it("warns about a running standalone session without selecting or duplicating it", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [{ id: "foreign-codex", projectId: project.id, title: "Foreign runtime", state: "working", loaded: false, canAcceptDirectInput: false, createdAt: 1, updatedAt: 3, botCreated: false }];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await coordinator.initialize();
+    expect(messaging.texts.at(-1)).toContain("launched outside the PulseCortex shared app-server");
+    expect(messaging.texts.at(-1)).toContain("pnpm pulsectl codex repo");
+    await messaging.command!({ eventId: "projects-foreign", messageId: "projects-foreign", actor, name: "projects", args: [], text: "/projects", receivedAt: Date.now() });
+    await messaging.action!({ eventId: "choose-foreign", actor, kind: "project.select", token: messaging.choices[0]!.choices[0]!.token, receivedAt: Date.now() });
+    expect(messaging.texts.at(-1)).toContain("cannot receive Feishu messages");
+    expect(db.getSession("session")).toBeNull();
+    await messaging.command!({ eventId: "send-foreign", messageId: "send-foreign", actor, name: "send", args: ["hello"], text: "/send hello", receivedAt: Date.now() });
+    expect(messaging.texts.at(-1)).toContain("No session selected");
+    expect(driver.steered).toHaveLength(0);
+    expect(driver.started).toHaveLength(0);
+  });
+
+  it("uses a running session in the chosen project as the default", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    const otherProject = db.addProject("other", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [
+      { id: "chosen-codex", projectId: project.id, title: "Chosen project session", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 3, botCreated: false },
+      { id: "older-codex", projectId: project.id, title: "Older project session", state: "working", loaded: true, canAcceptDirectInput: true, activeTurnId: "older-turn", createdAt: 1, updatedAt: 2, botCreated: false },
+      { id: "other-codex", projectId: otherProject.id, title: "Other project session", state: "working", loaded: true, canAcceptDirectInput: true, activeTurnId: "other-turn", createdAt: 1, updatedAt: 4, botCreated: false },
+    ];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "projects", messageId: "projects", actor, name: "projects", args: [], text: "/projects", receivedAt: Date.now() });
+    const projectChoice = messaging.choices[0]!.choices.find((choice) => choice.value === project.id)!;
+    await messaging.action!({ eventId: "choose-project", actor, kind: "project.select", token: projectChoice.token, receivedAt: Date.now() });
+
+    expect(messaging.texts.at(-1)).toContain("Using running Codex session Chosen project session in repo");
+    expect(db.getSession("session")).toBeNull();
+    await messaging.command!({ eventId: "send-project", messageId: "send-project", actor, name: "send", args: ["project", "follow-up"], text: "/send project follow-up", receivedAt: Date.now() });
+    expect(driver.started.at(-1)).toEqual({ id: "chosen-codex", prompt: "project follow-up" });
+  });
+
+  it("creates a new session in the chosen project without repeating its name", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [{ id: "selected-session", projectId: project.id, title: "Selected session", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 2, botCreated: false }];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "projects", messageId: "projects", actor, name: "projects", args: [], text: "/projects", receivedAt: Date.now() });
+    await messaging.action!({ eventId: "choose-project", actor, kind: "project.select", token: messaging.choices[0]!.choices[0]!.token, receivedAt: Date.now() });
+    await messaging.command!({ eventId: "new", messageId: "new", actor, name: "new", args: ["implement", "the", "feature"], text: "/new implement the feature", receivedAt: Date.now() });
+
+    expect(db.getSession("session")?.projectId).toBe(project.id);
+    expect(driver.started.at(-1)).toEqual({ id: "session", prompt: "implement the feature" });
+  });
+
+  it("creates an empty new session in the chosen project", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [{ id: "selected-session", projectId: project.id, title: "Selected session", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 2, botCreated: false }];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "projects", messageId: "projects", actor, name: "projects", args: [], text: "/projects", receivedAt: Date.now() });
+    await messaging.action!({ eventId: "choose-project", actor, kind: "project.select", token: messaging.choices[0]!.choices[0]!.token, receivedAt: Date.now() });
+    await messaging.command!({ eventId: "new", messageId: "new", actor, name: "new", args: [], text: "/new", receivedAt: Date.now() });
+
+    expect(db.getSession("session")?.projectId).toBe(project.id);
+    expect(driver.started).toHaveLength(0);
+    expect(messaging.texts.at(-1)).toBe("Session created for repo. Send the task when ready.");
+  });
+
+  it("refreshes a stored session before sending when another client started its turn", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    db.createSession({ id: "stored-live", projectId: project.id, title: "Stored session" });
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [{ id: "stored-live", projectId: project.id, title: "Stored session", state: "working", loaded: true, canAcceptDirectInput: true, activeTurnId: "terminal-turn", createdAt: 1, updatedAt: 2, botCreated: true }];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "send-live", messageId: "send-live", actor, name: "send", args: ["stored-live", "from", "phone"], text: "/send stored-live from phone", receivedAt: Date.now() });
+
+    expect(driver.started).toHaveLength(0);
+    expect(driver.steered).toEqual([{ id: "stored-live", text: "from phone" }]);
+  });
+
+  it("paginates session choices three at a time and bounds preview text", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    const longTitle = Array.from({ length: 120 }, (_, index) => `word${index}`).join(" ");
+    for (let index = 0; index < 5; index += 1) db.createSession({ id: `session-${index}`, projectId: project.id, title: index === 0 ? longTitle : `Session ${index}` });
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "sessions", messageId: "sessions", actor, name: "sessions", args: [], text: "/sessions", receivedAt: Date.now() });
+    expect(messaging.choices[0]?.choices).toHaveLength(3);
+    expect(messaging.choices[0]?.nextToken).toBeTruthy();
+    expect(Math.max(...messaging.choices[0]!.choices.map((choice) => choice.label.split(/\s+/u).length))).toBeLessThanOrEqual(100);
+
+    await messaging.action!({ eventId: "more", actor, kind: "sessions.more", token: messaging.choices[0]!.nextToken!, receivedAt: Date.now() });
+    expect(messaging.choices[1]?.choices).toHaveLength(2);
+    expect(messaging.choices[1]?.nextToken).toBeUndefined();
+    expect(messaging.choices[1]?.previousToken).toBeTruthy();
+    const truncated = messaging.choices.flatMap((view) => view.choices).find((choice) => choice.value === "session-0")!.label;
+    expect(truncated.split(/\s+/u)).toHaveLength(100);
+    expect(truncated.endsWith("...")).toBe(true);
+  });
+
+  it("reports a session owned by another Codex runtime instead of failing silently", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    db.createSession({ id: "foreign", projectId: project.id, title: "Foreign session" });
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.resumeError = new Error("thread foreign already has an active writer");
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "sessions", messageId: "sessions", actor, name: "sessions", args: [], text: "/sessions", receivedAt: Date.now() });
+    const choice = messaging.choices[0]!.choices[0]!;
+    await messaging.action!({ eventId: "select", actor, kind: "session.select", token: choice.token, receivedAt: Date.now() });
+
+    expect(messaging.texts.at(-1)).toContain("open in a separate Codex runtime");
+    expect(db.inspectAudit().some((row) => row["event_type"] === "session.select.failed")).toBe(true);
   });
 });

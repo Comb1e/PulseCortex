@@ -1,4 +1,4 @@
-import type { ApprovalView, ChoiceView, OutputView, QuestionView, SessionView, TurnResultView } from "@pulsecortex/domain";
+import type { ApprovalResolutionView, ApprovalView, ChoiceView, OutputView, QuestionView, SessionView, TurnResultView } from "@pulsecortex/domain";
 import { redact } from "@pulsecortex/domain";
 
 type Card = Record<string, unknown>;
@@ -46,9 +46,18 @@ function elapsed(startedAt: number, at: number): string {
 
 export function statusCard(view: SessionView): Card {
   const commands = view.recentCommands.length ? view.recentCommands.map((name) => `- ${escapeMarkdown(name)}`).join("\n") : "- None";
-  const pending = view.pendingApproval ? `\n**Approval:** ${escapeMarkdown(view.pendingApproval.kind)} - ${escapeMarkdown(view.pendingApproval.summary)}` : "";
+  const metadata = `**Session:** ${escapeMarkdown(view.sessionId)}\n**Project:** ${escapeMarkdown(view.projectName)}\n**Phase:** ${escapeMarkdown(view.phase)}\n**Elapsed:** ${elapsed(view.startedAt, view.updatedAt)}`;
+  const replies = view.replies?.filter((reply) => reply.trim()) ?? [];
+  const replyElements: Card[] = replies.length
+    ? replies.flatMap((reply, index) => [...(index ? [{ tag: "hr" }] : []), markdown(escapeMarkdown(reply))])
+    : [markdown(escapeMarkdown(view.safeSummary || "Waiting for Codex..."))];
   return baseCard(view.title, [
-    markdown(`**Session:** ${escapeMarkdown(view.sessionId)}\n**Project:** ${escapeMarkdown(view.projectName)}\n**Phase:** ${escapeMarkdown(view.phase)}\n**Elapsed:** ${elapsed(view.startedAt, view.updatedAt)}${pending}\n\n${escapeMarkdown(view.safeSummary || "Waiting for Codex...")}\n\n**Recent commands**\n${commands}`),
+    markdown(metadata),
+    ...(view.pendingApproval ? [markdown(`**Approval:** ${escapeMarkdown(view.pendingApproval.kind)} - ${escapeMarkdown(view.pendingApproval.summary)}`)] : []),
+    { tag: "hr" },
+    ...replyElements,
+    { tag: "hr" },
+    markdown(`**Recent commands**\n${commands}`),
     buttonRow([
       button("Stop", "turn.stop", view.actionTokens.stop, undefined, "danger"),
       button("Logs", "logs.show", view.actionTokens.logs),
@@ -75,6 +84,12 @@ export function approvalCard(view: ApprovalView): Card {
   ], "orange");
 }
 
+export function resolvedApprovalCard(view: ApprovalResolutionView): Card {
+  const label = view.decision === "accept" ? "Allowed once" : view.decision === "decline" ? "Denied" : "Turn stopped";
+  const template = view.decision === "accept" ? "green" : view.decision === "decline" ? "red" : "grey";
+  return baseCard(view.title, [markdown(`**Choice executed:** ${label}\n**Resolved:** ${new Date(view.resolvedAt).toISOString()}`)], template);
+}
+
 export function resultCard(view: TurnResultView): Card {
   return baseCard(view.title, [
     markdown(`**Session:** ${escapeMarkdown(view.sessionId)}\n**Status:** ${escapeMarkdown(view.status)}\n**Project:** ${escapeMarkdown(view.projectName)}\n**Changed files:** ${view.changedFileCount}\n**Tests:** ${escapeMarkdown(view.testSummary || "Not reported")}\n\n${escapeMarkdown(view.summary)}`),
@@ -95,7 +110,10 @@ export function choiceCard(view: ChoiceView): Card {
     if (choice.description) elements.push(markdown(`**${escapeMarkdown(choice.label)}**\n${escapeMarkdown(choice.description)}`));
     elements.push(buttonRow([button(choice.label, view.actionKind, choice.token, choice.value, "primary")]));
   }
-  if (view.choices.length > 20) elements.push(markdown(`[Showing 20 of ${view.choices.length} choices]`));
+  const navigation: Card[] = [];
+  if (view.previousToken) navigation.push(button("Previous", "sessions.more", view.previousToken));
+  if (view.nextToken) navigation.push(button("Show more", "sessions.more", view.nextToken, undefined, "primary"));
+  if (navigation.length) elements.push({ tag: "hr" }, buttonRow(navigation));
   return baseCard(view.title, elements);
 }
 

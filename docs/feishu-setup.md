@@ -45,4 +45,6 @@ Use a developer tenant before production:
 4. Exercise Allow once, Deny, and Stop on approval cards.
 5. Disconnect internet temporarily, allow Codex to continue, reconnect, and verify queued milestones/results arrive.
 6. Restart during a turn and verify the turn becomes `interrupted_unknown` rather than completed.
-7. Verify no TCP listener appears for the daemon.
+7. Verify the Codex app-server TCP listener is bound only to the configured loopback address, and that no PulseCortex port is reachable from another machine.
+8. Install the shell integration with `pnpm pulsectl shell install`, open a new terminal, and launch ordinary `codex` from a registered project or one of its subdirectories. Without restarting PulseCortex, verify Feishu announces the loaded session within a few seconds. Send `/send <message>` and confirm the running session is steered; then select another session through `/sessions` and repeat.
+9. Create at least four sessions and verify `/sessions` shows three at a time, caps previews at 100 words, and exposes Show more navigation.

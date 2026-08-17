@@ -2,9 +2,9 @@ import {
   Domain, LoggerLevel, createLarkChannel,
   type CardActionEvent, type LarkChannel, type LarkChannelError, type NormalizedMessage,
 } from "@larksuiteoapi/node-sdk";
-import { parseCommand, redact, type ChannelAction, type ChannelCommand, type MessagingAdapter, type MessageRef, type ApprovalView, type ChoiceView, type OutputView, type QuestionView, type SessionView, type TurnResultView } from "@pulsecortex/domain";
+import { parseCommand, redact, type ChannelAction, type ChannelCommand, type MessagingAdapter, type MessageRef, type ApprovalResolutionView, type ApprovalView, type ChoiceView, type OutputView, type QuestionView, type SessionView, type TurnResultView } from "@pulsecortex/domain";
 import type { ControllerStore } from "@pulsecortex/persistence";
-import { approvalCard, choiceCard, outputCard, questionCard, resultCard, statusCard } from "./cards.js";
+import { approvalCard, choiceCard, outputCard, questionCard, resolvedApprovalCard, resultCard, statusCard } from "./cards.js";
 
 interface ChannelLike {
   connect(): Promise<void>;
@@ -24,6 +24,15 @@ export interface FeishuAdapterOptions {
   store: ControllerStore;
   channel?: ChannelLike;
   onConnectionChange?: (connected: boolean) => void;
+  onOutboundMessage?: (message: FeishuOutboundMessage) => void;
+}
+
+export interface FeishuOutboundMessage {
+  kind: "text" | "status" | "approval" | "result" | "choices" | "question" | "output";
+  operation: "send" | "update";
+  chatId: string;
+  messageId?: string;
+  content: unknown;
 }
 
 type RawMessage = { sender?: { tenant_key?: string } };
@@ -132,16 +141,52 @@ export class FeishuAdapter implements MessagingAdapter {
     void Promise.resolve(this.actionHandler?.(action)).catch((error) => this.options.store.audit({ eventType: "handler.failed", summary: redact((error as Error).message).slice(0, 500), actor }));
   }
 
-  async sendStatus(view: SessionView): Promise<MessageRef> { return this.sendCard(statusCard(view)); }
-  async updateStatus(ref: MessageRef, view: SessionView): Promise<void> { await retryTransient(() => this.channel.updateCard(ref.messageId, statusCard(view))); }
-  async sendApproval(view: ApprovalView): Promise<MessageRef> { return this.sendCard(approvalCard(view)); }
-  async sendResult(view: TurnResultView): Promise<void> { await this.sendCard(resultCard(view)); }
-  async sendChoices(view: ChoiceView): Promise<void> { await this.sendCard(choiceCard(view)); }
-  async sendQuestion(view: QuestionView): Promise<void> { await this.sendCard(questionCard(view)); }
-  async sendOutput(view: OutputView): Promise<void> { await this.sendCard(outputCard(view)); }
+  async sendStatus(view: SessionView): Promise<MessageRef> {
+    const ref = await this.sendCard(statusCard(view));
+    const { actionTokens: _, ...content } = view;
+    this.reportOutbound({ kind: "status", operation: "send", ...ref, content });
+    return ref;
+  }
+  async updateStatus(ref: MessageRef, view: SessionView): Promise<void> {
+    await retryTransient(() => this.channel.updateCard(ref.messageId, statusCard(view)));
+    const { actionTokens: _, ...content } = view;
+    this.reportOutbound({ kind: "status", operation: "update", ...ref, content });
+  }
+  async sendApproval(view: ApprovalView): Promise<MessageRef> {
+    const ref = await this.sendCard(approvalCard(view));
+    const { actionTokens: _, ...content } = view;
+    this.reportOutbound({ kind: "approval", operation: "send", ...ref, content });
+    return ref;
+  }
+  async updateApproval(ref: MessageRef, resolution: ApprovalResolutionView): Promise<void> {
+    await retryTransient(() => this.channel.updateCard(ref.messageId, resolvedApprovalCard(resolution)));
+    this.reportOutbound({ kind: "approval", operation: "update", ...ref, content: resolution });
+  }
+  async sendResult(view: TurnResultView): Promise<void> {
+    const ref = await this.sendCard(resultCard(view));
+    const { actionTokens: _, ...content } = view;
+    this.reportOutbound({ kind: "result", operation: "send", ...ref, content });
+  }
+  async sendChoices(view: ChoiceView): Promise<void> {
+    const ref = await this.sendCard(choiceCard(view));
+    const { previousToken: _, nextToken: __, ...safeView } = view;
+    const content = { ...safeView, choices: view.choices.map(({ token: ___, value: ____, ...choice }) => choice) };
+    this.reportOutbound({ kind: "choices", operation: "send", ...ref, content });
+  }
+  async sendQuestion(view: QuestionView): Promise<void> {
+    const ref = await this.sendCard(questionCard(view));
+    const content = { ...view, options: view.options.map(({ token: _, value: __, ...option }) => option) };
+    this.reportOutbound({ kind: "question", operation: "send", ...ref, content });
+  }
+  async sendOutput(view: OutputView): Promise<void> {
+    const ref = await this.sendCard(outputCard(view));
+    const { previousToken: _, nextToken: __, ...content } = view;
+    this.reportOutbound({ kind: "output", operation: "send", ...ref, content });
+  }
   async sendText(text: string): Promise<void> {
     const chatId = this.ownerChat(); const safe = redact(text); const bounded = safe.length > 3_500 ? `${safe.slice(0, 3_460)}\n[Output truncated]` : safe;
-    await retryTransient(() => this.channel.send(chatId, { text: bounded }));
+    const sent = await retryTransient(() => this.channel.send(chatId, { text: bounded }));
+    this.reportOutbound({ kind: "text", operation: "send", chatId, messageId: sent.messageId, content: bounded });
   }
   connectionStatus(): unknown { return this.channel.getConnectionStatus?.(); }
 
@@ -155,5 +200,9 @@ export class FeishuAdapter implements MessagingAdapter {
     const chatId = this.options.store.getOwner()?.chatId;
     if (!chatId) throw new Error("The paired owner has no direct-chat destination yet");
     return chatId;
+  }
+
+  private reportOutbound(message: FeishuOutboundMessage): void {
+    this.options.onOutboundMessage?.(message);
   }
 }

@@ -33,6 +33,19 @@ export interface AgentCapabilities {
   supportsApprovals: boolean;
 }
 
+export interface AgentSessionInfo {
+  id: SessionId;
+  projectId: string;
+  title: string;
+  state: TurnPhase | "idle";
+  loaded: boolean;
+  canAcceptDirectInput: boolean;
+  activeTurnId?: TurnId;
+  createdAt: number;
+  updatedAt: number;
+  botCreated: boolean;
+}
+
 export type TurnPhase =
   | "starting"
   | "working"
@@ -52,6 +65,7 @@ export interface SessionView {
   startedAt: number;
   updatedAt: number;
   safeSummary: string;
+  replies?: string[];
   recentCommands: string[];
   pendingApproval?: { id: ApprovalId; kind: ApprovalKind; summary: string };
   actionTokens: { stop: string; logs: string; diff: string };
@@ -80,6 +94,12 @@ export interface ApprovalView {
   expiresAt: number;
 }
 
+export interface ApprovalResolutionView {
+  title: string;
+  decision: "accept" | "decline" | "cancel";
+  resolvedAt: number;
+}
+
 export interface TurnResultView {
   sessionId: SessionId;
   turnId: TurnId;
@@ -97,6 +117,8 @@ export interface ChoiceView {
   description?: string;
   actionKind: "project.select" | "session.select";
   choices: Array<{ label: string; description?: string; token: string; value: string }>;
+  previousToken?: string;
+  nextToken?: string;
 }
 
 export interface QuestionView {
@@ -155,6 +177,7 @@ export type ChannelActionKind =
   | "diff.show"
   | "session.continue"
   | "task.new"
+  | "sessions.more"
   | "project.select"
   | "session.select"
   | "input.answer";
@@ -183,7 +206,7 @@ export interface InputQuestion {
 
 export type AgentEvent =
   | { type: "turn.started"; sessionId: SessionId; turnId: TurnId; occurredAt: number }
-  | { type: "agent.message.delta"; sessionId: SessionId; turnId: TurnId; delta: string; occurredAt: number }
+  | { type: "agent.message.delta"; sessionId: SessionId; turnId: TurnId; messageId?: string; delta: string; occurredAt: number }
   | { type: "command.started"; sessionId: SessionId; turnId: TurnId; commandId: string; command: string; occurredAt: number }
   | { type: "command.completed"; sessionId: SessionId; turnId: TurnId; commandId: string; exitCode?: number; occurredAt: number }
   | { type: "approval.requested"; sessionId: SessionId; turnId: TurnId; approvalId: ApprovalId; kind: ApprovalKind; title: string; reason?: string; command?: string; files?: string[]; paths?: string[]; network?: NetworkDestination[]; occurredAt: number }

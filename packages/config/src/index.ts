@@ -12,6 +12,12 @@ const ConfigSchema = z.object({
   logMaxBytes: z.number().int().min(1_000_000).max(2_000_000_000).default(100_000_000),
   redactionPatterns: z.array(z.string()).default([]),
   feishuDomain: z.enum(["feishu", "lark"]).default("feishu"),
+  codexAppServerUrl: z.string().refine((value) => {
+    try {
+      const url = new URL(value);
+      return url.protocol === "ws:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) && !!url.port && url.pathname === "/";
+    } catch { return false; }
+  }, "codexAppServerUrl must be a loopback ws:// URL with an explicit port").default("ws://127.0.0.1:4500"),
   logLevel: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
 });
 

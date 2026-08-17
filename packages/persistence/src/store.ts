@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import {
   normalizePathForComparison,
   pathsOverlap,
+  type AgentSessionInfo,
   type OwnerIdentity,
   type Project,
   type SessionState,
@@ -140,12 +141,28 @@ export class ControllerStore {
     return this.getSession(input.id)!;
   }
 
-  getSession(id: string): StoredSession | null { const row = this.database.prepare("SELECT * FROM sessions WHERE id = ? AND bot_created = 1").get(id); return row ? parseSession(row) : null; }
-  listSessions(limit = 20): StoredSession[] { return this.database.prepare("SELECT * FROM sessions WHERE bot_created = 1 ORDER BY updated_at DESC LIMIT ?").all(limit).map(parseSession); }
+  getSession(id: string): StoredSession | null { const row = this.database.prepare("SELECT * FROM sessions WHERE id = ?").get(id); return row ? parseSession(row) : null; }
+  listSessions(limit = 20): StoredSession[] { return this.database.prepare("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?").all(limit).map(parseSession); }
+
+  upsertDiscoveredSession(input: AgentSessionInfo): StoredSession {
+    this.database.prepare(`INSERT INTO sessions(id, project_id, title, created_at, updated_at, last_turn_id, state, bot_created)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, title=excluded.title, updated_at=excluded.updated_at,
+        last_turn_id=COALESCE(excluded.last_turn_id, sessions.last_turn_id), state=excluded.state`)
+      .run(input.id, input.projectId, input.title, input.createdAt, input.updatedAt, input.activeTurnId ?? null, input.state, input.botCreated ? 1 : 0);
+    return this.getSession(input.id)!;
+  }
+
+  attachTurn(input: { id: string; sessionId: string; state: SessionState; startedAt: number }): void {
+    this.database.prepare(`INSERT OR IGNORE INTO turns(id, session_id, state, prompt_hash, started_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(input.id, input.sessionId, input.state, sha256(""), input.startedAt, Date.now());
+    this.database.prepare("UPDATE sessions SET last_turn_id=?, state=?, updated_at=? WHERE id=?").run(input.id, input.state, Date.now(), input.sessionId);
+  }
 
   updateSessionState(id: string, state: SessionState, turnId?: string): void {
     const now = Date.now();
-    this.database.prepare("UPDATE sessions SET state = ?, last_turn_id = COALESCE(?, last_turn_id), updated_at = ? WHERE id = ? AND bot_created = 1").run(state, turnId ?? null, now, id);
+    this.database.prepare("UPDATE sessions SET state = ?, last_turn_id = COALESCE(?, last_turn_id), updated_at = ? WHERE id = ?").run(state, turnId ?? null, now, id);
   }
 
   createTurn(input: { id: string; sessionId: string; prompt: string }): void {
