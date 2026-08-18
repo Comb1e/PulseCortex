@@ -64,13 +64,13 @@ program.command("init").description("Create non-secret config and a permission-r
 });
 
 const project = program.command("project").description("Manage the local project allowlist");
-project.command("add").argument("<name>").argument("<path>").action(async (name: string, inputPath: string) => {
+project.command("add").description("Register a project directory").argument("<name>").argument("<path>").action(async (name: string, inputPath: string) => {
   const canonical = await canonicalProjectPath(inputPath);
   const added = await withStore((store) => store.addProject(name, canonical));
   process.stdout.write(`Registered ${added.name}: ${added.canonicalPath}\n`);
 });
-project.command("list").action(async () => { const projects = await withStore((store) => store.listProjects()); process.stdout.write(projects.length ? projects.map((item) => `${item.name}\t${item.canonicalPath}`).join("\n") + "\n" : "No projects registered.\n"); });
-project.command("remove").argument("<name>").action(async (name: string) => { const removed = await withStore((store) => store.removeProject(name)); process.stdout.write(removed ? `Removed ${name}\n` : `Project ${name} was not found\n`); });
+project.command("list").description("List registered projects").action(async () => { const projects = await withStore((store) => store.listProjects()); process.stdout.write(projects.length ? projects.map((item) => `${item.name}\t${item.canonicalPath}`).join("\n") + "\n" : "No projects registered.\n"); });
+project.command("remove").description("Remove a registered project").argument("<name>").action(async (name: string) => { const removed = await withStore((store) => store.removeProject(name)); process.stdout.write(removed ? `Removed ${name}\n` : `Project ${name} was not found\n`); });
 
 program.command("pair").description("Generate a short-lived owner pairing code").option("--ttl <minutes>", "expiry in minutes", "10").action(async (options: { ttl: string }) => {
   const minutes = Number(options.ttl);

@@ -50,6 +50,7 @@ The explicit `pnpm pulsectl codex` launcher remains available. An explicitly sup
 ```powershell
 pnpm pulsectl diagnose
 pnpm pulsectl project list
+pnpm pulsectl project remove <project-name>
 pnpm pulsectl db sessions --limit 20
 pnpm pulsectl db delivery_queue --limit 20
 ```

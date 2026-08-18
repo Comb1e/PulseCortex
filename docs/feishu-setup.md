@@ -9,7 +9,7 @@ PulseCortex requires an application bot. A one-way custom webhook bot cannot rec
    - Send messages as the application bot: `im:message:send_as_bot`
 4. Do not grant group-message scopes. PulseCortex rejects group events even if the application later receives one.
 5. Under Events and Callbacks > Event Configuration, select **long connection** delivery and subscribe to `im.message.receive_v1`.
-6. Under Events and Callbacks > Callback Configuration, select **long connection** delivery and subscribe to the new `card.action.trigger` callback. Do not select the legacy `card.action.trigger_v1` callback.
+6. Under Events and Callbacks > Callback Configuration, select **long connection** delivery and subscribe to the `card.action.trigger` callback.
 7. Publish an application version and make the bot available only to the intended owner during initial testing.
 8. Obtain App ID and App Secret from Credentials and Basic Information. Put them only in the local restricted environment file or service-manager environment.
 

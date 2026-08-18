@@ -73,8 +73,7 @@ creates the secret environment file with mode `0600`.
 6. Open **Events and Callbacks > Event Configuration**, select **Long
    Connection**, and subscribe to `im.message.receive_v1`.
 7. Open **Events and Callbacks > Callback Configuration**, select **Long
-   Connection**, and subscribe to `card.action.trigger`. Do not select the
-   legacy `card.action.trigger_v1` callback.
+   Connection**, and subscribe to `card.action.trigger`.
 8. Create and publish an application version. Restrict the application's
    availability to the intended owner during initial testing. Permission,
    subscription, and availability changes do not take effect until published.
@@ -106,6 +105,13 @@ pnpm pulsectl pair
 ```
 
 Start the daemon with `pnpm start`, direct-message `/pair <code>` to the bot, then use `/projects` or `/new pulsecortex`. Daemon events are formatted for terminal reading and saved below the data directory as `daemon.log` (readable) and `daemon.jsonl` (structured). During development, `pnpm dev` runs the TypeScript source directly.
+
+List registered projects or remove one by its name without deleting its files:
+
+```powershell
+pnpm pulsectl project list
+pnpm pulsectl project remove pulsecortex
+```
 
 PulseCortex remembers the most recently selected project in `settings.json` below its data directory. On the next daemon start it prefers that project's newest controllable Codex session, or uses the project for the next task when no session is running. Inspect or override local preferences with:
 
