@@ -7,7 +7,7 @@ import { approvalCard, resolvedApprovalCard, statusCard } from "./cards.js";
 const stores: ControllerStore[] = [];
 afterEach(() => { while (stores.length) stores.pop()?.close(); });
 function store(): ControllerStore { const value = new ControllerStore(":memory:"); stores.push(value); return value; }
-const channel = { connect: vi.fn(), disconnect: vi.fn(), on: vi.fn(), send: vi.fn(), updateCard: vi.fn() };
+const channel = { connect: vi.fn(), disconnect: vi.fn(), on: vi.fn(), send: vi.fn(), updateCard: vi.fn(), recallMessage: vi.fn() };
 
 function message(content: string, user = "owner"): NormalizedMessage {
   return { messageId: `m-${content}`, chatId: "chat", chatType: "p2p", senderId: user, content, rawContentType: "text", resources: [], mentions: [], mentionAll: false, mentionedBot: false, createTime: Date.now(), raw: { sender: { tenant_key: "tenant" } } };
@@ -74,6 +74,16 @@ describe("Feishu card rendering", () => {
     expect(json).toContain("Choice executed");
     expect(json).toContain("Allowed once");
     expect(json).not.toContain('"tag":"button"');
+  });
+
+  it("recalls a resolved approval so the working card returns to the bottom", async () => {
+    const db = store();
+    const recallMessage = vi.fn().mockResolvedValue(undefined);
+    const adapter = new FeishuAdapter({ appId: "id", appSecret: "secret", store: db, channel: { ...channel, recallMessage } });
+
+    await adapter.removeApproval({ messageId: "approval-message", chatId: "chat" });
+
+    expect(recallMessage).toHaveBeenCalledWith("approval-message");
   });
 
   it("renders bounded status actions", () => {

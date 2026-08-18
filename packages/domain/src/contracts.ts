@@ -27,6 +27,8 @@ export interface MessagingAdapter {
   updateStatus(ref: MessageRef, view: SessionView): Promise<void>;
   sendApproval(request: ApprovalView): Promise<MessageRef>;
   updateApproval(ref: MessageRef, resolution: ApprovalResolutionView): Promise<void>;
+  /** Remove a resolved approval prompt so the active status card is last in chat. */
+  removeApproval?(ref: MessageRef): Promise<void>;
   sendResult(result: TurnResultView): Promise<void>;
   sendChoices(view: ChoiceView): Promise<void>;
   sendQuestion(view: QuestionView): Promise<void>;

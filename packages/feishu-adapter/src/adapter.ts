@@ -14,6 +14,7 @@ interface ChannelLike {
   on(name: "error" | "reconnecting" | "reconnected", handler: (...args: never[]) => void): unknown;
   send(to: string, input: { text: string } | { card: object }): Promise<{ messageId: string }>;
   updateCard(messageId: string, card: object): Promise<void>;
+  recallMessage?(messageId: string): Promise<void>;
   getConnectionStatus?(): unknown;
 }
 
@@ -29,7 +30,7 @@ export interface FeishuAdapterOptions {
 
 export interface FeishuOutboundMessage {
   kind: "text" | "status" | "approval" | "result" | "choices" | "question" | "output";
-  operation: "send" | "update";
+  operation: "send" | "update" | "remove";
   chatId: string;
   messageId?: string;
   content: unknown;
@@ -161,6 +162,11 @@ export class FeishuAdapter implements MessagingAdapter {
   async updateApproval(ref: MessageRef, resolution: ApprovalResolutionView): Promise<void> {
     await retryTransient(() => this.channel.updateCard(ref.messageId, resolvedApprovalCard(resolution)));
     this.reportOutbound({ kind: "approval", operation: "update", ...ref, content: resolution });
+  }
+  async removeApproval(ref: MessageRef): Promise<void> {
+    if (!this.channel.recallMessage) return;
+    await retryTransient(() => this.channel.recallMessage!(ref.messageId));
+    this.reportOutbound({ kind: "approval", operation: "remove", ...ref, content: { removed: true } });
   }
   async sendResult(view: TurnResultView): Promise<void> {
     const ref = await this.sendCard(resultCard(view));

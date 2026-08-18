@@ -71,7 +71,7 @@ interface SessionRefreshResult {
   newlyUncontrollable: ProjectSession[];
 }
 
-type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "result" | "choices" | "question" | "output";
+type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "approval.remove" | "result" | "choices" | "question" | "output";
 const SESSION_DISCOVERY_INTERVAL_MS = 2_000;
 
 const HELP = `PulseCortex commands:
@@ -695,6 +695,9 @@ export class SessionCoordinator {
     if (!pending.ref) return;
     const resolution: ApprovalResolutionView = { title: pending.summary, decision, resolvedAt: Date.now() };
     await this.safeSend("approval.update", { ref: pending.ref, resolution }, () => this.messaging.updateApproval(pending.ref!, resolution), { ref: pending.ref, resolution }, `approval:${pending.id}:resolution`);
+    if (this.messaging.removeApproval) {
+      await this.safeSend("approval.remove", { ref: pending.ref }, () => this.messaging.removeApproval!(pending.ref!), { ref: pending.ref }, `approval:${pending.id}:remove`);
+    }
   }
 
   private makeRuntime(session: StoredSession, project: Project, turnId: string, phase: TurnPhase, startedAt: number, safeSummary: string): RuntimeTurn {
@@ -796,6 +799,11 @@ export class SessionCoordinator {
         break;
       }
       case "approval.update": { const value = payload as unknown as { ref: MessageRef; resolution: ApprovalResolutionView }; await this.messaging.updateApproval(value.ref, value.resolution); break; }
+      case "approval.remove": {
+        const value = payload as unknown as { ref: MessageRef };
+        if (this.messaging.removeApproval) await this.messaging.removeApproval(value.ref);
+        break;
+      }
       case "result": await this.messaging.sendResult(payload as unknown as TurnResultView); break;
       case "choices": await this.messaging.sendChoices(payload as unknown as ChoiceView); break;
       case "question": await this.messaging.sendQuestion(payload as unknown as QuestionView); break;

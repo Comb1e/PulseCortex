@@ -35,6 +35,7 @@ class FakeMessaging implements MessagingAdapter {
   approvals: ApprovalView[] = [];
   approvalUpdates: ApprovalResolutionView[] = [];
   approvalUpdateRefs: MessageRef[] = [];
+  approvalRemovalRefs: MessageRef[] = [];
   statuses: SessionView[] = [];
   choices: ChoiceView[] = [];
   results: TurnResultView[] = [];
@@ -46,6 +47,7 @@ class FakeMessaging implements MessagingAdapter {
   async updateStatus(_ref: MessageRef, view: SessionView): Promise<void> { this.statuses.push(view); }
   async sendApproval(view: ApprovalView): Promise<MessageRef> { this.approvals.push(view); return { messageId: view.approvalId, chatId: "chat" }; }
   async updateApproval(ref: MessageRef, view: ApprovalResolutionView): Promise<void> { this.approvalUpdateRefs.push(ref); this.approvalUpdates.push(view); }
+  async removeApproval(ref: MessageRef): Promise<void> { this.approvalRemovalRefs.push(ref); }
   async sendResult(view: TurnResultView): Promise<void> { this.results.push(view); }
   async sendChoices(view: ChoiceView): Promise<void> { this.choices.push(view); }
   async sendQuestion(_view: QuestionView): Promise<void> {}
@@ -80,6 +82,7 @@ describe("session coordinator", () => {
     await messaging.action!({ ...action, eventId: "a-replay" });
     expect(driver.decisions).toEqual([{ id: "approval", decision: "accept" }]);
     expect(messaging.approvalUpdates).toEqual([expect.objectContaining({ title: "Run tests", decision: "accept" })]);
+    expect(messaging.approvalRemovalRefs).toEqual([{ messageId: "approval", chatId: "chat" }]);
     expect(db.inspectAudit().some((row) => row["event_type"] === "action.rejected")).toBe(true);
   });
 
