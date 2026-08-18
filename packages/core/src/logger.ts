@@ -7,6 +7,7 @@ const LEVEL_COLORS: Record<string, string> = { TRACE: "\u001b[90m", DEBUG: "\u00
 const RESET = "\u001b[0m";
 const DIM = "\u001b[2m";
 const LOG_METADATA = new Set(["level", "time", "pid", "hostname", "service", "msg"]);
+const LIVE_MESSAGE_KINDS = new Set(["status", "approval", "result"]);
 
 interface LogTarget { write(content: string): unknown }
 
@@ -48,7 +49,7 @@ export function formatLogRecord(record: Record<string, unknown>, color = false):
 
 class PrettyLogStream extends Writable {
   private buffered = "";
-  private readonly liveFingerprints = new Map<string, string>();
+  private readonly liveRecords = new Map<string, { rendered: string; lines: number; fingerprint: string }>();
 
   constructor(private readonly target: LogTarget, private readonly color: boolean, private readonly liveStatus = false) { super(); }
 
@@ -74,16 +75,28 @@ class PrettyLogStream extends Writable {
       const record = JSON.parse(line) as Record<string, unknown>;
       const liveKey = this.liveKey(record);
       if (this.liveStatus && liveKey) {
+        const rendered = formatLogRecord(record, this.color);
         const fingerprint = this.liveFingerprint(record);
-        if (this.liveFingerprints.get(liveKey) === fingerprint) return;
-        this.liveFingerprints.set(liveKey, fingerprint);
+        if (this.liveRecords.get(liveKey)?.fingerprint === fingerprint) return;
+        this.clearLiveRecords();
+        this.liveRecords.set(liveKey, { rendered, lines: rendered.split("\n").length - 1, fingerprint });
+        this.renderLiveRecords();
+        return;
+      }
+      if (this.liveStatus && this.liveRecords.size) {
+        this.clearLiveRecords();
         this.target.write(formatLogRecord(record, this.color));
+        this.renderLiveRecords();
         return;
       }
       this.target.write(formatLogRecord(record, this.color));
     }
     catch {
-      this.target.write(`${line}\n`);
+      if (this.liveStatus && this.liveRecords.size) {
+        this.clearLiveRecords();
+        this.target.write(`${line}\n`);
+        this.renderLiveRecords();
+      } else this.target.write(`${line}\n`);
     }
   }
 
@@ -92,26 +105,31 @@ class PrettyLogStream extends Writable {
     const feishu = record["feishu"];
     if (!feishu || typeof feishu !== "object") return null;
     const value = feishu as Record<string, unknown>;
-    if (value["kind"] !== "status" || typeof value["messageId"] !== "string") return null;
-    const content = value["content"];
-    if (content && typeof content === "object") {
-      const status = content as Record<string, unknown>;
-      if (typeof status["sessionId"] === "string" && typeof status["turnId"] === "string") {
-        return `status:${status["sessionId"]}:${status["turnId"]}`;
-      }
-    }
-    return `status:${value["messageId"]}`;
+    return LIVE_MESSAGE_KINDS.has(String(value["kind"])) && typeof value["messageId"] === "string" ? `message:${value["messageId"]}` : null;
   }
 
   private liveFingerprint(record: Record<string, unknown>): string {
     const feishu = record["feishu"];
     if (!feishu || typeof feishu !== "object") return "";
-    const content = (feishu as Record<string, unknown>)["content"];
+    const value = feishu as Record<string, unknown>;
+    const content = value["content"];
     if (content && typeof content === "object") {
       const { updatedAt: _updatedAt, ...stableContent } = content as Record<string, unknown>;
-      return JSON.stringify(stableContent) ?? String(stableContent);
+      return JSON.stringify({ ...value, content: stableContent }) ?? String(stableContent);
     }
-    return JSON.stringify(content) ?? String(content);
+    return JSON.stringify(value) ?? String(value);
+  }
+
+  private clearLiveRecords(): void {
+    if (!this.liveRecords.size) return;
+    const lines = [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
+    this.target.write(`\u001b[${lines}A`);
+    for (let index = 0; index < lines; index += 1) this.target.write(`\u001b[2K\u001b[1B`);
+    this.target.write(`\u001b[${lines}A\r`);
+  }
+
+  private renderLiveRecords(): void {
+    for (const entry of this.liveRecords.values()) this.target.write(entry.rendered);
   }
 }
 
