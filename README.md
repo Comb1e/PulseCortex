@@ -175,7 +175,7 @@ See [Feishu setup](docs/feishu-setup.md), [operations](docs/operations.md), [sec
 | `/new [task]` | Create a concurrent session in the chosen project and optionally start work; use `/new <project> [task]` to override it |
 | `/sessions` | Discover sessions in registered projects, three per page with 100-word previews and Show more navigation |
 | `/resume [session-id]` | Resume or select an allowlisted session |
-| `/send <message>` | Start or steer work in the selected session |
+| `/send <message>` | Start or steer work in the selected session; create one if none is selected |
 | `/send <session-id> <message>` | Start or steer work in a specific allowlisted session |
 | `/status` | Send the selected session's status card |
 | `/stop` | Interrupt the selected session's active turn |
@@ -183,7 +183,7 @@ See [Feishu setup](docs/feishu-setup.md), [operations](docs/operations.md), [sec
 | `/diff` | Show the bounded, paginated unified diff |
 | `/help` | Show command help |
 
-Selecting a session makes it the default for `/send <message>` and ordinary text. The explicit `/send <session-id> <message>` form selects and addresses another session. PulseCortex continuously discovers Codex sessions that are loaded on its shared app-server and can accept direct input, including idle sessions launched after the daemon and sessions started from subdirectories of a registered project. A sole newly discovered session becomes the default and is announced in Feishu; otherwise Feishu asks the owner to choose through `/sessions`. Choosing a project adopts its newest controllable session instead of creating a duplicate. Multiple sessions can work concurrently, including sessions in different registered projects. If Codex requests structured input, PulseCortex sends selectable cards and accepts direct-message free-form answers when allowed. Secret-input questions are stopped locally and are never rendered into Feishu cards.
+Selecting a session makes it the default for `/send <message>` and ordinary text. With no selected session, `/send <message>` behaves like `/new <message>` by creating a session in the chosen project and starting the message there. The explicit `/send <session-id> <message>` form selects and addresses another session. PulseCortex continuously discovers Codex sessions that are loaded on its shared app-server and can accept direct input, including idle sessions launched after the daemon and sessions started from subdirectories of a registered project. A sole newly discovered session becomes the default and is announced in Feishu; otherwise Feishu asks the owner to choose through `/sessions`. Choosing a project adopts its newest controllable session except when completing a `/send` request that needs a new session. Multiple sessions can work concurrently, including sessions in different registered projects. If Codex requests structured input, PulseCortex sends selectable cards and accepts direct-message free-form answers when allowed. Secret-input questions are stopped locally and are never rendered into Feishu cards.
 
 ## Development
 

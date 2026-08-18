@@ -79,7 +79,7 @@ const HELP = `PulseCortex commands:
 /new [task] - create a Codex session in the chosen project (or use /new <project> [task])
 /sessions - discover and select allowlisted Codex sessions
 /resume [session-id] - resume a session
-/send <message> - message the selected session
+/send <message> - message the selected session, or create one if none is selected
 /send <session-id> <message> - message a specific session
 /status - show the selected session's active turn
 /stop - interrupt the selected session's active turn
@@ -96,6 +96,7 @@ export class SessionCoordinator {
   private selectedSession: StoredSession | null = null;
   private selectedProjectId: string | null = null;
   private pendingPrompt: string | null = null;
+  private pendingPromptCreatesSession = false;
   private readonly tokens: ActionTokenService;
   private readonly redactions: RegExp[];
   private readonly statusTimer: NodeJS.Timeout;
@@ -212,7 +213,7 @@ export class SessionCoordinator {
       case "project.select": await this.selectProject(record.requestId); break;
       case "session.select": await this.resumeStoredSession(record.requestId); break;
       case "session.continue": await this.resumeStoredSession(record.sessionId); break;
-      case "task.new": await this.sendProjectChoices(); break;
+      case "task.new": await this.promptForNewSession(null); break;
       case "sessions.more": await this.sendSessionChoices(Number(record.payload["page"] ?? 1), false); break;
       case "input.answer": await this.answerStructuredInput(record); break;
     }
@@ -247,8 +248,7 @@ export class SessionCoordinator {
     const explicitlyNamedProject = firstArg ? this.store.getProject(firstArg) : null;
     const project = explicitlyNamedProject ?? this.selectedProject();
     if (!project) {
-      if (!firstArg) { await this.sendProjectChoices(); return; }
-      await this.messaging.sendText(`Unknown project '${redact(firstArg)}'. Use /projects.`);
+      await this.promptForNewSession(args.join(" ").trim() || null);
       return;
     }
     const prompt = (explicitlyNamedProject ? args.slice(1) : args).join(" ").trim();
@@ -270,7 +270,7 @@ export class SessionCoordinator {
     const selectedRuntime = this.selectedRuntime();
     const session = addressedSession ?? (this.selectedSession ? this.store.getSession(this.selectedSession.id) : null) ?? selectedRuntime?.session ?? null;
     const text = addressedSession ? addressedMessage![2]!.trim() : body;
-    if (!session) { await this.messaging.sendText("No session selected. Use /sessions, /projects, or /send <session-id> <message>."); return; }
+    if (!session) { await this.createSessionForUnselectedSend(text); return; }
     const runtime = this.runtimes.get(session.id);
     if (runtime) {
       this.selectedSession = runtime.session;
@@ -324,6 +324,7 @@ export class SessionCoordinator {
     const projects = this.store.listProjects();
     if (projects.length === 1) { await this.createSelectedSession(projects[0]!, text); return; }
     this.pendingPrompt = text;
+    this.pendingPromptCreatesSession = false;
     await this.sendProjectChoices("Choose the project for this task.");
   }
 
@@ -348,6 +349,23 @@ export class SessionCoordinator {
     this.selectedSession = session;
     if (prompt) await this.startTurn(session, prompt);
     else await this.messaging.sendText(`Session created for ${project.name}. Send the task when ready.`);
+  }
+
+  private async createSessionForUnselectedSend(prompt: string): Promise<void> {
+    this.pendingPrompt = null;
+    this.pendingPromptCreatesSession = false;
+    const project = this.selectedProject();
+    if (project) { await this.createSelectedSession(project, prompt); return; }
+    const projects = this.store.listProjects();
+    if (projects.length === 1) { await this.createSelectedSession(projects[0]!, prompt); return; }
+    if (projects.length > 1) { await this.promptForNewSession(prompt); return; }
+    await this.sendProjectChoices("Choose the project for this new session.");
+  }
+
+  private async promptForNewSession(prompt: string | null): Promise<void> {
+    this.pendingPrompt = prompt;
+    this.pendingPromptCreatesSession = true;
+    await this.sendProjectChoices("Choose the project for this new session.");
   }
 
   private async startTurn(session: StoredSession, prompt: string): Promise<void> {
@@ -557,6 +575,8 @@ export class SessionCoordinator {
     if (this.selectedSession?.projectId !== project.id) this.selectedSession = null;
     this.rememberProject(project.id);
     const prompt = this.pendingPrompt; this.pendingPrompt = null;
+    const createNewSession = this.pendingPromptCreatesSession; this.pendingPromptCreatesSession = false;
+    if (createNewSession) { await this.createSelectedSession(project, prompt); return; }
     await this.refreshSessions();
     const running = [...this.controllableSessions.values()]
       .filter((candidate) => candidate.project.id === project.id)

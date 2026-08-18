@@ -359,6 +359,97 @@ describe("session coordinator", () => {
     expect(driver.started.at(-1)).toEqual({ id: "session", prompt: "continue where I left off" });
   });
 
+  it("creates a new session for /send when no session is selected", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("remembered", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    db.setLocalSetting("defaultProject", project.name);
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "send-new", messageId: "send-new", actor, name: "send", args: ["start", "fresh"], text: "/send start fresh\nwith details", receivedAt: Date.now() });
+
+    expect(db.getSession("session")?.projectId).toBe(project.id);
+    expect(driver.started).toEqual([{ id: "session", prompt: "start fresh\nwith details" }]);
+  });
+
+  it("creates a new session after choosing a project for /send", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const first = db.addProject("first", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    const second = db.addProject("second", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    db.createSession({ id: "existing-first", projectId: first.id, title: "Existing first session" });
+    db.createSession({ id: "existing", projectId: second.id, title: "Existing session" });
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [
+      { id: "existing-first", projectId: first.id, title: "Existing first session", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 2, botCreated: false },
+      { id: "existing", projectId: second.id, title: "Existing session", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 2, botCreated: false },
+    ];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "send-new", messageId: "send-new", actor, name: "send", args: ["start", "fresh"], text: "/send start fresh", receivedAt: Date.now() });
+    expect(messaging.choices.at(-1)?.description).toBe("Choose the project for this new session.");
+    const choice = messaging.choices.at(-1)!.choices.find((item) => item.value === second.id)!;
+    await messaging.action!({ eventId: "choose-second", actor, kind: "project.select", token: choice.token, receivedAt: Date.now() });
+
+    expect(db.getSession("session")?.projectId).toBe(second.id);
+    expect(driver.started.at(-1)).toEqual({ id: "session", prompt: "start fresh" });
+    expect(driver.started.some((turn) => turn.id === "existing")).toBe(false);
+  });
+
+  it("opens the project card and retains the task when /new needs a project", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("first", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    const second = db.addProject("second", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "new", messageId: "new", actor, name: "new", args: ["implement", "the", "feature"], text: "/new implement the feature", receivedAt: Date.now() });
+
+    expect(messaging.texts.some((text) => text.includes("Unknown project"))).toBe(false);
+    expect(messaging.choices.at(-1)?.description).toBe("Choose the project for this new session.");
+    const choice = messaging.choices.at(-1)!.choices.find((item) => item.value === second.id)!;
+    await messaging.action!({ eventId: "choose-second", actor, kind: "project.select", token: choice.token, receivedAt: Date.now() });
+    expect(db.getSession("session")?.projectId).toBe(second.id);
+    expect(driver.started).toEqual([{ id: "session", prompt: "implement the feature" }]);
+  });
+
+  it("creates an empty new session after choosing a project for bare /new", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    db.addProject("other", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    db.createSession({ id: "existing", projectId: project.id, title: "Existing session" });
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [{ id: "existing", projectId: project.id, title: "Existing session", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 2, botCreated: false }];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "new", messageId: "new", actor, name: "new", args: [], text: "/new", receivedAt: Date.now() });
+    const choice = messaging.choices.at(-1)!.choices.find((item) => item.value === project.id)!;
+    await messaging.action!({ eventId: "choose-project", actor, kind: "project.select", token: choice.token, receivedAt: Date.now() });
+
+    expect(db.getSession("session")?.projectId).toBe(project.id);
+    expect(driver.started).toHaveLength(0);
+    expect(messaging.texts.at(-1)).toBe("Session created for repo. Send the task when ready.");
+  });
+
   it("prefers a running session from the remembered project during startup", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();
@@ -425,7 +516,7 @@ describe("session coordinator", () => {
     expect(driver.steered.at(-1)).toEqual({ id: "new-working-codex", text: "continue from Feishu" });
   });
 
-  it("warns about a running standalone session without selecting or duplicating it", async () => {
+  it("creates a new session when only an uncontrollable standalone session exists", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();
     const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
@@ -445,9 +536,9 @@ describe("session coordinator", () => {
     expect(messaging.texts.at(-1)).toContain("cannot receive Feishu messages");
     expect(db.getSession("session")).toBeNull();
     await messaging.command!({ eventId: "send-foreign", messageId: "send-foreign", actor, name: "send", args: ["hello"], text: "/send hello", receivedAt: Date.now() });
-    expect(messaging.texts.at(-1)).toContain("No session selected");
+    expect(db.getSession("session")?.projectId).toBe(project.id);
     expect(driver.steered).toHaveLength(0);
-    expect(driver.started).toHaveLength(0);
+    expect(driver.started).toEqual([{ id: "session", prompt: "hello" }]);
   });
 
   it("uses a running session in the chosen project as the default", async () => {
