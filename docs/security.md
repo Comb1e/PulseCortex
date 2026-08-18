@@ -10,7 +10,7 @@ PulseCortex is remote code execution mediated by Codex. Treat the Feishu account
 - Only sessions whose real working directory is at or below a locally registered canonical project root are exposed or controllable remotely.
 - Concurrent turns are isolated by session, and every approval remains bound to its session, turn, request, owner, and tenant.
 - Actions are signed, owner/session/turn/request-bound, expiring, and transactionally single-use.
-- Approval cards expose Allow once, Deny, and Stop only. Session-wide approval is never returned.
+- Command approval cards expose Allow once, Auto approve, Deny, and Stop. Auto approve returns Codex's session-wide command decision; network, filesystem, and file-change cards remain one-time only.
 - Network cards use app-server destination host/protocol. Broad network grants without a destination are denied.
 - Secret-input questions are denied and interrupt the turn instead of asking for credentials over Feishu.
 - ANSI/control characters are removed; common and configured credential patterns are redacted; mobile payloads are bounded.

@@ -48,7 +48,7 @@ export function formatLogRecord(record: Record<string, unknown>, color = false):
 
 class PrettyLogStream extends Writable {
   private buffered = "";
-  private readonly liveRecords = new Map<string, { rendered: string; lines: number }>();
+  private readonly liveRecords = new Map<string, { rendered: string; lines: number; fingerprint: string }>();
 
   constructor(private readonly target: LogTarget, private readonly color: boolean, private readonly liveStatus = false) { super(); }
 
@@ -75,8 +75,10 @@ class PrettyLogStream extends Writable {
       const liveKey = this.liveKey(record);
       if (this.liveStatus && liveKey) {
         const rendered = formatLogRecord(record, this.color);
+        const fingerprint = this.liveFingerprint(record);
+        if (this.liveRecords.get(liveKey)?.fingerprint === fingerprint) return;
         this.clearLiveRecords();
-        this.liveRecords.set(liveKey, { rendered, lines: rendered.split("\n").length - 1 });
+        this.liveRecords.set(liveKey, { rendered, lines: rendered.split("\n").length - 1, fingerprint });
         this.renderLiveRecords();
         return;
       }
@@ -103,7 +105,25 @@ class PrettyLogStream extends Writable {
     if (!feishu || typeof feishu !== "object") return null;
     const value = feishu as Record<string, unknown>;
     if (value["kind"] !== "status" || typeof value["messageId"] !== "string") return null;
+    const content = value["content"];
+    if (content && typeof content === "object") {
+      const status = content as Record<string, unknown>;
+      if (typeof status["sessionId"] === "string" && typeof status["turnId"] === "string") {
+        return `status:${status["sessionId"]}:${status["turnId"]}`;
+      }
+    }
     return `status:${value["messageId"]}`;
+  }
+
+  private liveFingerprint(record: Record<string, unknown>): string {
+    const feishu = record["feishu"];
+    if (!feishu || typeof feishu !== "object") return "";
+    const content = (feishu as Record<string, unknown>)["content"];
+    if (content && typeof content === "object") {
+      const { updatedAt: _updatedAt, ...stableContent } = content as Record<string, unknown>;
+      return JSON.stringify(stableContent) ?? String(stableContent);
+    }
+    return JSON.stringify(content) ?? String(content);
   }
 
   private clearLiveRecords(): void {

@@ -42,7 +42,7 @@ Use a developer tenant before production:
 1. Pair the owner and verify an unknown user receives no control response.
 2. Verify group messages do not start work.
 3. Select a project, run a harmless edit/test task, and inspect status, logs, and diff cards.
-4. Exercise Allow once, Deny, and Stop on approval cards.
+4. Exercise Allow once, Auto approve (command cards only), Deny, and Stop on approval cards.
 5. Disconnect internet temporarily, allow Codex to continue, reconnect, and verify queued milestones/results arrive.
 6. Restart during a turn and verify the turn becomes `interrupted_unknown` rather than completed.
 7. Verify the Codex app-server TCP listener is bound only to the configured loopback address, and that no PulseCortex port is reachable from another machine.

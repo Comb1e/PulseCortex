@@ -23,7 +23,7 @@ class FakeDriver implements AgentDriver {
   async startTurn(id: SessionId, prompt: string): Promise<TurnId> { this.started.push({ id, prompt }); return this.started.length === 1 ? "turn" : `turn-${this.started.length}`; }
   async steerTurn(id: SessionId, text: string): Promise<void> { this.steered.push({ id, text }); }
   async interruptTurn(_id: SessionId): Promise<void> {}
-  async resolveApproval(id: ApprovalId, decision: "accept" | "decline" | "cancel"): Promise<void> { this.decisions.push({ id, decision }); }
+  async resolveApproval(id: ApprovalId, decision: "accept" | "acceptForSession" | "decline" | "cancel"): Promise<void> { this.decisions.push({ id, decision }); }
   async resolveInput(_id: string, _answers: Record<string, string>): Promise<void> {}
   subscribe(handler: (event: AgentEvent) => void): Unsubscribe { this.handlers.add(handler); return () => this.handlers.delete(handler); }
   emit(event: AgentEvent): void { for (const handler of this.handlers) handler(event); }
@@ -86,6 +86,32 @@ describe("session coordinator", () => {
     expect(db.inspectAudit().some((row) => row["event_type"] === "action.rejected")).toBe(true);
   });
 
+  it("enables Codex auto approve from command cards only", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "run commands", receivedAt: Date.now() });
+
+    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "command", kind: "command", title: "Run command", command: "pnpm test", canAutoApprove: true, occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.approvals).toHaveLength(1));
+    const autoApprove = messaging.approvals[0]!.actionTokens.autoApprove;
+    expect(autoApprove).toBeTruthy();
+    await messaging.action!({ eventId: "auto", actor, kind: "approval.acceptForSession", token: autoApprove!, receivedAt: Date.now() });
+
+    expect(driver.decisions).toEqual([{ id: "command", decision: "acceptForSession" }]);
+    expect(messaging.approvalUpdates).toEqual([expect.objectContaining({ decision: "acceptForSession" })]);
+
+    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "network", kind: "network", title: "Network access", network: [{ host: "example.com", protocol: "https" }], canAutoApprove: false, occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.approvals).toHaveLength(2));
+    expect(messaging.approvals[1]!.actionTokens.autoApprove).toBeUndefined();
+  });
+
   it.each([
     ["accept", "approval.accept"],
     ["decline", "approval.decline"],
@@ -111,6 +137,31 @@ describe("session coordinator", () => {
     await messaging.action!({ eventId: decision, actor, kind: actionKind, token, receivedAt: Date.now() });
     expect(driver.decisions).toEqual([{ id: "approval", decision }]);
     expect(messaging.approvalUpdates).toEqual([expect.objectContaining({ title: "Run command", decision })]);
+  });
+
+  it("keeps a pending approval actionable after its card token expires", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await messaging.command!({ eventId: "start-expired", messageId: "start-expired", actor, name: "text", args: [], text: "run a command", receivedAt: Date.now() });
+    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "approval-expired", kind: "command", title: "Run command", command: "pnpm test", occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.approvals).toHaveLength(1));
+    const token = messaging.approvals[0]!.actionTokens.accept;
+    const now = Date.now();
+    vi.useFakeTimers({ now });
+    try {
+      vi.advanceTimersByTime(61_000);
+      await messaging.action!({ eventId: "approve-expired", actor, kind: "approval.accept", token, receivedAt: Date.now() });
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(driver.decisions).toEqual([{ id: "approval-expired", decision: "accept" }]);
   });
 
   it("resolves multiple simultaneous approvals and updates each card", async () => {

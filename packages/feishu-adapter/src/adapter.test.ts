@@ -59,13 +59,18 @@ describe("Feishu card rendering", () => {
     expect(JSON.stringify(outbound)).not.toContain("secret-stop");
   });
 
-  it("uses v2 callback behaviors and never offers session approval", () => {
+  it("offers auto approve only for command requests", () => {
     const approval = approvalCard({ approvalId: "a", sessionId: "s", turnId: "t", kind: "network", title: "Network", network: [{ host: "example.com", protocol: "https" }], actionTokens: { accept: "one", decline: "no", cancel: "stop" }, expiresAt: Date.now() + 60_000 });
     const json = JSON.stringify(approval);
     expect(json).toContain('"schema":"2.0"');
     expect(json).toContain('"type":"callback"');
     expect(json).toContain("Allow once");
-    expect(json).not.toContain("Allow session");
+    expect(json).not.toContain("Auto approve");
+
+    const command = approvalCard({ approvalId: "c", sessionId: "s", turnId: "t", kind: "command", title: "Command", command: "pnpm test", actionTokens: { accept: "one", autoApprove: "auto", decline: "no", cancel: "stop" }, expiresAt: Date.now() + 60_000 });
+    const commandJson = JSON.stringify(command);
+    expect(commandJson).toContain("Auto approve");
+    expect(commandJson).toContain("approval.acceptForSession");
   });
 
   it("replaces an approval with a static executed-choice card", () => {

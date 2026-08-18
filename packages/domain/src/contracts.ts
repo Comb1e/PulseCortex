@@ -47,7 +47,7 @@ export interface AgentDriver {
   startTurn(id: SessionId, prompt: string): Promise<TurnId>;
   steerTurn(id: SessionId, text: string): Promise<void>;
   interruptTurn(id: SessionId): Promise<void>;
-  resolveApproval(id: ApprovalId, decision: "accept" | "decline" | "cancel"): Promise<void>;
+  resolveApproval(id: ApprovalId, decision: "accept" | "acceptForSession" | "decline" | "cancel"): Promise<void>;
   resolveInput(id: string, answers: Record<string, string>): Promise<void>;
   subscribe(handler: (event: AgentEvent) => void): Unsubscribe;
 }

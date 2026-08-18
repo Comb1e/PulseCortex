@@ -53,6 +53,15 @@ describe("action token replay prevention", () => {
     const token = tokens.issue({ kind: "turn.stop", ...actor, sessionId: "s", turnId: "turn", requestId: "turn", expiresAt: Date.now() - 1, payload: {} });
     expect(tokens.consume(token, actor)).toBeNull();
   });
+
+  it("can consume an expired token after the caller validates a pending action", () => {
+    const store = memoryStore();
+    const tokens = new ActionTokenService(store, "x".repeat(32));
+    const actor = { tenantId: "t", userId: "u" };
+    const token = tokens.issue({ kind: "approval.accept", ...actor, sessionId: "s", turnId: "turn", requestId: "req", expiresAt: Date.now() - 1, payload: {} });
+
+    expect(tokens.consume(token, actor, "approval.accept", { allowExpired: true })?.requestId).toBe("req");
+  });
 });
 
 describe("project ambiguity", () => {

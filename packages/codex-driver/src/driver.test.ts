@@ -78,6 +78,24 @@ describe("Codex app-server contract", () => {
     await driver.stop();
   });
 
+  it("maps command auto approve to the native session decision", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "auto-approve"], verifyVersion: false });
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    driver.subscribe((event) => {
+      if (event.type === "approval.requested") {
+        expect(event).toMatchObject({ kind: "command", canAutoApprove: true });
+        void driver.resolveApproval(event.approvalId, "acceptForSession");
+      }
+      if (event.type === "turn.completed") complete();
+    });
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+    await driver.startTurn(sessionId, "run tests");
+    await completed;
+    await driver.stop();
+  });
+
   it("rejects structured root filesystem grants before presenting approval", async () => {
     const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "unsafe-permission"], verifyVersion: false });
     const events: AgentEvent[] = [];

@@ -248,10 +248,10 @@ export class ControllerStore {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(record.nonce, record.kind, record.tenantId, record.userId, record.sessionId, record.turnId, record.requestId, record.expiresAt, JSON.stringify(record.payload));
   }
 
-  consumeInteraction(nonce: string, actor: OwnerIdentity, now = Date.now()): InteractionRecord | null {
+  consumeInteraction(nonce: string, actor: OwnerIdentity, now = Date.now(), allowExpired = false): InteractionRecord | null {
     return this.database.transaction(() => {
       const row = this.database.prepare("SELECT * FROM pending_interactions WHERE nonce = ?").get(nonce) as Record<string, unknown> | undefined;
-      if (!row || row["consumed_at"] !== null || Number(row["expires_at"]) < now || row["tenant_id"] !== actor.tenantId || row["user_id"] !== actor.userId) return null;
+      if (!row || row["consumed_at"] !== null || (!allowExpired && Number(row["expires_at"]) < now) || row["tenant_id"] !== actor.tenantId || row["user_id"] !== actor.userId) return null;
       const consumed = this.database.prepare("UPDATE pending_interactions SET consumed_at = ? WHERE nonce = ? AND consumed_at IS NULL").run(now, nonce);
       if (consumed.changes !== 1) return null;
       return {

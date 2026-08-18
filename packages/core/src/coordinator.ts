@@ -198,11 +198,13 @@ export class SessionCoordinator {
 
   async handleAction(action: ChannelAction): Promise<void> {
     if (!this.store.isOwner(action.actor)) return;
-    const record = this.tokens.consume(action.token, action.actor, action.kind);
+    const allowExpiredApproval = action.kind === "approval.accept" || action.kind === "approval.acceptForSession" || action.kind === "approval.decline" || action.kind === "turn.stop";
+    const record = this.tokens.consume(action.token, action.actor, action.kind, { allowExpired: allowExpiredApproval });
     if (!record) { this.store.audit({ eventType: "action.rejected", summary: `Stale, forged, or replayed action ${action.kind}`, actor: action.actor }); return; }
     this.store.audit({ eventType: "action.consumed", summary: action.kind, actor: action.actor, sessionId: record.sessionId, turnId: record.turnId });
     switch (action.kind) {
       case "approval.accept": await this.resolveApproval(record, "accept", action.actor); break;
+      case "approval.acceptForSession": await this.resolveApproval(record, "acceptForSession", action.actor); break;
       case "approval.decline": await this.resolveApproval(record, "decline", action.actor); break;
       case "turn.stop": await this.stopActiveTurn("action", record); break;
       case "logs.show": await this.sendPagedOutput("logs.show", record.sessionId, Number(record.payload["page"] ?? 1), record.turnId); break;
@@ -403,6 +405,7 @@ export class SessionCoordinator {
       ...(event.reason ? { reason: redact(event.reason, this.redactions) } : {}), ...(event.command ? { command: event.command } : {}), ...(event.files ? { files: event.files } : {}), ...(event.paths ? { paths: event.paths } : {}), ...(event.network ? { network: event.network } : {}),
       actionTokens: {
         accept: this.issueForOwner(owner, "approval.accept", runtime.session.id, runtime.turnId, event.approvalId, expiresAt, {}),
+        ...(event.kind === "command" && event.canAutoApprove === true ? { autoApprove: this.issueForOwner(owner, "approval.acceptForSession", runtime.session.id, runtime.turnId, event.approvalId, expiresAt, {}) } : {}),
         decline: this.issueForOwner(owner, "approval.decline", runtime.session.id, runtime.turnId, event.approvalId, expiresAt, {}),
         cancel: this.issueForOwner(owner, "turn.stop", runtime.session.id, runtime.turnId, event.approvalId, expiresAt, { approvalId: event.approvalId }),
       }, expiresAt,
@@ -414,10 +417,14 @@ export class SessionCoordinator {
     await this.flushStatus(runtime.session.id, true);
   }
 
-  private async resolveApproval(record: InteractionRecord, decision: "accept" | "decline", actor: { tenantId: string; userId: string }): Promise<void> {
+  private async resolveApproval(record: InteractionRecord, decision: "accept" | "acceptForSession" | "decline", actor: { tenantId: string; userId: string }): Promise<void> {
     const runtime = this.runtimes.get(record.sessionId);
     const pending = runtime?.pendingApprovals.get(record.requestId);
     if (!runtime || !pending || record.sessionId !== runtime.session.id || record.turnId !== runtime.turnId) return;
+    if (decision === "acceptForSession" && pending.kind !== "command") {
+      this.store.audit({ eventType: "approval.rejected", summary: "Auto approve is restricted to command requests", actor, sessionId: runtime.session.id, turnId: runtime.turnId });
+      return;
+    }
     await this.driver.resolveApproval(record.requestId, decision);
     await this.resolveApprovalCard(pending, decision);
     runtime.pendingApprovals.delete(record.requestId);
@@ -425,7 +432,7 @@ export class SessionCoordinator {
     runtime.phase = pendingCount ? "awaiting_approval" : "working";
     runtime.safeSummary = pendingCount
       ? `${pendingCount} approval request${pendingCount === 1 ? "" : "s"} still pending.`
-      : decision === "accept" ? "Approval granted once. Codex is continuing..." : "Request denied. Codex is continuing...";
+      : decision === "accept" ? "Approval granted once. Codex is continuing..." : decision === "acceptForSession" ? "Command auto approve enabled for this session. Codex is continuing..." : "Request denied. Codex is continuing...";
     runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: runtime.phase });
     this.store.audit({ eventType: "approval.decided", summary: decision, actor, sessionId: runtime.session.id, turnId: runtime.turnId });

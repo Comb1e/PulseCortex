@@ -54,6 +54,18 @@ describe("daemon logger", () => {
     expect(output).toMatch(/\u001b\[\d+A/);
   });
 
+  it("coalesces duplicate status sends for the same Codex turn", () => {
+    const terminal = new PassThrough();
+    const terminalText = capture(terminal);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+    const content = { sessionId: "session-1", turnId: "turn-1", phase: "working", safeSummary: "Codex is working...", updatedAt: 1 };
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-2", content: { ...content, updatedAt: 2 } } }, "Feishu outbound message");
+
+    expect((terminalText().match(/Codex is working\.\.\./g) ?? []).length).toBe(1);
+  });
+
   it("rotates an oversized log and keeps one previous file", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
     const filePath = path.join(directory, "daemon.log");
