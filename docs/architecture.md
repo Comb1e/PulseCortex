@@ -36,6 +36,6 @@ An app-server crash fails every attached active turn and preserves the thread ma
 
 ## Persistence
 
-SQLite uses WAL mode, foreign keys, and migrations. Tables cover owner binding, pairing codes, projects, sessions, turns, interactions, event deduplication, deliveries, milestones, and append-only audits. Sensitive prompt content is hashed for audit; command output stays in bounded files.
+SQLite uses WAL mode, foreign keys, and migrations. Tables cover owner binding, pairing codes, projects, sessions, turns, interactions, event deduplication, deliveries, milestones, and append-only audits. User-editable preferences live in `settings.json` beside the database; the JSON object retains the default project, OS startup preference, and future settings. Sensitive prompt content is hashed for audit; command output stays in bounded files.
 
-Metadata retention defaults to 30 days. Command logs retain at most seven days and 100 MB, deleting oldest files first. The daemon applies retention at startup and daily.
+Metadata retention defaults to 30 days. Command logs retain at most seven days and 100 MB in total, deleting oldest files first. The human-readable and structured daemon logs each rotate at the same configured byte ceiling during startup and keep one `.previous` file. The daemon applies command-log retention at startup and daily.

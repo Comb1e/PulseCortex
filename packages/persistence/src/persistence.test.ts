@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, realpath } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -63,6 +63,52 @@ describe("project ambiguity", () => {
     const store = memoryStore();
     store.addProject("root", await realpath(root));
     expect(() => store.addProject("child", child)).toThrow(/overlaps/u);
+  });
+
+  it("stores typed local settings and clears a removed default project", () => {
+    const store = memoryStore();
+    const project = store.addProject("repo", process.cwd());
+    expect(store.getLocalSettings()).toEqual({ defaultProject: null, autoStartOnBoot: false });
+
+    store.setLocalSetting("defaultProject", project.name);
+    store.setLocalSetting("autoStartOnBoot", true);
+    expect(store.getLocalSettings()).toEqual({ defaultProject: project.name, autoStartOnBoot: true });
+
+    expect(store.removeProject(project.name)).toBe(true);
+    expect(store.getLocalSettings()).toEqual({ defaultProject: null, autoStartOnBoot: true });
+  });
+
+  it("rejects an unregistered default project", () => {
+    const store = memoryStore();
+    expect(() => store.setLocalSetting("defaultProject", "missing")).toThrow(/not registered/u);
+  });
+
+  it("creates settings.json, reloads manual edits, and preserves future keys", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pulsecortex-settings-"));
+    const settingsPath = path.join(directory, "settings.json");
+    const store = new ControllerStore(":memory:", settingsPath); stores.push(store);
+    const project = store.addProject("repo", process.cwd());
+    expect(JSON.parse(await readFile(settingsPath, "utf8"))).toEqual({ defaultProject: null, autoStartOnBoot: false });
+
+    await writeFile(settingsPath, JSON.stringify({ defaultProject: project.name, autoStartOnBoot: false, theme: "dark" }));
+    expect(store.getLocalSettings()).toEqual({ defaultProject: project.name, autoStartOnBoot: false });
+    store.setLocalSetting("autoStartOnBoot", true);
+    expect(JSON.parse(await readFile(settingsPath, "utf8"))).toEqual({ defaultProject: project.name, autoStartOnBoot: true, theme: "dark" });
+  });
+
+  it("migrates legacy SQLite settings into settings.json", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pulsecortex-settings-"));
+    const databasePath = path.join(directory, "pulsecortex.db");
+    const settingsPath = path.join(directory, "settings.json");
+    const legacy = new ControllerStore(databasePath);
+    const project = legacy.addProject("repo", process.cwd());
+    legacy.database.prepare("INSERT INTO local_settings(key, value_json, updated_at) VALUES (?, ?, ?)").run("lastProjectId", JSON.stringify(project.id), Date.now());
+    legacy.database.prepare("INSERT INTO local_settings(key, value_json, updated_at) VALUES (?, ?, ?)").run("autoStartOnBoot", "true", Date.now());
+    legacy.close();
+
+    const restored = new ControllerStore(databasePath, settingsPath); stores.push(restored);
+    expect(restored.getLocalSettings()).toEqual({ defaultProject: project.name, autoStartOnBoot: true });
+    expect(JSON.parse(await readFile(settingsPath, "utf8"))).toEqual({ defaultProject: project.name, autoStartOnBoot: true });
   });
 });
 

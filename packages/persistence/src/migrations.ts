@@ -110,6 +110,16 @@ const MIGRATIONS: Array<{ version: number; sql: string }> = [
       CREATE UNIQUE INDEX delivery_queue_dedupe_pending ON delivery_queue(dedupe_key) WHERE delivered_at IS NULL AND dedupe_key IS NOT NULL;
     `,
   },
+  {
+    version: 5,
+    sql: `
+      CREATE TABLE local_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `,
+  },
 ];
 
 export function migrate(database: Database.Database): void {

@@ -36,6 +36,8 @@ class FakeMessaging implements MessagingAdapter {
   approvalUpdates: ApprovalResolutionView[] = [];
   statuses: SessionView[] = [];
   choices: ChoiceView[] = [];
+  results: TurnResultView[] = [];
+  outputs: OutputView[] = [];
   texts: string[] = [];
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
@@ -43,10 +45,10 @@ class FakeMessaging implements MessagingAdapter {
   async updateStatus(_ref: MessageRef, view: SessionView): Promise<void> { this.statuses.push(view); }
   async sendApproval(view: ApprovalView): Promise<MessageRef> { this.approvals.push(view); return { messageId: "approval", chatId: "chat" }; }
   async updateApproval(_ref: MessageRef, view: ApprovalResolutionView): Promise<void> { this.approvalUpdates.push(view); }
-  async sendResult(_view: TurnResultView): Promise<void> {}
+  async sendResult(view: TurnResultView): Promise<void> { this.results.push(view); }
   async sendChoices(view: ChoiceView): Promise<void> { this.choices.push(view); }
   async sendQuestion(_view: QuestionView): Promise<void> {}
-  async sendOutput(_view: OutputView): Promise<void> {}
+  async sendOutput(view: OutputView): Promise<void> { this.outputs.push(view); }
   async sendText(text: string): Promise<void> { this.texts.push(text); }
   onCommand(handler: (command: ChannelCommand) => Promise<void>): void { this.command = handler; }
   onAction(handler: (action: ChannelAction) => Promise<void>): void { this.action = handler; }
@@ -98,6 +100,30 @@ describe("session coordinator", () => {
     await messaging.command!({ eventId: "status", messageId: "status", actor, name: "status", args: [], text: "/status", receivedAt: Date.now() });
 
     expect(messaging.statuses.at(-1)?.replies).toEqual(["First reply", "Second reply"]);
+  });
+
+  it("opens logs for the result card's turn after the session advances", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "first", messageId: "first", actor, name: "text", args: [], text: "first task", receivedAt: Date.now() });
+    await logs.append("turn", "stdout", "first turn output\n");
+    driver.emit({ type: "turn.completed", sessionId: "session", turnId: "turn", status: "completed", occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.results).toHaveLength(1));
+    const oldLogsToken = messaging.results[0]!.actionTokens.logs;
+
+    await messaging.command!({ eventId: "second", messageId: "second", actor, name: "text", args: [], text: "second task", receivedAt: Date.now() });
+    await logs.append("turn-2", "stdout", "second turn output\n");
+    await messaging.action!({ eventId: "old-logs", actor, kind: "logs.show", token: oldLogsToken, receivedAt: Date.now() });
+
+    expect(messaging.outputs.at(-1)?.content).toBe("first turn output\n");
   });
 
   it("runs and addresses multiple Codex sessions independently", async () => {
@@ -170,6 +196,50 @@ describe("session coordinator", () => {
     expect(messaging.texts.at(-1)).toContain("/send <message>");
     await messaging.command!({ eventId: "send-default", messageId: "send-default", actor, name: "send", args: ["continue", "work"], text: "/send continue work", receivedAt: Date.now() });
     expect(driver.steered.at(-1)).toEqual({ id: "startup-codex", text: "continue work" });
+  });
+
+  it("restores the last project and uses it for the first task after startup", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("other", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    const project = db.addProject("remembered", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    db.setLocalSetting("defaultProject", project.name);
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await coordinator.initialize();
+    await messaging.command!({ eventId: "first-task", messageId: "first-task", actor, name: "text", args: [], text: "continue where I left off", receivedAt: Date.now() });
+
+    expect(db.getSession("session")?.projectId).toBe(project.id);
+    expect(driver.started.at(-1)).toEqual({ id: "session", prompt: "continue where I left off" });
+  });
+
+  it("prefers a running session from the remembered project during startup", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("remembered", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    const other = db.addProject("other", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    db.setLocalSetting("defaultProject", project.name);
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    driver.discovered = [
+      { id: "remembered-session", projectId: project.id, title: "Remembered session", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 2, botCreated: false },
+      { id: "other-session", projectId: other.id, title: "Other session", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 3, botCreated: false },
+    ];
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await coordinator.initialize();
+    await messaging.command!({ eventId: "send-remembered", messageId: "send-remembered", actor, name: "send", args: ["hello"], text: "/send hello", receivedAt: Date.now() });
+
+    expect(messaging.texts.some((text) => text.includes("Remembered session in remembered"))).toBe(true);
+    expect(driver.started.at(-1)).toEqual({ id: "remembered-session", prompt: "hello" });
   });
 
   it("detects an idle controllable Codex session launched after startup", async () => {
@@ -261,6 +331,7 @@ describe("session coordinator", () => {
     await messaging.action!({ eventId: "choose-project", actor, kind: "project.select", token: projectChoice.token, receivedAt: Date.now() });
 
     expect(messaging.texts.at(-1)).toContain("Using running Codex session Chosen project session in repo");
+    expect(db.getLocalSettings().defaultProject).toBe(project.name);
     expect(db.getSession("session")).toBeNull();
     await messaging.command!({ eventId: "send-project", messageId: "send-project", actor, name: "send", args: ["project", "follow-up"], text: "/send project follow-up", receivedAt: Date.now() });
     expect(driver.started.at(-1)).toEqual({ id: "chosen-codex", prompt: "project follow-up" });

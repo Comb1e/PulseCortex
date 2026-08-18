@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises";
+import path from "node:path";
 import { loadConfig } from "@pulsecortex/config";
 import { CodexAppServerDriver } from "@pulsecortex/codex-driver";
 import { createLogger, SessionCoordinator } from "@pulsecortex/core";
@@ -10,9 +11,11 @@ async function main(): Promise<void> {
   const config = await loadConfig();
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
   await mkdir(config.commandLogDir, { recursive: true, mode: 0o700 });
-  const logger = createLogger(config.logLevel);
+  const humanLogPath = path.join(config.dataDir, "daemon.log");
+  const structuredLogPath = path.join(config.dataDir, "daemon.jsonl");
+  const logger = createLogger(config.logLevel, { humanLogPath, structuredLogPath, maxFileBytes: config.logMaxBytes });
   const patterns = config.redactionPatterns.map((pattern) => new RegExp(pattern, "giu"));
-  const store = new ControllerStore(config.databasePath);
+  const store = new ControllerStore(config.databasePath, config.settingsPath);
   const interrupted = store.markActiveTurnsInterrupted();
   if (interrupted) store.audit({ eventType: "daemon.recovery", summary: `${interrupted} active turn(s) marked interrupted/unknown after restart` });
   const commandLogs = new CommandLogStore(config.commandLogDir, patterns);
@@ -88,7 +91,7 @@ async function main(): Promise<void> {
     void commandLogs.retain(config.logRetentionDays, config.logMaxBytes).catch((error) => logger.warn({ errorMessage: redact((error as Error).message, patterns) }, "command log retention failed"));
   }, 24 * 60 * 60_000);
   retention.unref();
-  logger.info({ dataDir: config.dataDir }, "PulseCortex daemon ready");
+  logger.info({ dataDir: config.dataDir, humanLogPath, structuredLogPath }, "PulseCortex daemon ready");
 }
 
 main().catch((error) => {

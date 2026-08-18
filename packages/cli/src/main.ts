@@ -16,7 +16,7 @@ const execFileAsync = promisify(execFile);
 async function withStore<T>(work: (store: ControllerStore) => Promise<T> | T): Promise<T> {
   const config = await loadConfig({ requireSecrets: false });
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
-  const store = new ControllerStore(config.databasePath);
+  const store = new ControllerStore(config.databasePath, config.settingsPath);
   try { return await work(store); } finally { store.close(); }
 }
 
@@ -33,6 +33,18 @@ async function codexShellOptions() {
   return { dataDir: config.dataDir, shimEntry, codexExecutable: invocation.executable, codexPrefixArgs: invocation.prefixArgs };
 }
 
+async function setAutoStartOnBoot(enabled: boolean): Promise<void> {
+  if (enabled) await installService(await serviceOptions());
+  else await uninstallService(await serviceOptions());
+  await withStore((store) => store.setLocalSetting("autoStartOnBoot", enabled));
+}
+
+function parseBooleanSetting(value: string): boolean {
+  if (/^(?:true|on|yes|1)$/iu.test(value)) return true;
+  if (/^(?:false|off|no|0)$/iu.test(value)) return false;
+  throw new Error("Value must be true or false");
+}
+
 const program = new Command().name("pulsectl").description("Local administration for PulseCortex").version("0.1.0");
 
 program.command("init").description("Create non-secret config and a permission-restricted secret template").action(async () => {
@@ -42,6 +54,7 @@ program.command("init").description("Create non-secret config and a permission-r
   const envPath = path.join(dataDir, "pulsecortex.env");
   try { await access(configPath); } catch { await writeFile(configPath, `${JSON.stringify({ statusUpdateIntervalMs: 2000, approvalTtlMs: 900000, auditRetentionDays: 30, logRetentionDays: 7, logMaxBytes: 100000000, redactionPatterns: [], codexAppServerUrl: "ws://127.0.0.1:4500" }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 }); }
   try { await access(envPath); } catch { await writeFile(envPath, "# Keep this file readable only by your desktop user.\nFEISHU_APP_ID=\nFEISHU_APP_SECRET=\n# Generate at least 32 random bytes, for example: openssl rand -base64 48\nPULSECORTEX_ACTION_SIGNING_KEY=\n", { encoding: "utf8", mode: 0o600 }); }
+  await withStore(() => undefined);
   if (process.platform === "win32") {
     const user = process.env["USERNAME"];
     if (!user) throw new Error("USERNAME is unavailable; cannot restrict the secret file ACL");
@@ -71,10 +84,12 @@ program.command("codex").description("Launch Codex in a registered project on th
   .action(async (projectOrPrompt: string | undefined, remainingPrompt: string[]) => {
     const config = await loadConfig({ requireSecrets: false });
     const currentDirectory = await canonicalProjectPath(process.cwd());
-    const projects = await withStore((store) => store.listProjects());
+    const { projects, settings } = await withStore((store) => ({ projects: store.listProjects(), settings: store.getLocalSettings() }));
     const named = projectOrPrompt ? projects.find((project) => project.name === projectOrPrompt) : undefined;
-    const registered = named ?? projects.find((project) => isPathInside(project.canonicalPath, currentDirectory));
-    if (!registered) throw new Error(projectOrPrompt ? `Project '${projectOrPrompt}' is not registered and the current directory is outside every registered project` : "The current directory is outside every registered project");
+    const remembered = settings.defaultProject ? projects.find((project) => project.name.toLocaleLowerCase() === settings.defaultProject?.toLocaleLowerCase()) : undefined;
+    const registered = named ?? remembered ?? projects.find((project) => isPathInside(project.canonicalPath, currentDirectory));
+    if (!registered) throw new Error(projectOrPrompt ? `Project '${projectOrPrompt}' is not registered, the current directory is outside every registered project, and no default project is saved` : "The current directory is outside every registered project and no default project is saved");
+    await withStore((store) => store.setLocalSetting("defaultProject", registered.name));
     const prompt = named ? remainingPrompt : [...(projectOrPrompt ? [projectOrPrompt] : []), ...remainingPrompt];
     const healthUrl = new URL(config.codexAppServerUrl); healthUrl.protocol = "http:"; healthUrl.pathname = "/readyz";
     try {
@@ -99,7 +114,7 @@ program.command("diagnose").description("Check Codex, database, pairing, project
   try { const codex = await detectCodexVersion(); checks.push({ name: "Codex", ok: codex.compatible, detail: `${codex.version}${codex.compatible ? "" : " (unsupported; requires 0.147.x)"}` }); }
   catch (error) { checks.push({ name: "Codex", ok: false, detail: (error as Error).message }); }
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
-  const store = new ControllerStore(config.databasePath);
+  const store = new ControllerStore(config.databasePath, config.settingsPath);
   try {
     const integrity = store.integrityCheck(); checks.push({ name: "Database", ok: integrity.every((value) => value === "ok"), detail: integrity.join(", ") });
     const owner = store.getOwner(); checks.push({ name: "Owner", ok: !!owner, detail: owner ? `paired; chat ${owner.chatId ? "known" : "unknown"}` : "not paired" });
@@ -116,7 +131,7 @@ program.command("diagnose").description("Check Codex, database, pairing, project
 });
 
 program.command("db").description("Inspect a bounded database table").argument("<table>").option("--limit <number>", "row count", "20").action(async (table: string, options: { limit: string }) => {
-  const allowed = ["projects", "sessions", "turns", "pending_interactions", "delivery_queue", "audit_log"] as const;
+  const allowed = ["projects", "sessions", "turns", "pending_interactions", "delivery_queue", "audit_log", "local_settings"] as const;
   if (!allowed.includes(table as typeof allowed[number])) throw new Error(`Table must be one of: ${allowed.join(", ")}`);
   const limit = Math.min(200, Math.max(1, Number(options.limit)));
   const rows = await withStore((store) => store.inspectTable(table as typeof allowed[number], limit));
@@ -124,10 +139,40 @@ program.command("db").description("Inspect a bounded database table").argument("
 });
 
 const service = program.command("service").description("Manage user-level startup integration");
-service.command("install").action(async () => { const artifact = await installService(await serviceOptions()); process.stdout.write(`Installed user service from ${artifact.path}\n`); });
-service.command("uninstall").action(async () => { await uninstallService(await serviceOptions()); process.stdout.write("Removed PulseCortex user service.\n"); });
+service.command("install").action(async () => { const artifact = await installService(await serviceOptions()); await withStore((store) => store.setLocalSetting("autoStartOnBoot", true)); process.stdout.write(`Installed user service from ${artifact.path}\n`); });
+service.command("uninstall").action(async () => { await uninstallService(await serviceOptions()); await withStore((store) => store.setLocalSetting("autoStartOnBoot", false)); process.stdout.write("Removed PulseCortex user service.\n"); });
 service.command("status").action(async () => { process.stdout.write(await serviceStatus()); });
 service.command("generate").description("Preview the platform startup artifact without installing it").action(async () => { const artifact = serviceArtifact(await serviceOptions()); process.stdout.write(`# ${artifact.path}\n${artifact.content}`); });
+
+const settings = program.command("settings").description("Manage local PulseCortex preferences");
+settings.command("list").action(async () => {
+  const values = await withStore((store) => {
+    const local = store.getLocalSettings();
+    return { local, project: local.defaultProject ? store.getProject(local.defaultProject) : null };
+  });
+  process.stdout.write(`default-project\t${values.project?.name ?? "none"}\nauto-start-on-boot\t${values.local.autoStartOnBoot}\n`);
+});
+settings.command("set").argument("<name>").argument("<value>").action(async (name: string, value: string) => {
+  switch (name.toLowerCase()) {
+    case "default-project": {
+      const projectName = /^(?:none|null|off)$/iu.test(value) ? null : value;
+      await withStore((store) => {
+        const project = projectName ? store.getProject(projectName) : null;
+        if (projectName && !project) throw new Error(`Project '${projectName}' is not registered`);
+        store.setLocalSetting("defaultProject", project?.name ?? null);
+      });
+      process.stdout.write(`Default project set to ${projectName ?? "none"}.\n`);
+      break;
+    }
+    case "auto-start-on-boot": {
+      const enabled = parseBooleanSetting(value);
+      await setAutoStartOnBoot(enabled);
+      process.stdout.write(`Auto-start on boot ${enabled ? "enabled" : "disabled"}.\n`);
+      break;
+    }
+    default: throw new Error("Setting must be default-project or auto-start-on-boot");
+  }
+});
 
 const shell = program.command("shell").description("Make ordinary Codex CLI sessions controllable through PulseCortex");
 shell.command("install").action(async () => {

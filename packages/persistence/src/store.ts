@@ -11,6 +11,7 @@ import {
   type StoredSession,
 } from "@pulsecortex/domain";
 import { migrate } from "./migrations.js";
+import { hasSettingsFile, LocalSettingsFile, type LocalSettingKey, type LocalSettings } from "./settings.js";
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -49,13 +50,17 @@ export interface InteractionRecord {
 
 export class ControllerStore {
   readonly database: Database.Database;
+  private readonly localSettings: LocalSettingsFile;
 
-  constructor(databasePath: string) {
+  constructor(databasePath: string, settingsPath?: string) {
+    const settingsAlreadyExisted = settingsPath ? hasSettingsFile(settingsPath) : true;
     this.database = new Database(databasePath);
     this.database.pragma("journal_mode = WAL");
     this.database.pragma("foreign_keys = ON");
     this.database.pragma("busy_timeout = 5000");
     migrate(this.database);
+    this.localSettings = new LocalSettingsFile(settingsPath);
+    if (settingsPath && !settingsAlreadyExisted) this.migrateLegacySettings();
   }
 
   close(): void { this.database.close(); }
@@ -122,15 +127,52 @@ export class ControllerStore {
   }
 
   removeProject(name: string): boolean {
-    const result = this.database.prepare("DELETE FROM projects WHERE name = ? COLLATE NOCASE").run(name);
-    if (result.changes) this.audit({ eventType: "project.removed", summary: `Project ${name} removed` });
-    return result.changes === 1;
+    const remove = this.database.transaction(() => {
+      const project = this.getProject(name);
+      if (!project) return false;
+      const wasDefault = this.getLocalSettings().defaultProject?.toLocaleLowerCase() === project.name.toLocaleLowerCase();
+      const result = this.database.prepare("DELETE FROM projects WHERE id = ?").run(project.id);
+      if (result.changes && wasDefault) this.setLocalSetting("defaultProject", null);
+      return result.changes === 1;
+    });
+    const removed = remove();
+    if (removed) this.audit({ eventType: "project.removed", summary: `Project ${name} removed` });
+    return removed;
   }
 
   listProjects(): Project[] { return this.database.prepare("SELECT * FROM projects ORDER BY name COLLATE NOCASE").all().map(parseProject); }
   getProject(nameOrId: string): Project | null {
     const row = this.database.prepare("SELECT * FROM projects WHERE id = ? OR name = ? COLLATE NOCASE LIMIT 1").get(nameOrId, nameOrId);
     return row ? parseProject(row) : null;
+  }
+
+  getLocalSettings(): LocalSettings {
+    const settings = this.localSettings.get();
+    if (settings.defaultProject && !this.getProject(settings.defaultProject)) settings.defaultProject = null;
+    return settings;
+  }
+
+  setLocalSetting<K extends LocalSettingKey>(key: K, value: LocalSettings[K]): void {
+    if (key === "defaultProject" && value !== null && (typeof value !== "string" || !this.getProject(value))) throw new Error("The default project is not registered");
+    if (key === "autoStartOnBoot" && typeof value !== "boolean") throw new Error("Auto-start must be a boolean");
+    if (this.localSettings.get()[key] === value) return;
+    this.localSettings.set(key, value);
+    this.audit({ eventType: "setting.updated", summary: `${key} updated` });
+  }
+
+  private migrateLegacySettings(): void {
+    const rows = this.database.prepare("SELECT key, value_json FROM local_settings").all() as Array<{ key: string; value_json: string }>;
+    for (const row of rows) {
+      if (row.key !== "lastProjectId" && row.key !== "defaultProject" && row.key !== "autoStartOnBoot") continue;
+      let value: unknown;
+      try { value = JSON.parse(row.value_json) as unknown; } catch { continue; }
+      if (row.key === "lastProjectId" && (value === null || typeof value === "string")) {
+        const project = value ? this.getProject(value) : null;
+        this.localSettings.set("defaultProject", project?.name ?? null);
+      }
+      if (row.key === "defaultProject" && (value === null || typeof value === "string")) this.localSettings.set(row.key, value);
+      if (row.key === "autoStartOnBoot" && typeof value === "boolean") this.localSettings.set(row.key, value);
+    }
   }
 
   createSession(input: { id: string; projectId: string; title: string }): StoredSession {
@@ -253,7 +295,8 @@ export class ControllerStore {
   }
 
   inspectAudit(limit = 50): Record<string, unknown>[] { return this.database.prepare("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?").all(limit) as Record<string, unknown>[]; }
-  inspectTable(table: "projects" | "sessions" | "turns" | "pending_interactions" | "delivery_queue" | "audit_log", limit = 50): Record<string, unknown>[] {
+  inspectTable(table: "projects" | "sessions" | "turns" | "pending_interactions" | "delivery_queue" | "audit_log" | "local_settings", limit = 50): Record<string, unknown>[] {
+    if (table === "local_settings") return this.localSettings.entries().slice(0, limit).map(({ key, value }) => ({ key, value_json: JSON.stringify(value) }));
     return this.database.prepare(`SELECT * FROM ${table} ORDER BY rowid DESC LIMIT ?`).all(limit) as Record<string, unknown>[];
   }
 

@@ -87,6 +87,7 @@ export class SessionCoordinator {
   private controllableSessions = new Map<string, ProjectSession>();
   private uncontrollableSessions = new Map<string, ProjectSession>();
   private selectedSession: StoredSession | null = null;
+  private selectedProjectId: string | null = null;
   private pendingPrompt: string | null = null;
   private readonly tokens: ActionTokenService;
   private readonly redactions: RegExp[];
@@ -110,6 +111,8 @@ export class SessionCoordinator {
   ) {
     this.tokens = new ActionTokenService(store, signingKey);
     this.redactions = options.redactionPatterns ?? [];
+    const defaultProject = store.getLocalSettings().defaultProject;
+    this.selectedProjectId = defaultProject ? store.getProject(defaultProject)?.id ?? null : null;
     this.messaging.onCommand(async (command) => this.handleCommand(command));
     this.messaging.onAction(async (action) => this.handleAction(action));
     this.driver.subscribe((event) => { void this.handleAgentEvent(event).catch((error) => this.logger.error({ err: error }, "agent event handling failed")); });
@@ -134,12 +137,16 @@ export class SessionCoordinator {
   async syncRunningSessions(): Promise<void> {
     const { newlyControllable, newlyUncontrollable } = await this.refreshSessions();
     if (newlyControllable.length) {
-      if (newlyControllable.length === 1) {
-        const running = newlyControllable[0]!;
+      const preferred = this.selectedProjectId
+        ? newlyControllable.filter((candidate) => candidate.project.id === this.selectedProjectId)
+        : newlyControllable;
+      if (preferred.length === 1 || (this.selectedProjectId && preferred.length > 1)) {
+        const running = preferred.sort((left, right) => right.updatedAt - left.updatedAt)[0]!;
         this.selectedSession = running.session;
+        this.rememberProject(running.project.id);
         const message = runningSessionSelectedMessage(running);
         await this.safeSend("text", message, () => this.messaging.sendText(message));
-      } else {
+      } else if (!this.selectedProjectId && newlyControllable.length > 1) {
         const message = `Detected ${newlyControllable.length} controllable Codex sessions in registered projects. Use /sessions to choose the default.`;
         await this.safeSend("text", message, () => this.messaging.sendText(message));
       }
@@ -191,8 +198,8 @@ export class SessionCoordinator {
       case "approval.accept": await this.resolveApproval(record, "accept", action.actor); break;
       case "approval.decline": await this.resolveApproval(record, "decline", action.actor); break;
       case "turn.stop": await this.stopActiveTurn("action", record); break;
-      case "logs.show": await this.sendPagedOutput("logs.show", record.sessionId, Number(record.payload["page"] ?? 1)); break;
-      case "diff.show": await this.sendPagedOutput("diff.show", record.sessionId, Number(record.payload["page"] ?? 1)); break;
+      case "logs.show": await this.sendPagedOutput("logs.show", record.sessionId, Number(record.payload["page"] ?? 1), record.turnId); break;
+      case "diff.show": await this.sendPagedOutput("diff.show", record.sessionId, Number(record.payload["page"] ?? 1), record.turnId); break;
       case "project.select": await this.selectProject(record.requestId); break;
       case "session.select": await this.resumeStoredSession(record.requestId); break;
       case "session.continue": await this.resumeStoredSession(record.sessionId); break;
@@ -258,12 +265,14 @@ export class SessionCoordinator {
     const runtime = this.runtimes.get(session.id);
     if (runtime) {
       this.selectedSession = runtime.session;
+      this.rememberProject(runtime.project.id);
       if (runtime.pendingInput) { await this.answerFreeformInput(runtime, text); return; }
       if (!isActiveState(runtime.phase)) { await this.messaging.sendText("That turn is finishing. Try again shortly."); return; }
       await this.steerRuntime(runtime, text, `Message sent to ${session.id}.`);
       return;
     }
     this.selectedSession = session;
+    this.rememberProject(session.projectId);
     await this.startTurn(session, text);
   }
 
@@ -298,6 +307,8 @@ export class SessionCoordinator {
       if (refreshed) { this.selectedSession = refreshed; await this.startTurn(refreshed, text); return; }
       this.selectedSession = null;
     }
+    const selectedProject = this.selectedProject();
+    if (selectedProject) { await this.createSelectedSession(selectedProject, text); return; }
     const projects = this.store.listProjects();
     if (projects.length === 1) { await this.createSelectedSession(projects[0]!, text); return; }
     this.pendingPrompt = text;
@@ -311,6 +322,7 @@ export class SessionCoordinator {
   }
 
   private async createSelectedSession(project: Project, prompt: string | null): Promise<void> {
+    this.rememberProject(project.id);
     const title = redact(prompt?.trim() || `New ${project.name} task`, this.redactions).slice(0, 120);
     const id = await this.driver.createSession(project, { title });
     const session = this.store.createSession({ id, projectId: project.id, title });
@@ -323,6 +335,7 @@ export class SessionCoordinator {
     if (this.runtimes.has(session.id)) throw new Error("This session already has an active turn");
     const project = this.store.getProject(session.projectId);
     if (!project) throw new Error("Session project is no longer registered");
+    this.rememberProject(project.id);
     await this.driver.resumeSession(session.id, project);
     const turnId = await this.driver.startTurn(session.id, prompt);
     this.store.createTurn({ id: turnId, sessionId: session.id, prompt });
@@ -509,6 +522,8 @@ export class SessionCoordinator {
 
   private async selectProject(projectId: string): Promise<void> {
     const project = this.store.getProject(projectId); if (!project) return;
+    if (this.selectedSession?.projectId !== project.id) this.selectedSession = null;
+    this.rememberProject(project.id);
     const prompt = this.pendingPrompt; this.pendingPrompt = null;
     await this.refreshSessions();
     const running = [...this.controllableSessions.values()]
@@ -562,6 +577,7 @@ export class SessionCoordinator {
     const runtime = this.runtimes.get(session.id);
     if (runtime) {
       this.selectedSession = runtime.session;
+      this.rememberProject(runtime.project.id);
       await this.messaging.sendText(`Selected active session ${session.title}. New messages will steer it.`);
       return;
     }
@@ -575,6 +591,7 @@ export class SessionCoordinator {
       return;
     }
     this.selectedSession = session;
+    this.rememberProject(project.id);
     await this.messaging.sendText(`Resumed ${session.title}. Send a message to start the next turn.`);
   }
 
@@ -624,10 +641,12 @@ export class SessionCoordinator {
     return { newlyControllable, newlyUncontrollable };
   }
 
-  private async sendPagedOutput(kind: "logs.show" | "diff.show", sessionId: string | undefined, requestedPage: number): Promise<void> {
+  private async sendPagedOutput(kind: "logs.show" | "diff.show", sessionId: string | undefined, requestedPage: number, requestedTurnId?: string): Promise<void> {
     if (!sessionId) { await this.messaging.sendText("No session selected."); return; }
-    const session = this.store.getSession(sessionId); const turnId = this.runtimes.get(sessionId)?.turnId ?? session?.lastTurnId;
+    const session = this.store.getSession(sessionId); const turnId = requestedTurnId ?? this.runtimes.get(sessionId)?.turnId ?? session?.lastTurnId;
     if (!session || !turnId) { await this.messaging.sendText("No turn output is available."); return; }
+    const turn = this.store.getTurn(turnId);
+    if (!turn || String(turn["session_id"]) !== sessionId) { await this.messaging.sendText("That turn output is no longer available."); return; }
     const view = await this.makeOutputView(kind, sessionId, turnId, requestedPage);
     await this.safeSend("output", view, () => this.messaging.sendOutput(view), { actionKind: kind, sessionId, turnId, page: view.page });
   }
@@ -692,16 +711,28 @@ export class SessionCoordinator {
 
   private selectedRuntime(): RuntimeTurn | null {
     if (this.selectedSession) return this.runtimes.get(this.selectedSession.id) ?? null;
-    return this.runtimes.size === 1 && this.controllableSessions.size <= 1 ? this.runtimes.values().next().value ?? null : null;
+    const candidates = [...this.runtimes.values()].filter((runtime) => !this.selectedProjectId || runtime.project.id === this.selectedProjectId);
+    return candidates.length === 1 && this.controllableSessions.size <= 1 ? candidates[0]! : null;
   }
 
   private selectedProject(): Project | null {
-    return this.selectedSession ? this.store.getProject(this.selectedSession.projectId) : null;
+    return this.selectedProjectId ? this.store.getProject(this.selectedProjectId) : null;
   }
 
   private selectSoleControllableSession(): void {
-    if (this.selectedSession || this.controllableSessions.size !== 1) return;
-    this.selectedSession = this.controllableSessions.values().next().value?.session ?? null;
+    if (this.selectedSession) return;
+    const candidates = [...this.controllableSessions.values()].filter((candidate) => !this.selectedProjectId || candidate.project.id === this.selectedProjectId);
+    if (candidates.length !== 1) return;
+    this.selectedSession = candidates[0]!.session;
+    this.rememberProject(candidates[0]!.project.id);
+  }
+
+  private rememberProject(projectId: string): void {
+    if (this.selectedProjectId === projectId) return;
+    const project = this.store.getProject(projectId);
+    if (!project) throw new Error("The selected project is no longer registered");
+    this.store.setLocalSetting("defaultProject", project.name);
+    this.selectedProjectId = projectId;
   }
 
   private issue(kind: string, sessionId: string, turnId: string, requestId: string, expiresAt: number, payload: Record<string, unknown>): string {

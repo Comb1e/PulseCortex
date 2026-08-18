@@ -18,7 +18,21 @@ export class CommandLogStore {
 
   async read(turnId: string): Promise<string> {
     const file = BunNotAvailableReadShim(path.join(this.directory, `${safeId(turnId)}.jsonl`));
-    try { return await file; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return "No command output recorded."; throw error; }
+    try {
+      const contents = await file;
+      return contents
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const entry = JSON.parse(line) as { text?: unknown };
+          if (typeof entry.text !== "string") throw new Error("Invalid command log entry");
+          return entry.text;
+        })
+        .join("") || "No command output recorded.";
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "No command output recorded.";
+      throw error;
+    }
   }
 
   async retain(maxAgeDays: number, maxBytes: number): Promise<{ removed: number; bytes: number }> {
