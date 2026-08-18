@@ -129,4 +129,11 @@ describe("Feishu card rendering", () => {
     expect(json.match(/"tag":"hr"/gu)).toHaveLength(3);
     expect(json).not.toContain("First reply\\n\\nSecond reply");
   });
+
+  it("shows only the final Codex reply on a completed status card", () => {
+    const card = statusCard({ sessionId: "s", turnId: "t", title: "Task", projectName: "app", phase: "completed", startedAt: 0, updatedAt: 10_000, safeSummary: "First reply\\n\\nFinal answer", replies: ["First reply", "Final answer"], recentCommands: [], actionTokens: { stop: "s", logs: "l", diff: "d" } });
+    const json = JSON.stringify(card);
+    expect(json).toContain("Final answer");
+    expect(json).not.toContain("First reply");
+  });
 });

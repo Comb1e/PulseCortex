@@ -47,7 +47,7 @@ function elapsed(startedAt: number, at: number): string {
 export function statusCard(view: SessionView): Card {
   const commands = view.recentCommands.length ? view.recentCommands.map((name) => `- ${escapeMarkdown(name)}`).join("\n") : "- None";
   const metadata = `**Session:** ${escapeMarkdown(view.sessionId)}\n**Project:** ${escapeMarkdown(view.projectName)}\n**Phase:** ${escapeMarkdown(view.phase)}\n**Elapsed:** ${elapsed(view.startedAt, view.updatedAt)}`;
-  const replies = view.replies?.filter((reply) => reply.trim()) ?? [];
+  const replies = (view.phase === "completed" ? view.replies?.filter((reply) => reply.trim()).slice(-1) : view.replies?.filter((reply) => reply.trim())) ?? [];
   const replyElements: Card[] = replies.length
     ? replies.flatMap((reply, index) => [...(index ? [{ tag: "hr" }] : []), markdown(escapeMarkdown(reply))])
     : [markdown(escapeMarkdown(view.safeSummary || "Waiting for Codex..."))];

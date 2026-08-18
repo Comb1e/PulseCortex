@@ -550,7 +550,7 @@ export class SessionCoordinator {
   private async sendResult(runtime: RuntimeTurn, status: TurnResultView["status"]): Promise<void> {
     const expiresAt = Date.now() + 14 * 86_400_000;
     const view: TurnResultView = {
-      sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, status, summary: status === "failed" ? runtime.safeSummary : this.replySummary(runtime) || runtime.safeSummary, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary,
+      sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, status, summary: status === "failed" ? runtime.safeSummary : status === "completed" ? this.latestReply(runtime) || runtime.safeSummary : this.replySummary(runtime) || runtime.safeSummary, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary,
       actionTokens: {
         diff: this.issue("diff.show", runtime.session.id, runtime.turnId, runtime.turnId, expiresAt, { page: 1 }),
         logs: this.issue("logs.show", runtime.session.id, runtime.turnId, runtime.turnId, expiresAt, { page: 1 }),
@@ -635,9 +635,8 @@ export class SessionCoordinator {
 
   private async sendInstructionChoices(): Promise<void> {
     await this.refreshSessions();
-    this.selectSoleControllableSession();
     let session = this.selectedSession;
-    if (!session && !this.store.listSessions(1).length) {
+    if (!session) {
       const projects = this.store.listProjects();
       const project = this.selectedProject() ?? (projects.length === 1 ? projects[0]! : null);
       if (project) session = await this.createSelectedSession(project, null, false);
@@ -646,11 +645,6 @@ export class SessionCoordinator {
         await this.sendProjectChoices("Choose the project for this new session.");
         return;
       }
-    }
-    if (!session) {
-      const message = "No Codex session is selected. Use /sessions or /new first.";
-      await this.safeSend("text", message, () => this.messaging.sendText(message));
-      return;
     }
     const presets = await this.driver.listInstructionPresets();
     if (!presets.length) {
@@ -791,6 +785,10 @@ export class SessionCoordinator {
 
   private replySummary(runtime: RuntimeTurn): string {
     return runtime.replies.map((reply) => reply.text).join("\n\n");
+  }
+
+  private latestReply(runtime: RuntimeTurn): string {
+    return runtime.replies.findLast((reply) => reply.text.trim())?.text ?? "";
   }
 
   private async resolveApprovalCard(pending: PendingApprovalState, decision: ApprovalResolutionView["decision"]): Promise<void> {
