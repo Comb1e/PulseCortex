@@ -40,6 +40,20 @@ describe("daemon logger", () => {
     expect(structured["token"]).toBe("[REDACTED]");
   });
 
+  it("rewrites live Feishu status updates in the terminal", () => {
+    const terminal = new PassThrough();
+    const terminalText = capture(terminal);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working" } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed" } } }, "Feishu outbound message");
+
+    const output = terminalText();
+    expect(output).toContain('"phase": "working"');
+    expect(output).toContain('"phase": "completed"');
+    expect(output).toMatch(/\u001b\[\d+A/);
+  });
+
   it("rotates an oversized log and keeps one previous file", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
     const filePath = path.join(directory, "daemon.log");

@@ -13,6 +13,7 @@ interface LogTarget { write(content: string): unknown }
 export interface LoggerOptions {
   output?: LogTarget;
   color?: boolean;
+  liveStatus?: boolean;
   humanLogPath?: string;
   structuredLogPath?: string;
   maxFileBytes?: number;
@@ -47,8 +48,9 @@ export function formatLogRecord(record: Record<string, unknown>, color = false):
 
 class PrettyLogStream extends Writable {
   private buffered = "";
+  private readonly liveRecords = new Map<string, { rendered: string; lines: number }>();
 
-  constructor(private readonly target: LogTarget, private readonly color: boolean) { super(); }
+  constructor(private readonly target: LogTarget, private readonly color: boolean, private readonly liveStatus = false) { super(); }
 
   override _write(chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
     this.buffered += chunk.toString();
@@ -68,8 +70,52 @@ class PrettyLogStream extends Writable {
   }
 
   private writeLine(line: string): void {
-    try { this.target.write(formatLogRecord(JSON.parse(line) as Record<string, unknown>, this.color)); }
-    catch { this.target.write(`${line}\n`); }
+    try {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      const liveKey = this.liveKey(record);
+      if (this.liveStatus && liveKey) {
+        const rendered = formatLogRecord(record, this.color);
+        this.clearLiveRecords();
+        this.liveRecords.set(liveKey, { rendered, lines: rendered.split("\n").length - 1 });
+        this.renderLiveRecords();
+        return;
+      }
+      if (this.liveStatus && this.liveRecords.size) {
+        this.clearLiveRecords();
+        this.target.write(formatLogRecord(record, this.color));
+        this.renderLiveRecords();
+        return;
+      }
+      this.target.write(formatLogRecord(record, this.color));
+    }
+    catch {
+      if (this.liveStatus && this.liveRecords.size) {
+        this.clearLiveRecords();
+        this.target.write(`${line}\n`);
+        this.renderLiveRecords();
+      } else this.target.write(`${line}\n`);
+    }
+  }
+
+  private liveKey(record: Record<string, unknown>): string | null {
+    if (record["msg"] !== "Feishu outbound message") return null;
+    const feishu = record["feishu"];
+    if (!feishu || typeof feishu !== "object") return null;
+    const value = feishu as Record<string, unknown>;
+    if (value["kind"] !== "status" || typeof value["messageId"] !== "string") return null;
+    return `status:${value["messageId"]}`;
+  }
+
+  private clearLiveRecords(): void {
+    if (!this.liveRecords.size) return;
+    const lines = [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
+    this.target.write(`\u001b[${lines}A`);
+    for (let index = 0; index < lines; index += 1) this.target.write(`\u001b[2K\u001b[1B`);
+    this.target.write(`\u001b[${lines}A\r`);
+  }
+
+  private renderLiveRecords(): void {
+    for (const entry of this.liveRecords.values()) this.target.write(entry.rendered);
   }
 }
 
@@ -88,7 +134,7 @@ export function rotateLogFile(filePath: string, maxBytes: number): boolean {
 export function createLogger(level = "info", options: LoggerOptions = {}): Logger {
   const output = options.output ?? process.stdout;
   const useColor = options.color ?? (output === process.stdout && process.stdout.isTTY === true && process.env["NO_COLOR"] === undefined);
-  const streams: Array<StreamEntry<string>> = [{ level, stream: new PrettyLogStream(output, useColor) }];
+  const streams: Array<StreamEntry<string>> = [{ level, stream: new PrettyLogStream(output, useColor, options.liveStatus ?? false) }];
   const maxFileBytes = options.maxFileBytes ?? 100_000_000;
   if (options.humanLogPath) {
     rotateLogFile(options.humanLogPath, maxFileBytes);

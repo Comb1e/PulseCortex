@@ -13,7 +13,7 @@ async function main(): Promise<void> {
   await mkdir(config.commandLogDir, { recursive: true, mode: 0o700 });
   const humanLogPath = path.join(config.dataDir, "daemon.log");
   const structuredLogPath = path.join(config.dataDir, "daemon.jsonl");
-  const logger = createLogger(config.logLevel, { humanLogPath, structuredLogPath, maxFileBytes: config.logMaxBytes });
+  const logger = createLogger(config.logLevel, { humanLogPath, structuredLogPath, maxFileBytes: config.logMaxBytes, liveStatus: process.stdout.isTTY === true });
   const patterns = config.redactionPatterns.map((pattern) => new RegExp(pattern, "giu"));
   const store = new ControllerStore(config.databasePath, config.settingsPath);
   const interrupted = store.markActiveTurnsInterrupted();

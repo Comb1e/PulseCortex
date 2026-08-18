@@ -83,6 +83,33 @@ describe("session coordinator", () => {
     expect(db.inspectAudit().some((row) => row["event_type"] === "action.rejected")).toBe(true);
   });
 
+  it.each([
+    ["accept", "approval.accept"],
+    ["decline", "approval.decline"],
+  ] as const)("keeps a pending approval actionable after /send (%s)", async (decision, actionKind) => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "run a command", receivedAt: Date.now() });
+    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "approval", kind: "command", title: "Run command", command: "pnpm test", occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.approvals).toHaveLength(1));
+
+    await messaging.command!({ eventId: "send", messageId: "send", actor, name: "send", args: ["follow", "up"], text: "/send follow up", receivedAt: Date.now() });
+
+    expect(driver.steered).toHaveLength(0);
+    expect(messaging.texts.at(-1)).toContain("pending approval card");
+    const token = decision === "accept" ? messaging.approvals[0]!.actionTokens.accept : messaging.approvals[0]!.actionTokens.decline;
+    await messaging.action!({ eventId: decision, actor, kind: actionKind, token, receivedAt: Date.now() });
+    expect(driver.decisions).toEqual([{ id: "approval", decision }]);
+    expect(messaging.approvalUpdates).toEqual([expect.objectContaining({ title: "Run command", decision })]);
+  });
+
   it("resolves multiple simultaneous approvals and updates each card", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();

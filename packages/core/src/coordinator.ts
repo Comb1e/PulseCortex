@@ -274,6 +274,7 @@ export class SessionCoordinator {
       this.selectedSession = runtime.session;
       this.rememberProject(runtime.project.id);
       if (runtime.pendingInput) { await this.answerFreeformInput(runtime, text); return; }
+      if (await this.blockSteerWhileApprovalsPending(runtime)) return;
       if (!isActiveState(runtime.phase)) { await this.messaging.sendText("That turn is finishing. Try again shortly."); return; }
       await this.steerRuntime(runtime, text, `Message sent to ${session.id}.`);
       return;
@@ -301,6 +302,7 @@ export class SessionCoordinator {
     this.selectSoleControllableSession();
     const runtime = this.selectedRuntime();
     if (runtime?.pendingInput) { await this.answerFreeformInput(runtime, text); return; }
+    if (runtime && await this.blockSteerWhileApprovalsPending(runtime)) return;
     if (runtime && isActiveState(runtime.phase)) {
       await this.steerRuntime(runtime, text, "Steering update sent.");
       return;
@@ -309,6 +311,7 @@ export class SessionCoordinator {
       const selectedId = this.selectedSession.id;
       const liveRuntime = this.runtimes.get(selectedId);
       if (liveRuntime?.pendingInput) { await this.answerFreeformInput(liveRuntime, text); return; }
+      if (liveRuntime && await this.blockSteerWhileApprovalsPending(liveRuntime)) return;
       if (liveRuntime && isActiveState(liveRuntime.phase)) { await this.steerRuntime(liveRuntime, text, "Steering update sent."); return; }
       const refreshed = this.store.getSession(selectedId);
       if (refreshed) { this.selectedSession = refreshed; await this.startTurn(refreshed, text); return; }
@@ -320,6 +323,13 @@ export class SessionCoordinator {
     if (projects.length === 1) { await this.createSelectedSession(projects[0]!, text); return; }
     this.pendingPrompt = text;
     await this.sendProjectChoices("Choose the project for this task.");
+  }
+
+  private async blockSteerWhileApprovalsPending(runtime: RuntimeTurn): Promise<boolean> {
+    if (!runtime.pendingApprovals.size) return false;
+    const noun = runtime.pendingApprovals.size === 1 ? "approval card" : "approval cards";
+    await this.messaging.sendText(`Use Allow once or Deny on the pending ${noun} before sending another message.`);
+    return true;
   }
 
   private async steerRuntime(runtime: RuntimeTurn, text: string, acknowledgement: string): Promise<void> {
