@@ -84,7 +84,7 @@ describe("session coordinator", () => {
     await messaging.action!({ ...action, eventId: "a-replay" });
     expect(driver.decisions).toEqual([{ id: "approval", decision: "accept" }]);
     expect(messaging.approvalUpdates).toEqual([expect.objectContaining({ title: "Run tests", decision: "accept" })]);
-    expect(messaging.approvalRemovalRefs).toEqual([{ messageId: "approval", chatId: "chat" }]);
+    expect(messaging.approvalRemovalRefs).toEqual([]);
     expect(db.inspectAudit().some((row) => row["event_type"] === "action.rejected")).toBe(true);
   });
 

@@ -707,7 +707,7 @@ export class SessionCoordinator {
     if (!pending.ref) return;
     const resolution: ApprovalResolutionView = { title: pending.summary, decision, resolvedAt: Date.now() };
     await this.safeSend("approval.update", { ref: pending.ref, resolution }, () => this.messaging.updateApproval(pending.ref!, resolution), { ref: pending.ref, resolution }, `approval:${pending.id}:resolution`);
-    if (this.messaging.removeApproval) {
+    if (pending.kind !== "command" && this.messaging.removeApproval) {
       await this.safeSend("approval.remove", { ref: pending.ref }, () => this.messaging.removeApproval!(pending.ref!), { ref: pending.ref }, `approval:${pending.id}:remove`);
     }
   }
