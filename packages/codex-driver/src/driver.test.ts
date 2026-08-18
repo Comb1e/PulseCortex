@@ -29,6 +29,19 @@ describe("Codex app-server contract", () => {
     await driver.stop();
   });
 
+  it("preserves a discovered session subdirectory when starting its next turn", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "resumed-cwd"], verifyVersion: false });
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    driver.subscribe((event) => { if (event.type === "turn.completed") complete(); });
+    await driver.start();
+    await driver.listSessions([project]);
+
+    await expect(driver.startTurn("external-thread", "continue here")).resolves.toBe("019fake-turn");
+    await completed;
+    await driver.stop();
+  });
+
   it("detects a running standalone thread from its Codex writer lock", async () => {
     const codexHome = await mkdtemp(path.join(os.tmpdir(), "pulse-codex-home-"));
     const locks = path.join(codexHome, "thread-writer-locks");
@@ -121,6 +134,91 @@ describe("Codex app-server contract", () => {
     await completed;
     expect(events.some((event) => event.type === "approval.requested")).toBe(false);
     expect(events.some((event) => event.type === "agent.message.delta" && event.delta.includes("denied filesystem access"))).toBe(true);
+    await driver.stop();
+  });
+
+  it("blocks new turns while the execution environment is disconnected", async () => {
+    const diagnostics: string[] = [];
+    const driver = new CodexAppServerDriver({
+      executable: process.execPath,
+      args: [fixture, "disconnected-before-turn"],
+      verifyVersion: false,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic.message),
+    });
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    await expect(driver.startTurn(sessionId, "use a tool")).rejects.toThrow("tool access is unavailable");
+    expect(diagnostics).toContain("Codex execution environment disconnected; tool access is unavailable");
+    await driver.stop();
+  });
+
+  it("fails an active turn when its execution environment disconnects", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "disconnect-active"], verifyVersion: false });
+    const events: AgentEvent[] = [];
+    driver.subscribe((event) => events.push(event));
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+    await driver.startTurn(sessionId, "use a tool").catch(() => undefined);
+
+    await expect.poll(() => events.some((event) => event.type === "turn.failed")).toBe(true);
+    expect(events.find((event) => event.type === "turn.failed")).toMatchObject({ error: expect.stringContaining("tool access is unavailable") });
+    await driver.stop();
+  });
+
+  it("responds safely to app-server host requests", async () => {
+    const diagnostics: string[] = [];
+    const driver = new CodexAppServerDriver({
+      executable: process.execPath,
+      args: [fixture, "host-requests"],
+      verifyVersion: false,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic.message),
+    });
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    driver.subscribe((event) => { if (event.type === "turn.completed") complete(); });
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+    await driver.startTurn(sessionId, "exercise host requests");
+    await completed;
+
+    expect(diagnostics).toContain("Rejected an unregistered dynamic tool call");
+    expect(diagnostics).toContain("Declined MCP elicitation because remote structured input is not enabled");
+    await driver.stop();
+  });
+
+  it("clears pending requests resolved by the app-server", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "server-resolved"], verifyVersion: false });
+    const events: AgentEvent[] = [];
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    driver.subscribe((event) => { events.push(event); if (event.type === "turn.completed") complete(); });
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+    await driver.startTurn(sessionId, "wait for cancellation");
+    await completed;
+
+    const approval = events.find((event) => event.type === "approval.requested");
+    expect(approval).toBeDefined();
+    expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", requestId: approval && "approvalId" in approval ? approval.approvalId : "" }));
+    if (approval?.type === "approval.requested") await expect(driver.resolveApproval(approval.approvalId, "accept")).rejects.toThrow("stale");
+    await driver.stop();
+  });
+
+  it("surfaces app-server warnings and stderr as diagnostics", async () => {
+    const diagnostics: Array<{ level: string; message: string; output?: unknown }> = [];
+    const driver = new CodexAppServerDriver({
+      executable: process.execPath,
+      args: [fixture, "diagnostics"],
+      verifyVersion: false,
+      onDiagnostic: (diagnostic) => diagnostics.push({ level: diagnostic.level, message: diagnostic.message, output: diagnostic.details?.["output"] }),
+    });
+    await driver.start();
+
+    await expect.poll(() => diagnostics.length).toBeGreaterThanOrEqual(2);
+    expect(diagnostics).toContainEqual(expect.objectContaining({ level: "warn", message: "fake app-server warning" }));
+    expect(diagnostics).toContainEqual(expect.objectContaining({ level: "warn", message: "Codex app-server stderr", output: "fake app-server stderr" }));
     await driver.stop();
   });
 });

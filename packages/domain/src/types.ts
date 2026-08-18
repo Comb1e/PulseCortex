@@ -222,6 +222,7 @@ export type AgentEvent =
   | { type: "command.completed"; sessionId: SessionId; turnId: TurnId; commandId: string; exitCode?: number; occurredAt: number }
   | { type: "approval.requested"; sessionId: SessionId; turnId: TurnId; approvalId: ApprovalId; kind: ApprovalKind; title: string; reason?: string; command?: string; files?: string[]; paths?: string[]; network?: NetworkDestination[]; canAutoApprove?: boolean; occurredAt: number }
   | { type: "input.requested"; sessionId: SessionId; turnId: TurnId; requestId: string; questions: InputQuestion[]; occurredAt: number }
+  | { type: "request.resolved"; sessionId: SessionId; turnId: TurnId; requestId: string; occurredAt: number }
   | { type: "diff.updated"; sessionId: SessionId; turnId: TurnId; diff: string; occurredAt: number }
   | { type: "turn.completed"; sessionId: SessionId; turnId: TurnId; status: "completed" | "stopped"; occurredAt: number }
   | { type: "turn.failed"; sessionId: SessionId; turnId: TurnId; error: string; occurredAt: number }

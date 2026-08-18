@@ -21,7 +21,21 @@ async function main(): Promise<void> {
   await commandLogs.retain(config.logRetentionDays, config.logMaxBytes);
   store.applyRetention(config.auditRetentionDays);
 
-  const driver = new CodexAppServerDriver({ commandLogs, listenUrl: config.codexAppServerUrl });
+  const driver = new CodexAppServerDriver({
+    commandLogs,
+    listenUrl: config.codexAppServerUrl,
+    onDiagnostic: ({ level, message, sessionId, details }) => {
+      const diagnostic = {
+        ...(sessionId ? { sessionId } : {}),
+        ...(details ? { details: redact(JSON.stringify(details), patterns) } : {}),
+      };
+      const safeMessage = redact(message, patterns);
+      if (level === "error") logger.error(diagnostic, safeMessage);
+      else if (level === "warn") logger.warn(diagnostic, safeMessage);
+      else if (level === "info") logger.info(diagnostic, safeMessage);
+      else logger.debug(diagnostic, safeMessage);
+    },
+  });
   const capabilities = await driver.start();
   logger.info({ cliVersion: capabilities.cliVersion, protocolMajor: capabilities.protocolMajor }, "Codex app-server started");
 

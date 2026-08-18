@@ -410,10 +410,26 @@ export class SessionCoordinator {
       }
       case "approval.requested": await this.handleApprovalEvent(runtime, event); break;
       case "input.requested": await this.handleInputEvent(runtime, event); break;
+      case "request.resolved": await this.handleResolvedRequest(runtime, event.requestId); break;
       case "diff.updated": runtime.diff = redact(event.diff, this.redactions); runtime.changedFileCount = countChangedFiles(runtime.diff); runtime.dirty = true; break;
       case "turn.completed": await this.completeRuntime(runtime, event.status); break;
       case "turn.failed": await this.failRuntime(runtime, event.error); break;
     }
+  }
+
+  private async handleResolvedRequest(runtime: RuntimeTurn, requestId: string): Promise<void> {
+    const approval = runtime.pendingApprovals.get(requestId);
+    if (approval) {
+      await this.resolveApprovalCard(approval, "cancel");
+      runtime.pendingApprovals.delete(requestId);
+    }
+    if (runtime.pendingInput?.requestId === requestId) delete runtime.pendingInput;
+    runtime.phase = runtime.pendingApprovals.size ? "awaiting_approval" : runtime.pendingInput ? "awaiting_input" : "working";
+    runtime.safeSummary = runtime.phase === "working" ? "Codex withdrew the pending request and is continuing..." : runtime.safeSummary;
+    runtime.dirty = true;
+    this.store.updateTurn(runtime.turnId, { state: runtime.phase });
+    this.store.audit({ eventType: "request.resolved", summary: requestId, sessionId: runtime.session.id, turnId: runtime.turnId });
+    await this.flushStatus(runtime.session.id, true);
   }
 
   private async handleApprovalEvent(runtime: RuntimeTurn, event: Extract<AgentEvent, { type: "approval.requested" }>): Promise<void> {

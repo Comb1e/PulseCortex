@@ -97,6 +97,27 @@ describe("session coordinator", () => {
     expect(db.inspectAudit().some((row) => row["event_type"] === "action.rejected")).toBe(true);
   });
 
+  it("cancels a pending approval card when Codex resolves the request", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "run a command", receivedAt: Date.now() });
+    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "withdrawn", kind: "command", title: "Run command", command: "pnpm test", occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.approvals).toHaveLength(1));
+
+    driver.emit({ type: "request.resolved", sessionId: "session", turnId: "turn", requestId: "withdrawn", occurredAt: Date.now() });
+
+    await vi.waitFor(() => expect(messaging.approvalUpdates).toContainEqual(expect.objectContaining({ title: "Run command", decision: "cancel" })));
+    await vi.waitFor(() => expect(messaging.statuses.at(-1)?.phase).toBe("working"));
+    expect(db.inspectAudit().some((row) => row["event_type"] === "request.resolved")).toBe(true);
+  });
+
   it("updates the starting card when Codex starts during its initial send", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();

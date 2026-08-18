@@ -15,6 +15,7 @@ import type { CollaborationModeListResponse } from "./generated/v2/Collaboration
 import type { CollaborationModeMask } from "./generated/v2/CollaborationModeMask";
 import type { ConfigReadResponse } from "./generated/v2/ConfigReadResponse";
 import type { AdditionalFileSystemPermissions } from "./generated/v2/AdditionalFileSystemPermissions";
+import type { EnvironmentStatusResponse } from "./generated/v2/EnvironmentStatusResponse";
 import type { FileChangeRequestApprovalParams } from "./generated/v2/FileChangeRequestApprovalParams";
 import type { ItemCompletedNotification } from "./generated/v2/ItemCompletedNotification";
 import type { ItemStartedNotification } from "./generated/v2/ItemStartedNotification";
@@ -37,10 +38,18 @@ const execFileAsync = promisify(execFile);
 interface PendingServerRequest { rpcId: string | number; method: string; params: Record<string, unknown> }
 interface SessionSettings { model: string; reasoningEffort: ReasoningEffort | null }
 
+export interface CodexDriverDiagnostic {
+  level: "debug" | "info" | "warn" | "error";
+  message: string;
+  sessionId?: SessionId;
+  details?: Record<string, unknown>;
+}
+
 export interface CodexDriverOptions extends TransportOptions {
   verifyVersion?: boolean;
   commandLogs?: CommandLogStore;
   supportedCliSeries?: string;
+  onDiagnostic?: (diagnostic: CodexDriverDiagnostic) => void;
 }
 
 function now(): number { return Date.now(); }
@@ -109,6 +118,8 @@ export class CodexAppServerDriver implements AgentDriver {
   private readonly pending = new Map<string, PendingServerRequest>();
   private readonly activeTurns = new Map<SessionId, TurnId>();
   private readonly projectRoots = new Map<SessionId, string>();
+  private readonly sessionCwds = new Map<SessionId, string>();
+  private readonly disconnectedEnvironments = new Map<SessionId, Set<string>>();
   private readonly directInputSessions = new Set<SessionId>();
   private readonly sessionSettings = new Map<SessionId, SessionSettings>();
   private readonly eventBuffers = new Map<SessionId, AgentEvent[]>();
@@ -122,6 +133,8 @@ export class CodexAppServerDriver implements AgentDriver {
     this.transport.on("request", (message: JsonRpcRequest) => this.handleRequest(message));
     this.transport.on("crash", (error: Error) => this.handleCrash(error));
     this.transport.on("protocolError", (error: Error) => { void this.handleProtocolError(error); });
+    this.transport.on("stdout", (output: string) => this.reportDiagnostic("debug", "Codex app-server stdout", undefined, { output: output.trim() }));
+    this.transport.on("stderr", (output: string) => this.reportDiagnostic("warn", "Codex app-server stderr", undefined, { output: output.trim() }));
   }
 
   async start(): Promise<AgentCapabilities> {
@@ -150,7 +163,7 @@ export class CodexAppServerDriver implements AgentDriver {
     }
   }
 
-  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.activeTurns.clear(); this.projectRoots.clear(); this.directInputSessions.clear(); this.sessionSettings.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
+  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.activeTurns.clear(); this.projectRoots.clear(); this.sessionCwds.clear(); this.disconnectedEnvironments.clear(); this.directInputSessions.clear(); this.sessionSettings.clear(); this.pending.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
 
   async createSession(project: Project, options: SessionOptions): Promise<SessionId> {
     this.assertStarted();
@@ -167,6 +180,7 @@ export class CodexAppServerDriver implements AgentDriver {
     });
     if (!isPathInside(project.canonicalPath, response.cwd)) throw new Error("Codex returned a working directory outside the registered project");
     this.projectRoots.set(response.thread.id, project.canonicalPath);
+    this.sessionCwds.set(response.thread.id, response.cwd);
     this.directInputSessions.add(response.thread.id);
     this.sessionSettings.set(response.thread.id, { model: response.model, reasoningEffort: response.reasoningEffort });
     return response.thread.id;
@@ -189,6 +203,7 @@ export class CodexAppServerDriver implements AgentDriver {
     if (response.thread.id !== id || !isPathInside(project.canonicalPath, response.cwd)) throw new Error("Codex resume did not match the registered session and project");
     if (response.thread.canAcceptDirectInput === false) throw new Error("Codex rejoined the session without granting direct input");
     this.projectRoots.set(id, project.canonicalPath);
+    this.sessionCwds.set(id, response.cwd);
     this.directInputSessions.add(id);
     this.sessionSettings.set(id, { model: response.model, reasoningEffort: response.reasoningEffort });
     const activeTurn = response.thread.turns?.findLast((turn) => turn.status === "inProgress");
@@ -209,6 +224,8 @@ export class CodexAppServerDriver implements AgentDriver {
     for (const id of [...this.projectRoots.keys()]) {
       if (loaded.has(id)) continue;
       this.projectRoots.delete(id);
+      this.sessionCwds.delete(id);
+      this.disconnectedEnvironments.delete(id);
       this.directInputSessions.delete(id);
       this.sessionSettings.delete(id);
       this.activeTurns.delete(id);
@@ -227,7 +244,10 @@ export class CodexAppServerDriver implements AgentDriver {
         if (!project) continue;
         const isLoaded = loaded.has(thread.id);
         const isExternallyRunning = !isLoaded && writerLocked.has(thread.id);
-        if (isLoaded) this.projectRoots.set(thread.id, project.canonicalPath);
+        if (isLoaded) {
+          this.projectRoots.set(thread.id, project.canonicalPath);
+          this.sessionCwds.set(thread.id, canonicalCwd);
+        }
         else this.directInputSessions.delete(thread.id);
         let detail: ThreadReadResponse | undefined;
         if (thread.status.type === "active" || (isLoaded && thread.canAcceptDirectInput !== true)) {
@@ -342,19 +362,28 @@ export class CodexAppServerDriver implements AgentDriver {
   async startTurn(id: SessionId, prompt: string): Promise<TurnId> {
     this.assertSession(id);
     if (this.activeTurns.has(id)) throw new Error("This session already has an active turn");
+    await this.assertEnvironmentAvailable(id);
     const root = this.projectRoots.get(id)!;
+    const cwd = this.sessionCwds.get(id) ?? root;
     this.eventBuffers.set(id, []);
     try {
       const response = await this.transport.request<TurnStartResponse>("turn/start", {
         threadId: id,
         input: textInput(prompt),
-        cwd: root,
+        cwd,
         runtimeWorkspaceRoots: [root],
         approvalPolicy: "on-request",
         approvalsReviewer: "user",
         sandboxPolicy: { type: "workspaceWrite", writableRoots: [root], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
       });
       this.activeTurns.set(id, response.turn.id);
+      try {
+        await this.assertEnvironmentAvailable(id);
+      } catch (error) {
+        this.activeTurns.delete(id);
+        await this.transport.request("turn/interrupt", { threadId: id, turnId: response.turn.id }).catch(() => undefined);
+        throw error;
+      }
       setImmediate(() => this.flushEventBuffer(id));
       return response.turn.id;
     } catch (error) {
@@ -481,7 +510,30 @@ export class CodexAppServerDriver implements AgentDriver {
       this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: command ? "command" : "file", title: command ? "Command approval requested" : "File change approval requested", ...(command ? { command: summarizeCommand(command) } : {}), ...(fileChanges.length ? { files: fileChanges } : {}), canAutoApprove: command ? canAutoApproveCommand({ rpcId: request.id, method: request.method, params }) : false, occurredAt: now() });
       return;
     }
+    if (request.method === "currentTime/read") {
+      this.transport.respond(request.id, { currentTimeAt: Math.floor(Date.now() / 1_000) });
+      return;
+    }
+    if (request.method === "mcpServer/elicitation/request") {
+      this.transport.respond(request.id, { action: "decline", content: null, _meta: null });
+      this.reportDiagnostic("warn", "Declined MCP elicitation because remote structured input is not enabled", sessionId, { turnId });
+      return;
+    }
+    if (request.method === "item/tool/call") {
+      this.transport.respond(request.id, {
+        contentItems: [{ type: "inputText", text: "PulseCortex did not register this dynamic tool for remote execution." }],
+        success: false,
+      });
+      this.reportDiagnostic("warn", "Rejected an unregistered dynamic tool call", sessionId, { turnId, tool: params["tool"], namespace: params["namespace"] });
+      return;
+    }
+    if (request.method === "account/chatgptAuthTokens/refresh" || request.method === "attestation/generate") {
+      this.transport.respondError(request.id, -32010, `${request.method} is not available because PulseCortex delegates authentication to the Codex CLI`);
+      this.reportDiagnostic("warn", "Rejected a client-managed authentication request", sessionId || undefined, { method: request.method });
+      return;
+    }
     this.transport.respondError(request.id, -32601, `Unsupported server request: ${request.method}`);
+    this.reportDiagnostic("warn", "Received an unsupported Codex server request", sessionId || undefined, { method: request.method });
   }
 
   private handleNotification(message: JsonRpcNotification): void {
@@ -490,6 +542,43 @@ export class CodexAppServerDriver implements AgentDriver {
     const turnId = String(params["turnId"] ?? (params["turn"] as Record<string, unknown> | undefined)?.["id"] ?? this.activeTurns.get(sessionId) ?? "");
     switch (message.method) {
       case "turn/started": this.activeTurns.set(sessionId, turnId); this.emit({ type: "turn.started", sessionId, turnId, occurredAt: now() }); break;
+      case "thread/environment/connected": {
+        const environmentId = String(params["environmentId"] ?? "");
+        const disconnected = this.disconnectedEnvironments.get(sessionId);
+        disconnected?.delete(environmentId);
+        if (!disconnected?.size) this.disconnectedEnvironments.delete(sessionId);
+        this.reportDiagnostic("info", "Codex execution environment connected", sessionId, { environmentId });
+        break;
+      }
+      case "thread/environment/disconnected": {
+        const environmentId = String(params["environmentId"] ?? "");
+        const disconnected = this.disconnectedEnvironments.get(sessionId) ?? new Set<string>();
+        disconnected.add(environmentId);
+        this.disconnectedEnvironments.set(sessionId, disconnected);
+        this.reportDiagnostic("error", "Codex execution environment disconnected; tool access is unavailable", sessionId, { environmentId });
+        const activeTurn = this.activeTurns.get(sessionId);
+        if (activeTurn) {
+          this.activeTurns.delete(sessionId);
+          this.clearPendingRequests(sessionId, activeTurn);
+          void this.transport.request("turn/interrupt", { threadId: sessionId, turnId: activeTurn }).catch(() => undefined);
+          this.emit({ type: "turn.failed", sessionId, turnId: activeTurn, error: `Codex execution environment ${environmentId} disconnected; tool access is unavailable`, occurredAt: now() });
+        }
+        break;
+      }
+      case "serverRequest/resolved": {
+        const rpcId = params["requestId"];
+        for (const [requestId, pending] of this.pending) {
+          if (String(pending.rpcId) !== String(rpcId)) continue;
+          this.pending.delete(requestId);
+          const pendingSessionId = String(pending.params["threadId"] ?? pending.params["conversationId"] ?? sessionId);
+          const pendingTurnId = String(pending.params["turnId"] ?? this.activeTurns.get(pendingSessionId) ?? turnId);
+          this.emit({ type: "request.resolved", sessionId: pendingSessionId, turnId: pendingTurnId, requestId, occurredAt: now() });
+        }
+        break;
+      }
+      case "warning": this.reportDiagnostic("warn", String(params["message"] ?? "Codex warning"), sessionId || undefined); break;
+      case "configWarning": this.reportDiagnostic("warn", String(params["summary"] ?? "Codex configuration warning"), undefined, { details: params["details"], path: params["path"] }); break;
+      case "deprecationNotice": this.reportDiagnostic("warn", String(params["summary"] ?? "Codex deprecation notice"), undefined, { details: params["details"] }); break;
       case "thread/settings/updated": {
         const settings = params["threadSettings"] as Record<string, unknown> | undefined;
         const model = settings?.["model"];
@@ -509,6 +598,7 @@ export class CodexAppServerDriver implements AgentDriver {
       case "turn/completed": {
         const input = message.params as TurnCompletedNotification;
         this.activeTurns.delete(input.threadId);
+        this.clearPendingRequests(input.threadId, input.turn.id);
         if (input.turn.status === "failed") this.emit({ type: "turn.failed", sessionId: input.threadId, turnId: input.turn.id, error: input.turn.error?.message ?? "Codex turn failed", occurredAt: now() });
         else this.emit({ type: "turn.completed", sessionId: input.threadId, turnId: input.turn.id, status: input.turn.status === "interrupted" ? "stopped" : "completed", occurredAt: now() });
         break;
@@ -542,11 +632,38 @@ export class CodexAppServerDriver implements AgentDriver {
     this.eventBuffers.delete(sessionId);
     for (const event of events) this.emit(event);
   }
+  private async assertEnvironmentAvailable(sessionId: SessionId): Promise<void> {
+    const disconnected = this.disconnectedEnvironments.get(sessionId);
+    if (!disconnected?.size) return;
+    for (const environmentId of [...disconnected]) {
+      try {
+        const response = await this.transport.request<EnvironmentStatusResponse>("environment/status", { environmentId });
+        if (response.status === "ready") disconnected.delete(environmentId);
+      } catch (error) {
+        this.reportDiagnostic("warn", "Could not verify Codex execution environment status", sessionId, { environmentId, error: (error as Error).message });
+      }
+    }
+    if (!disconnected.size) { this.disconnectedEnvironments.delete(sessionId); return; }
+    throw new Error(`Codex execution environment ${[...disconnected].join(", ")} is disconnected; tool access is unavailable`);
+  }
+  private clearPendingRequests(sessionId: SessionId, turnId?: TurnId): void {
+    for (const [requestId, pending] of this.pending) {
+      const pendingSessionId = String(pending.params["threadId"] ?? pending.params["conversationId"] ?? "");
+      const pendingTurnId = String(pending.params["turnId"] ?? "");
+      if (pendingSessionId === sessionId && (!turnId || !pendingTurnId || pendingTurnId === turnId)) this.pending.delete(requestId);
+    }
+  }
+  private reportDiagnostic(level: CodexDriverDiagnostic["level"], message: string, sessionId?: SessionId, details?: Record<string, unknown>): void {
+    if (!message.trim() && !details) return;
+    this.options.onDiagnostic?.({ level, message, ...(sessionId ? { sessionId } : {}), ...(details ? { details } : {}) });
+  }
   private handleCrash(error: Error): void {
     if (!this.started) return;
     this.started = false;
     this.activeTurns.clear();
     this.projectRoots.clear();
+    this.sessionCwds.clear();
+    this.disconnectedEnvironments.clear();
     this.directInputSessions.clear();
     this.sessionSettings.clear();
     this.pending.clear();
@@ -558,6 +675,8 @@ export class CodexAppServerDriver implements AgentDriver {
     this.started = false;
     this.activeTurns.clear();
     this.projectRoots.clear();
+    this.sessionCwds.clear();
+    this.disconnectedEnvironments.clear();
     this.directInputSessions.clear();
     this.sessionSettings.clear();
     this.pending.clear();
