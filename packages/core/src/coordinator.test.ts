@@ -17,7 +17,7 @@ class FakeDriver implements AgentDriver {
   selectedInstructionPresets: Array<{ id: SessionId; presetId: string }> = [];
   discovered: AgentSessionInfo[] = [];
   resumeError: Error | null = null;
-  async start(): Promise<AgentCapabilities> { return { cliVersion: "0.147.0", protocolMajor: 2, userAgent: "fake", supportsSteer: true, supportsApprovals: true }; }
+  async start(): Promise<AgentCapabilities> { return { cliVersion: "0.147.0", protocolMajor: 2, userAgent: "fake", supportsSteer: true, supportsApprovals: true, supportsNamespaceTools: true }; }
   async stop(): Promise<void> {}
   async createSession(_project: Project, _options: SessionOptions): Promise<SessionId> { return "session"; }
   async resumeSession(id: SessionId, project: Project): Promise<void> { this.resumed.push({ id, project }); if (this.resumeError) throw this.resumeError; }

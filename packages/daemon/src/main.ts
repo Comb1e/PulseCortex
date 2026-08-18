@@ -37,7 +37,7 @@ async function main(): Promise<void> {
     },
   });
   const capabilities = await driver.start();
-  logger.info({ cliVersion: capabilities.cliVersion, protocolMajor: capabilities.protocolMajor }, "Codex app-server started");
+  logger.info({ cliVersion: capabilities.cliVersion, protocolMajor: capabilities.protocolMajor, namespaceTools: capabilities.supportsNamespaceTools }, "Codex app-server started");
 
   let coordinator: SessionCoordinator | null = null;
   const messaging = new FeishuAdapter({

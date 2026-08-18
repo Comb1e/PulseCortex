@@ -31,6 +31,7 @@ export interface AgentCapabilities {
   userAgent: string;
   supportsSteer: boolean;
   supportsApprovals: boolean;
+  supportsNamespaceTools: boolean;
 }
 
 export interface AgentSessionInfo {

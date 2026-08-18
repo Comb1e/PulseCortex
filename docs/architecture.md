@@ -16,7 +16,7 @@ shared `codex app-server --listen`
 locally allowlisted project directory
 ```
 
-The domain package owns channel-neutral and Codex-neutral contracts. The Feishu adapter converts direct messages and JSON 2.0 callback cards into `ChannelCommand` and `ChannelAction`. The Codex driver converts app-server methods, notifications, and server requests into normalized `AgentEvent` values. Adapter-specific payloads do not enter coordinator behavior.
+The domain package owns channel-neutral and Codex-neutral contracts. The Feishu adapter converts direct messages and JSON 2.0 callback cards into `ChannelCommand` and `ChannelAction`. The Codex driver converts app-server methods, notifications, and server requests into normalized `AgentEvent` values. Adapter-specific payloads do not enter coordinator behavior. Driver startup also reads the model provider capability contract. PulseCortex-created and resumed sessions use paginated history and disable multi-agent namespace tools, avoiding providers that claim namespace support but do not preserve those structured arguments; independently created TUI sessions retain their own configuration.
 
 ## Lifecycle
 
@@ -32,7 +32,7 @@ Approvals are app-server server requests. Each card action is HMAC-signed and bo
 
 Feishu disconnection does not stop Codex. Failed milestone/result deliveries enter a SQLite queue with exponential backoff and jitter. Approval requests remain pending in the app-server unless the owner previously enabled command auto approve for that Codex session.
 
-An app-server crash fails every attached active turn and preserves the thread mappings. An execution-environment disconnect interrupts and fails its active turn, and blocks another turn until the environment is ready. A daemon restart cannot truthfully claim its previous shared runtime continued, so startup transactionally marks active rows `interrupted_unknown`. Stored session IDs can later be resumed against the same local Codex history.
+An app-server crash fails every attached active turn and preserves the thread mappings. An execution-environment disconnect interrupts and fails its active turn, and blocks another turn until the environment is ready. PulseCortex-created sessions opt into raw response-item notifications so a rejected function-call payload can be correlated to its thread and interrupted immediately. A narrowly scoped stderr fallback does the same when exactly one legacy turn is active. A daemon restart cannot truthfully claim its previous shared runtime continued, so startup transactionally marks active rows `interrupted_unknown`. Stored session IDs can later be resumed against the same local Codex history.
 
 ## Persistence
 

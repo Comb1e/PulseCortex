@@ -22,8 +22,14 @@ lines.on("line", (line) => {
       process.stderr.write("fake app-server stderr\n");
       send({ method: "warning", params: { threadId: null, message: "fake app-server warning" } });
     }
+  } else if (message.method === "modelProvider/capabilities/read") {
+    send({ id: message.id, result: { namespaceTools: scenario !== "no-namespace-tools", imageGeneration: true, webSearch: true } });
   } else if (message.method === "thread/start") {
-    if (message.params.sandbox !== "workspace-write" || message.params.runtimeWorkspaceRoots.length !== 1) {
+    if (message.params.sandbox !== "workspace-write"
+      || message.params.runtimeWorkspaceRoots.length !== 1
+      || message.params.historyMode !== "paginated"
+      || message.params.experimentalRawEvents !== true
+      || message.params.config?.features?.multi_agent !== false) {
       send({ id: message.id, error: { code: -32000, message: "unsafe thread configuration" } });
       return;
     }
@@ -54,6 +60,10 @@ lines.on("line", (line) => {
   } else if (message.method === "thread/read") {
     send({ id: message.id, result: { thread: { id: message.params.threadId, canAcceptDirectInput: scenario !== "rejoin-loaded" || externalThreadJoined, turns: [{ id: "external-turn", status: "inProgress" }] } } });
   } else if (message.method === "thread/resume") {
+    if (message.params.config?.features?.multi_agent !== false) {
+      send({ id: message.id, error: { code: -32000, message: "managed thread enabled unsupported multi-agent tools" } });
+      return;
+    }
     if (scenario === "reject-redundant-resume") {
       send({ id: message.id, error: { code: -32000, message: "thread is already loaded" } });
       return;
@@ -82,6 +92,14 @@ lines.on("line", (line) => {
     }
     if (scenario === "disconnect-active") {
       send({ method: "thread/environment/disconnected", params: { threadId: sessionId, environmentId: "local-tools" } });
+      return;
+    }
+    if (scenario === "raw-router-error") {
+      send({ method: "rawResponseItem/completed", params: { threadId: sessionId, turnId, item: { type: "function_call_output", call_id: "bad-call", output: "failed to parse function arguments: missing field `message` at line 1 column 2" } } });
+      return;
+    }
+    if (scenario === "stderr-router-error") {
+      process.stderr.write("ERROR codex_core::tools::router: error=failed to parse function arguments: missing field `message` at line 1 column 2\n");
       return;
     }
     if (scenario === "host-requests") {

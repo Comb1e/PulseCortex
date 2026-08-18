@@ -92,6 +92,7 @@ describe("Codex app-server contract", () => {
     });
     const capabilities = await driver.start();
     expect(capabilities.protocolMajor).toBe(2);
+    expect(capabilities.supportsNamespaceTools).toBe(true);
     const sessionId = await driver.createSession(project, {});
     expect(sessionId).toBe("019fake-thread");
     await driver.startTurn(sessionId, "run tests");
@@ -164,6 +165,47 @@ describe("Codex app-server contract", () => {
 
     await expect.poll(() => events.some((event) => event.type === "turn.failed")).toBe(true);
     expect(events.find((event) => event.type === "turn.failed")).toMatchObject({ error: expect.stringContaining("tool access is unavailable") });
+    await driver.stop();
+  });
+
+  it("interrupts a turn when a raw response reports invalid tool arguments", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "raw-router-error"], verifyVersion: false });
+    const events: AgentEvent[] = [];
+    driver.subscribe((event) => events.push(event));
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+    await driver.startTurn(sessionId, "use a namespace tool");
+
+    await expect.poll(() => events.some((event) => event.type === "turn.failed")).toBe(true);
+    expect(events.find((event) => event.type === "turn.failed")).toMatchObject({ error: expect.stringContaining("may not preserve namespace tool schemas") });
+    await expect(driver.startTurn(sessionId, "recover after failure")).resolves.toBe("019fake-turn");
+    await driver.stop();
+  });
+
+  it("uses stderr as a circuit breaker when exactly one turn is active", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "stderr-router-error"], verifyVersion: false });
+    const events: AgentEvent[] = [];
+    driver.subscribe((event) => events.push(event));
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+    await driver.startTurn(sessionId, "use a namespace tool");
+
+    await expect.poll(() => events.some((event) => event.type === "turn.failed")).toBe(true);
+    await driver.stop();
+  });
+
+  it("reports when the configured provider lacks namespace tools", async () => {
+    const diagnostics: string[] = [];
+    const driver = new CodexAppServerDriver({
+      executable: process.execPath,
+      args: [fixture, "no-namespace-tools"],
+      verifyVersion: false,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic.message),
+    });
+    const capabilities = await driver.start();
+
+    expect(capabilities.supportsNamespaceTools).toBe(false);
+    expect(diagnostics).toContain("Codex model provider does not support namespace tools; PulseCortex-managed sessions use single-agent tools");
     await driver.stop();
   });
 

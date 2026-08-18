@@ -8,6 +8,7 @@ import type {
 import { canonicalProjectPath, isPathInside, summarizeCommand } from "@pulsecortex/domain";
 import type { CommandLogStore } from "@pulsecortex/persistence";
 import type { InitializeResponse } from "./generated/InitializeResponse";
+import type { FunctionCallOutputBody } from "./generated/FunctionCallOutputBody";
 import type { ReasoningEffort } from "./generated/ReasoningEffort";
 import type { AgentMessageDeltaNotification } from "./generated/v2/AgentMessageDeltaNotification";
 import type { CommandExecutionRequestApprovalParams } from "./generated/v2/CommandExecutionRequestApprovalParams";
@@ -21,6 +22,8 @@ import type { ItemCompletedNotification } from "./generated/v2/ItemCompletedNoti
 import type { ItemStartedNotification } from "./generated/v2/ItemStartedNotification";
 import type { PermissionsRequestApprovalParams } from "./generated/v2/PermissionsRequestApprovalParams";
 import type { ModelListResponse } from "./generated/v2/ModelListResponse";
+import type { ModelProviderCapabilitiesReadResponse } from "./generated/v2/ModelProviderCapabilitiesReadResponse";
+import type { RawResponseItemCompletedNotification } from "./generated/v2/RawResponseItemCompletedNotification";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse";
 import type { ThreadListResponse } from "./generated/v2/ThreadListResponse";
 import type { ThreadLoadedListResponse } from "./generated/v2/ThreadLoadedListResponse";
@@ -54,6 +57,14 @@ export interface CodexDriverOptions extends TransportOptions {
 
 function now(): number { return Date.now(); }
 function textInput(text: string): Array<{ type: "text"; text: string; text_elements: [] }> { return [{ type: "text", text, text_elements: [] }]; }
+
+const MANAGED_THREAD_CONFIG = { features: { multi_agent: false } } as const;
+const TOOL_ARGUMENT_ERROR_PREFIX = "failed to parse function arguments:";
+
+function functionCallOutputText(output: FunctionCallOutputBody): string {
+  if (typeof output === "string") return output;
+  return output.flatMap((item) => item.type === "input_text" ? [item.text] : []).join("\n");
+}
 
 function parseVersion(output: string): string {
   const match = output.match(/(\d+\.\d+\.\d+)/u);
@@ -125,6 +136,7 @@ export class CodexAppServerDriver implements AgentDriver {
   private readonly eventBuffers = new Map<SessionId, AgentEvent[]>();
   private cliVersion = "unknown";
   private codexHome: string | null = null;
+  private stderrBuffer = "";
   private started = false;
 
   constructor(private readonly options: CodexDriverOptions = {}) {
@@ -134,7 +146,7 @@ export class CodexAppServerDriver implements AgentDriver {
     this.transport.on("crash", (error: Error) => this.handleCrash(error));
     this.transport.on("protocolError", (error: Error) => { void this.handleProtocolError(error); });
     this.transport.on("stdout", (output: string) => this.reportDiagnostic("debug", "Codex app-server stdout", undefined, { output: output.trim() }));
-    this.transport.on("stderr", (output: string) => this.reportDiagnostic("warn", "Codex app-server stderr", undefined, { output: output.trim() }));
+    this.transport.on("stderr", (output: string) => this.handleStderr(output));
   }
 
   async start(): Promise<AgentCapabilities> {
@@ -155,15 +167,26 @@ export class CodexAppServerDriver implements AgentDriver {
       });
       this.transport.notify("initialized");
       this.codexHome = initialized.codexHome;
+      const providerCapabilities = await this.transport.request<ModelProviderCapabilitiesReadResponse>("modelProvider/capabilities/read", {});
       this.started = true;
-      return { cliVersion: this.cliVersion, protocolMajor: SUPPORTED_PROTOCOL_MAJOR, userAgent: initialized.userAgent, supportsSteer: true, supportsApprovals: true };
+      this.reportDiagnostic(providerCapabilities.namespaceTools ? "info" : "warn", providerCapabilities.namespaceTools
+        ? "Codex model provider reports namespace-tool support"
+        : "Codex model provider does not support namespace tools; PulseCortex-managed sessions use single-agent tools", undefined, providerCapabilities);
+      return {
+        cliVersion: this.cliVersion,
+        protocolMajor: SUPPORTED_PROTOCOL_MAJOR,
+        userAgent: initialized.userAgent,
+        supportsSteer: true,
+        supportsApprovals: true,
+        supportsNamespaceTools: providerCapabilities.namespaceTools,
+      };
     } catch (error) {
       await this.transport.stop();
       throw error;
     }
   }
 
-  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.activeTurns.clear(); this.projectRoots.clear(); this.sessionCwds.clear(); this.disconnectedEnvironments.clear(); this.directInputSessions.clear(); this.sessionSettings.clear(); this.pending.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
+  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.stderrBuffer = ""; this.activeTurns.clear(); this.projectRoots.clear(); this.sessionCwds.clear(); this.disconnectedEnvironments.clear(); this.directInputSessions.clear(); this.sessionSettings.clear(); this.pending.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
 
   async createSession(project: Project, options: SessionOptions): Promise<SessionId> {
     this.assertStarted();
@@ -173,10 +196,13 @@ export class CodexAppServerDriver implements AgentDriver {
       approvalPolicy: "on-request",
       approvalsReviewer: "user",
       sandbox: "workspace-write",
+      config: MANAGED_THREAD_CONFIG,
       model: options.model ?? null,
       serviceName: "PulseCortex",
       threadSource: "pulsecortex",
       ephemeral: false,
+      historyMode: "paginated",
+      experimentalRawEvents: true,
     });
     if (!isPathInside(project.canonicalPath, response.cwd)) throw new Error("Codex returned a working directory outside the registered project");
     this.projectRoots.set(response.thread.id, project.canonicalPath);
@@ -198,7 +224,7 @@ export class CodexAppServerDriver implements AgentDriver {
       if (this.directInputSessions.has(id)) return;
     }
     const response = await this.transport.request<ThreadResumeResponse>("thread/resume", {
-      threadId: id, cwd, runtimeWorkspaceRoots: [project.canonicalPath], approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: "workspace-write", excludeTurns: false,
+      threadId: id, cwd, runtimeWorkspaceRoots: [project.canonicalPath], approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: "workspace-write", config: MANAGED_THREAD_CONFIG, excludeTurns: false,
     });
     if (response.thread.id !== id || !isPathInside(project.canonicalPath, response.cwd)) throw new Error("Codex resume did not match the registered session and project");
     if (response.thread.canAcceptDirectInput === false) throw new Error("Codex rejoined the session without granting direct input");
@@ -591,6 +617,14 @@ export class CodexAppServerDriver implements AgentDriver {
         this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: input.itemId, delta: input.delta, occurredAt: now() });
         break;
       }
+      case "rawResponseItem/completed": {
+        const input = message.params as RawResponseItemCompletedNotification;
+        if (input.item.type === "function_call_output") {
+          const output = functionCallOutputText(input.item.output);
+          if (output.toLowerCase().includes(TOOL_ARGUMENT_ERROR_PREFIX)) this.failToolArgumentTurn(input.threadId, input.turnId, output);
+        }
+        break;
+      }
       case "turn/diff/updated": this.emit({ type: "diff.updated", sessionId, turnId, diff: String(params["diff"] ?? ""), occurredAt: now() }); break;
       case "item/commandExecution/outputDelta": void this.options.commandLogs?.append(turnId, "stdout", String(params["delta"] ?? "")).catch(() => undefined); break;
       case "item/started": this.handleItemStarted(message.params as ItemStartedNotification); break;
@@ -653,6 +687,34 @@ export class CodexAppServerDriver implements AgentDriver {
       if (pendingSessionId === sessionId && (!turnId || !pendingTurnId || pendingTurnId === turnId)) this.pending.delete(requestId);
     }
   }
+  private handleStderr(output: string): void {
+    this.reportDiagnostic("warn", "Codex app-server stderr", undefined, { output: output.trim() });
+    this.stderrBuffer = `${this.stderrBuffer}${output}`.slice(-8_000);
+    const normalized = this.stderrBuffer.replace(/\u001b\[[0-9;]*m/gu, "");
+    const marker = normalized.toLowerCase().lastIndexOf(TOOL_ARGUMENT_ERROR_PREFIX);
+    if (marker < 0) {
+      const lastNewline = Math.max(this.stderrBuffer.lastIndexOf("\n"), this.stderrBuffer.lastIndexOf("\r"));
+      if (lastNewline >= 0) this.stderrBuffer = this.stderrBuffer.slice(lastNewline + 1);
+      return;
+    }
+    const detail = normalized.slice(marker).split(/\r?\n/u, 1)[0]!.trim();
+    this.stderrBuffer = "";
+    if (this.activeTurns.size !== 1) {
+      this.reportDiagnostic("error", "Codex rejected tool-call arguments but the stderr event could not be correlated to one active turn", undefined, { activeTurnCount: this.activeTurns.size, error: detail });
+      return;
+    }
+    const [sessionId, turnId] = this.activeTurns.entries().next().value as [SessionId, TurnId];
+    this.failToolArgumentTurn(sessionId, turnId, detail);
+  }
+  private failToolArgumentTurn(sessionId: SessionId, turnId: TurnId, detail: string): void {
+    if (this.activeTurns.get(sessionId) !== turnId) return;
+    this.activeTurns.delete(sessionId);
+    this.clearPendingRequests(sessionId, turnId);
+    const error = "Codex could not parse tool-call arguments. The configured model provider may not preserve namespace tool schemas correctly.";
+    this.reportDiagnostic("error", "Codex tool-call argument parsing failed; interrupting the turn", sessionId, { turnId, error: detail });
+    void this.transport.request("turn/interrupt", { threadId: sessionId, turnId }).catch(() => undefined);
+    this.emit({ type: "turn.failed", sessionId, turnId, error, occurredAt: now() });
+  }
   private reportDiagnostic(level: CodexDriverDiagnostic["level"], message: string, sessionId?: SessionId, details?: Record<string, unknown>): void {
     if (!message.trim() && !details) return;
     this.options.onDiagnostic?.({ level, message, ...(sessionId ? { sessionId } : {}), ...(details ? { details } : {}) });
@@ -660,6 +722,7 @@ export class CodexAppServerDriver implements AgentDriver {
   private handleCrash(error: Error): void {
     if (!this.started) return;
     this.started = false;
+    this.stderrBuffer = "";
     this.activeTurns.clear();
     this.projectRoots.clear();
     this.sessionCwds.clear();
@@ -673,6 +736,7 @@ export class CodexAppServerDriver implements AgentDriver {
   private async handleProtocolError(error: Error): Promise<void> {
     if (!this.started) return;
     this.started = false;
+    this.stderrBuffer = "";
     this.activeTurns.clear();
     this.projectRoots.clear();
     this.sessionCwds.clear();
