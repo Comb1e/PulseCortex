@@ -3,18 +3,23 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type {
-  AgentCapabilities, AgentDriver, AgentEvent, AgentSessionInfo, ApprovalId, NetworkDestination, Project, SessionId, SessionOptions, TurnId, Unsubscribe,
+  AgentCapabilities, AgentDriver, AgentEvent, AgentInstructionPreset, AgentSessionInfo, ApprovalId, NetworkDestination, Project, SessionId, SessionOptions, TurnId, Unsubscribe,
 } from "@pulsecortex/domain";
 import { canonicalProjectPath, isPathInside, summarizeCommand } from "@pulsecortex/domain";
 import type { CommandLogStore } from "@pulsecortex/persistence";
 import type { InitializeResponse } from "./generated/InitializeResponse";
+import type { ReasoningEffort } from "./generated/ReasoningEffort";
 import type { AgentMessageDeltaNotification } from "./generated/v2/AgentMessageDeltaNotification";
 import type { CommandExecutionRequestApprovalParams } from "./generated/v2/CommandExecutionRequestApprovalParams";
+import type { CollaborationModeListResponse } from "./generated/v2/CollaborationModeListResponse";
+import type { CollaborationModeMask } from "./generated/v2/CollaborationModeMask";
+import type { ConfigReadResponse } from "./generated/v2/ConfigReadResponse";
 import type { AdditionalFileSystemPermissions } from "./generated/v2/AdditionalFileSystemPermissions";
 import type { FileChangeRequestApprovalParams } from "./generated/v2/FileChangeRequestApprovalParams";
 import type { ItemCompletedNotification } from "./generated/v2/ItemCompletedNotification";
 import type { ItemStartedNotification } from "./generated/v2/ItemStartedNotification";
 import type { PermissionsRequestApprovalParams } from "./generated/v2/PermissionsRequestApprovalParams";
+import type { ModelListResponse } from "./generated/v2/ModelListResponse";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse";
 import type { ThreadListResponse } from "./generated/v2/ThreadListResponse";
 import type { ThreadLoadedListResponse } from "./generated/v2/ThreadLoadedListResponse";
@@ -30,6 +35,7 @@ import { resolveCodexInvocation } from "./launcher.js";
 const execFileAsync = promisify(execFile);
 
 interface PendingServerRequest { rpcId: string | number; method: string; params: Record<string, unknown> }
+interface SessionSettings { model: string; reasoningEffort: ReasoningEffort | null }
 
 export interface CodexDriverOptions extends TransportOptions {
   verifyVersion?: boolean;
@@ -104,6 +110,7 @@ export class CodexAppServerDriver implements AgentDriver {
   private readonly activeTurns = new Map<SessionId, TurnId>();
   private readonly projectRoots = new Map<SessionId, string>();
   private readonly directInputSessions = new Set<SessionId>();
+  private readonly sessionSettings = new Map<SessionId, SessionSettings>();
   private readonly eventBuffers = new Map<SessionId, AgentEvent[]>();
   private cliVersion = "unknown";
   private codexHome: string | null = null;
@@ -143,7 +150,7 @@ export class CodexAppServerDriver implements AgentDriver {
     }
   }
 
-  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.activeTurns.clear(); this.projectRoots.clear(); this.directInputSessions.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
+  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.activeTurns.clear(); this.projectRoots.clear(); this.directInputSessions.clear(); this.sessionSettings.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
 
   async createSession(project: Project, options: SessionOptions): Promise<SessionId> {
     this.assertStarted();
@@ -161,6 +168,7 @@ export class CodexAppServerDriver implements AgentDriver {
     if (!isPathInside(project.canonicalPath, response.cwd)) throw new Error("Codex returned a working directory outside the registered project");
     this.projectRoots.set(response.thread.id, project.canonicalPath);
     this.directInputSessions.add(response.thread.id);
+    this.sessionSettings.set(response.thread.id, { model: response.model, reasoningEffort: response.reasoningEffort });
     return response.thread.id;
   }
 
@@ -182,6 +190,7 @@ export class CodexAppServerDriver implements AgentDriver {
     if (response.thread.canAcceptDirectInput === false) throw new Error("Codex rejoined the session without granting direct input");
     this.projectRoots.set(id, project.canonicalPath);
     this.directInputSessions.add(id);
+    this.sessionSettings.set(id, { model: response.model, reasoningEffort: response.reasoningEffort });
     const activeTurn = response.thread.turns?.findLast((turn) => turn.status === "inProgress");
     if (activeTurn) this.activeTurns.set(id, activeTurn.id);
   }
@@ -201,6 +210,7 @@ export class CodexAppServerDriver implements AgentDriver {
       if (loaded.has(id)) continue;
       this.projectRoots.delete(id);
       this.directInputSessions.delete(id);
+      this.sessionSettings.delete(id);
       this.activeTurns.delete(id);
     }
     const sessions: AgentSessionInfo[] = [];
@@ -253,6 +263,67 @@ export class CodexAppServerDriver implements AgentDriver {
       cursor = response.nextCursor;
     } while (cursor);
     return sessions;
+  }
+
+  async listInstructionPresets(): Promise<AgentInstructionPreset[]> {
+    this.assertStarted();
+    const presets = await this.fetchInstructionPresets();
+    return presets.flatMap((preset) => preset.mode === null ? [] : [{
+      id: preset.name,
+      label: preset.name,
+      mode: preset.mode,
+      ...(preset.model === null ? {} : { model: preset.model }),
+      ...(preset.reasoning_effort === null ? {} : { reasoningEffort: preset.reasoning_effort }),
+    }]);
+  }
+
+  async selectInstructionPreset(id: SessionId, presetId: string): Promise<AgentInstructionPreset> {
+    this.assertSession(id);
+    const preset = (await this.fetchInstructionPresets()).find((candidate) => candidate.name === presetId && candidate.mode !== null);
+    if (!preset?.mode) throw new Error("That Codex instruction preset is no longer available");
+    const current = await this.settingsForSession(id);
+    const model = preset.model ?? current.model;
+    const reasoningEffort = preset.reasoning_effort ?? current.reasoningEffort;
+    await this.transport.request("thread/settings/update", {
+      threadId: id,
+      collaborationMode: {
+        mode: preset.mode,
+        settings: { model, reasoning_effort: reasoningEffort, developer_instructions: null },
+      },
+    });
+    this.sessionSettings.set(id, { model, reasoningEffort });
+    return {
+      id: preset.name,
+      label: preset.name,
+      mode: preset.mode,
+      ...(preset.model === null ? {} : { model: preset.model }),
+      ...(preset.reasoning_effort === null ? {} : { reasoningEffort: preset.reasoning_effort }),
+    };
+  }
+
+  private async fetchInstructionPresets(): Promise<CollaborationModeMask[]> {
+    const response = await this.transport.request<CollaborationModeListResponse>("collaborationMode/list", {});
+    return response.data;
+  }
+
+  private async settingsForSession(id: SessionId): Promise<SessionSettings> {
+    const cached = this.sessionSettings.get(id);
+    if (cached) return cached;
+    const cwd = this.projectRoots.get(id)!;
+    const configured = await this.transport.request<ConfigReadResponse>("config/read", { cwd, includeLayers: false });
+    let model = configured.config.model?.trim() || null;
+    if (!model) {
+      let cursor: string | null = null;
+      do {
+        const response: ModelListResponse = await this.transport.request<ModelListResponse>("model/list", { cursor, limit: 100, includeHidden: false });
+        model = response.data.find((candidate) => candidate.isDefault)?.model ?? null;
+        cursor = response.nextCursor;
+      } while (!model && cursor);
+    }
+    if (!model) throw new Error("Codex did not report a model for this session");
+    const settings = { model, reasoningEffort: configured.config.model_reasoning_effort };
+    this.sessionSettings.set(id, settings);
+    return settings;
   }
 
   private async listWriterLockedThreads(): Promise<Set<string>> {
@@ -419,6 +490,13 @@ export class CodexAppServerDriver implements AgentDriver {
     const turnId = String(params["turnId"] ?? (params["turn"] as Record<string, unknown> | undefined)?.["id"] ?? this.activeTurns.get(sessionId) ?? "");
     switch (message.method) {
       case "turn/started": this.activeTurns.set(sessionId, turnId); this.emit({ type: "turn.started", sessionId, turnId, occurredAt: now() }); break;
+      case "thread/settings/updated": {
+        const settings = params["threadSettings"] as Record<string, unknown> | undefined;
+        const model = settings?.["model"];
+        const effort = settings?.["effort"];
+        if (typeof model === "string") this.sessionSettings.set(sessionId, { model, reasoningEffort: typeof effort === "string" ? effort as ReasoningEffort : null });
+        break;
+      }
       case "item/agentMessage/delta": {
         const input = message.params as AgentMessageDeltaNotification;
         this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: input.itemId, delta: input.delta, occurredAt: now() });
@@ -470,6 +548,7 @@ export class CodexAppServerDriver implements AgentDriver {
     this.activeTurns.clear();
     this.projectRoots.clear();
     this.directInputSessions.clear();
+    this.sessionSettings.clear();
     this.pending.clear();
     this.eventBuffers.clear();
     this.emit({ type: "driver.crashed", error: error.message, occurredAt: now() });
@@ -480,6 +559,7 @@ export class CodexAppServerDriver implements AgentDriver {
     this.activeTurns.clear();
     this.projectRoots.clear();
     this.directInputSessions.clear();
+    this.sessionSettings.clear();
     this.pending.clear();
     this.eventBuffers.clear();
     await this.transport.stop();

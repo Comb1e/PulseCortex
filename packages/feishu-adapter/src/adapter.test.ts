@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CardActionEvent, NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { ControllerStore } from "@pulsecortex/persistence";
 import { FeishuAdapter } from "./adapter.js";
-import { approvalCard, resolvedApprovalCard, statusCard } from "./cards.js";
+import { approvalCard, choiceCard, resolvedApprovalCard, statusCard } from "./cards.js";
 
 const stores: ControllerStore[] = [];
 afterEach(() => { while (stores.length) stores.pop()?.close(); });
@@ -109,6 +109,18 @@ describe("Feishu card rendering", () => {
     const card = statusCard({ sessionId: "s", turnId: "t", title: "Task", projectName: "app", phase: "working", startedAt: 0, updatedAt: 10_000, safeSummary: "Working", recentCommands: ["pnpm test"], actionTokens: { stop: "s", logs: "l", diff: "d" } });
     expect(JSON.stringify(card)).toContain("pnpm test");
     expect(JSON.stringify(card)).toContain("**Session:** s");
+  });
+
+  it("renders built-in instruction presets as callback choices", () => {
+    const card = choiceCard({
+      title: "Choose Codex instructions",
+      actionKind: "instructions.select",
+      choices: [{ label: "Plan", description: "Mode: plan\nReasoning: medium", token: "signed", value: "Plan" }],
+    });
+    const json = JSON.stringify(card);
+    expect(json).toContain("instructions.select");
+    expect(json).toContain("Reasoning: medium");
+    expect(json).toContain("signed");
   });
 
   it("partitions each Codex reply in the status card", () => {

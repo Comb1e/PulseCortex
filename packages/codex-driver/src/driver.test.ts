@@ -51,6 +51,19 @@ describe("Codex app-server contract", () => {
     await driver.stop();
   });
 
+  it("lists and applies Codex built-in instruction presets", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture], verifyVersion: false });
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+
+    await expect(driver.listInstructionPresets()).resolves.toEqual([
+      { id: "Plan", label: "Plan", mode: "plan", reasoningEffort: "medium" },
+      { id: "Default", label: "Default", mode: "default" },
+    ]);
+    await expect(driver.selectInstructionPreset(sessionId, "Plan")).resolves.toEqual({ id: "Plan", label: "Plan", mode: "plan", reasoningEffort: "medium" });
+    await driver.stop();
+  });
+
   it("normalizes streams and one-time network approval", async () => {
     const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture], verifyVersion: false });
     const events: AgentEvent[] = [];

@@ -1,7 +1,7 @@
 import type { CommandName } from "./types.js";
 
 const COMMANDS = new Set<CommandName>([
-  "pair", "projects", "new", "sessions", "resume", "send", "status", "stop", "logs", "diff", "help",
+  "pair", "projects", "new", "sessions", "instructions", "resume", "send", "status", "stop", "logs", "diff", "help",
 ]);
 
 export interface ParsedCommand {

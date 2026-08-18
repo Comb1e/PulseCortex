@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import pino from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentCapabilities, AgentDriver, AgentEvent, AgentSessionInfo, ApprovalId, ApprovalResolutionView, ApprovalView, ChannelAction, ChannelCommand, ChoiceView, MessageRef, MessagingAdapter, OutputView, Project, QuestionView, SessionId, SessionOptions, SessionView, TurnId, TurnResultView, Unsubscribe } from "@pulsecortex/domain";
+import type { AgentCapabilities, AgentDriver, AgentEvent, AgentInstructionPreset, AgentSessionInfo, ApprovalId, ApprovalResolutionView, ApprovalView, ChannelAction, ChannelCommand, ChoiceView, MessageRef, MessagingAdapter, OutputView, Project, QuestionView, SessionId, SessionOptions, SessionView, TurnId, TurnResultView, Unsubscribe } from "@pulsecortex/domain";
 import { CommandLogStore, ControllerStore } from "@pulsecortex/persistence";
 import { SessionCoordinator } from "./coordinator.js";
 
@@ -13,6 +13,8 @@ class FakeDriver implements AgentDriver {
   resumed: Array<{ id: SessionId; project: Project }> = [];
   started: Array<{ id: SessionId; prompt: string }> = [];
   steered: Array<{ id: SessionId; text: string }> = [];
+  instructionPresets: AgentInstructionPreset[] = [{ id: "Plan", label: "Plan", mode: "plan", reasoningEffort: "medium" }, { id: "Default", label: "Default", mode: "default" }];
+  selectedInstructionPresets: Array<{ id: SessionId; presetId: string }> = [];
   discovered: AgentSessionInfo[] = [];
   resumeError: Error | null = null;
   async start(): Promise<AgentCapabilities> { return { cliVersion: "0.147.0", protocolMajor: 2, userAgent: "fake", supportsSteer: true, supportsApprovals: true }; }
@@ -20,6 +22,13 @@ class FakeDriver implements AgentDriver {
   async createSession(_project: Project, _options: SessionOptions): Promise<SessionId> { return "session"; }
   async resumeSession(id: SessionId, project: Project): Promise<void> { this.resumed.push({ id, project }); if (this.resumeError) throw this.resumeError; }
   async listSessions(_projects: Project[]): Promise<AgentSessionInfo[]> { return this.discovered; }
+  async listInstructionPresets(): Promise<AgentInstructionPreset[]> { return this.instructionPresets; }
+  async selectInstructionPreset(id: SessionId, presetId: string): Promise<AgentInstructionPreset> {
+    this.selectedInstructionPresets.push({ id, presetId });
+    const preset = this.instructionPresets.find((candidate) => candidate.id === presetId);
+    if (!preset) throw new Error("missing preset");
+    return preset;
+  }
   async startTurn(id: SessionId, prompt: string): Promise<TurnId> { this.started.push({ id, prompt }); return this.started.length === 1 ? "turn" : `turn-${this.started.length}`; }
   async steerTurn(id: SessionId, text: string): Promise<void> { this.steered.push({ id, text }); }
   async interruptTurn(_id: SessionId): Promise<void> {}
@@ -654,6 +663,31 @@ describe("session coordinator", () => {
     const truncated = messaging.choices.flatMap((view) => view.choices).find((choice) => choice.value === "session-0")!.label;
     expect(truncated.split(/\s+/u)).toHaveLength(100);
     expect(truncated.endsWith("...")).toBe(true);
+  });
+
+  it("selects Codex built-in instructions for the chosen session", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver();
+    driver.discovered = [{ id: "instruction-session", projectId: project.id, title: "Instruction task", state: "idle", loaded: true, canAcceptDirectInput: true, createdAt: 1, updatedAt: 2, botCreated: false }];
+    const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "sessions", messageId: "sessions", actor, name: "sessions", args: [], text: "/sessions", receivedAt: Date.now() });
+    await messaging.action!({ eventId: "select-session", actor, kind: "session.select", token: messaging.choices[0]!.choices[0]!.token, receivedAt: Date.now() });
+    await messaging.command!({ eventId: "instructions", messageId: "instructions", actor, name: "instructions", args: [], text: "/instructions", receivedAt: Date.now() });
+
+    const presetCard = messaging.choices.at(-1)!;
+    expect(presetCard).toMatchObject({ title: "Choose Codex instructions", actionKind: "instructions.select" });
+    expect(presetCard.choices.map((choice) => choice.label)).toEqual(["Plan", "Default"]);
+    await messaging.action!({ eventId: "select-plan", actor, kind: "instructions.select", token: presetCard.choices[0]!.token, receivedAt: Date.now() });
+    expect(driver.selectedInstructionPresets).toEqual([{ id: "instruction-session", presetId: "Plan" }]);
+    expect(messaging.texts.at(-1)).toContain("Using Codex's Plan instructions");
   });
 
   it("reports a session owned by another Codex runtime instead of failing silently", async () => {

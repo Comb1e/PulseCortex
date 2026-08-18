@@ -1,6 +1,7 @@
 import type {
   AgentCapabilities,
   AgentEvent,
+  AgentInstructionPreset,
   AgentSessionInfo,
   ApprovalId,
   ApprovalResolutionView,
@@ -45,6 +46,8 @@ export interface AgentDriver {
   createSession(project: Project, options: SessionOptions): Promise<SessionId>;
   resumeSession(id: SessionId, project: Project): Promise<void>;
   listSessions(projects: Project[]): Promise<AgentSessionInfo[]>;
+  listInstructionPresets(): Promise<AgentInstructionPreset[]>;
+  selectInstructionPreset(id: SessionId, presetId: string): Promise<AgentInstructionPreset>;
   startTurn(id: SessionId, prompt: string): Promise<TurnId>;
   steerTurn(id: SessionId, text: string): Promise<void>;
   interruptTurn(id: SessionId): Promise<void>;

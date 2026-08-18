@@ -5,6 +5,7 @@ describe("command parsing", () => {
   it("parses commands and strips bot suffixes", () => {
     expect(parseCommand(" /new@bot api ")).toEqual({ name: "new", args: ["api"], text: "/new@bot api" });
     expect(parseCommand("/send@bot session-1 keep going")).toEqual({ name: "send", args: ["session-1", "keep", "going"], text: "/send@bot session-1 keep going" });
+    expect(parseCommand("/instructions").name).toBe("instructions");
     expect(parseCommand("implement this").name).toBe("text");
     expect(parseCommand("/shell whoami").name).toBe("unknown");
   });

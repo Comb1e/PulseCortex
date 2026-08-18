@@ -46,6 +46,14 @@ export interface AgentSessionInfo {
   botCreated: boolean;
 }
 
+export interface AgentInstructionPreset {
+  id: string;
+  label: string;
+  mode: string;
+  model?: string;
+  reasoningEffort?: string;
+}
+
 export type TurnPhase =
   | "starting"
   | "working"
@@ -115,7 +123,7 @@ export interface TurnResultView {
 export interface ChoiceView {
   title: string;
   description?: string;
-  actionKind: "project.select" | "session.select";
+  actionKind: "project.select" | "session.select" | "instructions.select";
   choices: Array<{ label: string; description?: string; token: string; value: string }>;
   previousToken?: string;
   nextToken?: string;
@@ -151,6 +159,7 @@ export type CommandName =
   | "projects"
   | "new"
   | "sessions"
+  | "instructions"
   | "resume"
   | "send"
   | "status"
@@ -181,6 +190,7 @@ export type ChannelActionKind =
   | "sessions.more"
   | "project.select"
   | "session.select"
+  | "instructions.select"
   | "input.answer";
 
 export interface ChannelAction {

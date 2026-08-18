@@ -21,7 +21,19 @@ lines.on("line", (line) => {
       send({ id: message.id, error: { code: -32000, message: "unsafe thread configuration" } });
       return;
     }
-    send({ id: message.id, result: { thread: { id: sessionId }, cwd: message.params.cwd } });
+    send({ id: message.id, result: { thread: { id: sessionId }, cwd: message.params.cwd, model: "gpt-test", reasoningEffort: "high" } });
+  } else if (message.method === "collaborationMode/list") {
+    send({ id: message.id, result: { data: [
+      { name: "Plan", mode: "plan", model: null, reasoning_effort: "medium" },
+      { name: "Default", mode: "default", model: null, reasoning_effort: null },
+    ] } });
+  } else if (message.method === "thread/settings/update") {
+    const collaboration = message.params.collaborationMode;
+    if (collaboration?.mode !== "plan" || collaboration.settings?.model !== "gpt-test" || collaboration.settings?.reasoning_effort !== "medium" || collaboration.settings?.developer_instructions !== null) {
+      send({ id: message.id, error: { code: -32000, message: "invalid built-in instruction preset" } });
+      return;
+    }
+    send({ id: message.id, result: {} });
   } else if (message.method === "thread/loaded/list") {
     send({ id: message.id, result: { data: ["external-thread"], nextCursor: null } });
   } else if (message.method === "thread/list") {
@@ -44,7 +56,7 @@ lines.on("line", (line) => {
     }
     sessionId = message.params.threadId;
     externalThreadJoined = true;
-    send({ id: message.id, result: { thread: { id: sessionId, canAcceptDirectInput: true, turns: [{ id: "external-turn", status: "inProgress" }] }, cwd: message.params.cwd } });
+    send({ id: message.id, result: { thread: { id: sessionId, canAcceptDirectInput: true, turns: [{ id: "external-turn", status: "inProgress" }] }, cwd: message.params.cwd, model: "gpt-test", reasoningEffort: "high" } });
   } else if (message.method === "turn/start") {
     if (message.params.sandboxPolicy.type !== "workspaceWrite" || message.params.sandboxPolicy.networkAccess !== false || message.params.sandboxPolicy.writableRoots.length !== 1) {
       send({ id: message.id, error: { code: -32000, message: "unsafe turn configuration" } });

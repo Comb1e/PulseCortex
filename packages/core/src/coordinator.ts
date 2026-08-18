@@ -78,6 +78,7 @@ const HELP = `PulseCortex commands:
 /projects - choose a locally registered project
 /new [task] - create a Codex session in the chosen project (or use /new <project> [task])
 /sessions - discover and select allowlisted Codex sessions
+/instructions - choose Codex's built-in instructions for the selected session
 /resume [session-id] - resume a session
 /send <message> - message the selected session, or create one if none is selected
 /send <session-id> <message> - message a specific session
@@ -184,6 +185,7 @@ export class SessionCoordinator {
       case "projects": await this.sendProjectChoices(); break;
       case "new": await this.handleNew(command.args); break;
       case "sessions": await this.sendSessionChoices(); break;
+      case "instructions": await this.sendInstructionChoices(); break;
       case "resume": await this.handleResume(command.args[0]); break;
       case "send": await this.handleSend(command); break;
       case "status": await this.handleStatus(); break;
@@ -212,6 +214,7 @@ export class SessionCoordinator {
       case "diff.show": await this.sendPagedOutput("diff.show", record.sessionId, Number(record.payload["page"] ?? 1), record.turnId); break;
       case "project.select": await this.selectProject(record.requestId); break;
       case "session.select": await this.resumeStoredSession(record.requestId); break;
+      case "instructions.select": await this.selectInstructionPreset(record.sessionId, record.requestId); break;
       case "session.continue": await this.resumeStoredSession(record.sessionId); break;
       case "task.new": await this.promptForNewSession(null); break;
       case "sessions.more": await this.sendSessionChoices(Number(record.payload["page"] ?? 1), false); break;
@@ -620,6 +623,55 @@ export class SessionCoordinator {
       ...(boundedPage < totalPages ? { nextToken: this.issue("sessions.more", "sessions", "none", "sessions", expiresAt, { page: boundedPage + 1 }) } : {}),
     };
     await this.safeSend("choices", view, () => this.messaging.sendChoices(view));
+  }
+
+  private async sendInstructionChoices(): Promise<void> {
+    await this.refreshSessions();
+    this.selectSoleControllableSession();
+    const session = this.selectedSession;
+    if (!session) {
+      const message = "No Codex session is selected. Use /sessions or /new first.";
+      await this.safeSend("text", message, () => this.messaging.sendText(message));
+      return;
+    }
+    const presets = await this.driver.listInstructionPresets();
+    if (!presets.length) {
+      const message = "Codex did not report any built-in instruction presets.";
+      await this.safeSend("text", message, () => this.messaging.sendText(message));
+      return;
+    }
+    const expiresAt = Date.now() + 15 * 60_000;
+    const view: ChoiceView = {
+      title: "Choose Codex instructions",
+      description: `Select the built-in instructions for ${session.title}. The choice applies to subsequent turns.`,
+      actionKind: "instructions.select",
+      choices: presets.map((preset) => ({
+        label: preset.label,
+        description: [`Mode: ${preset.mode}`, ...(preset.model ? [`Model: ${preset.model}`] : []), ...(preset.reasoningEffort ? [`Reasoning: ${preset.reasoningEffort}`] : [])].join("\n"),
+        value: preset.id,
+        token: this.issue("instructions.select", session.id, session.lastTurnId ?? "none", preset.id, expiresAt, {}),
+      })),
+    };
+    await this.safeSend("choices", view, () => this.messaging.sendChoices(view));
+  }
+
+  private async selectInstructionPreset(sessionId: string, presetId: string): Promise<void> {
+    const session = this.store.getSession(sessionId);
+    if (!session) {
+      await this.messaging.sendText("That Codex session is no longer available.");
+      return;
+    }
+    try {
+      const preset = await this.driver.selectInstructionPreset(session.id, presetId);
+      const message = `Using Codex's ${preset.label} instructions for ${session.title}. The choice applies to subsequent turns.`;
+      await this.safeSend("text", message, () => this.messaging.sendText(message));
+    } catch (error) {
+      const errorMessage = redact((error as Error).message, this.redactions).slice(0, 500);
+      this.store.audit({ eventType: "instructions.select.failed", summary: errorMessage, sessionId: session.id, ...(session.lastTurnId ? { turnId: session.lastTurnId } : {}) });
+      this.logger.warn({ sessionId: session.id, errorMessage }, "Could not select Codex instructions");
+      const message = `Could not select Codex instructions: ${errorMessage}`;
+      await this.safeSend("text", message, () => this.messaging.sendText(message));
+    }
   }
 
   private async resumeStoredSession(id: string): Promise<void> {
