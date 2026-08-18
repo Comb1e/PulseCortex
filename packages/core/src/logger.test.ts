@@ -17,6 +17,8 @@ class TerminalScreen extends Writable {
   private row = 0;
   private column = 0;
 
+  constructor(readonly columns = Number.POSITIVE_INFINITY) { super(); }
+
   text(): string { return this.lines.join("\n").trimEnd(); }
 
   override _write(chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
@@ -43,6 +45,11 @@ class TerminalScreen extends Writable {
         const line = this.lines[this.row] ?? "";
         this.lines[this.row] = `${line.slice(0, this.column)}${character}${line.slice(this.column + 1)}`;
         this.column += 1;
+        if (this.column >= this.columns) {
+          this.row += 1;
+          this.column = 0;
+          while (this.lines.length <= this.row) this.lines.push("");
+        }
       }
       index += 1;
     }
@@ -79,16 +86,16 @@ describe("daemon logger", () => {
   });
 
   it("replaces the terminal entry for an updated Feishu message", () => {
-    const terminal = new TerminalScreen();
+    const terminal = new TerminalScreen(80);
     const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
 
-    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working" } } }, "Feishu outbound message");
-    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed" } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: "x".repeat(200) } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed", safeSummary: "y".repeat(200) } } }, "Feishu outbound message");
 
     const output = terminal.text();
-    expect(output).not.toContain('"phase": "working"');
-    expect(output).toContain('"phase": "completed"');
-    expect((output.match(/Feishu outbound message/g) ?? [])).toHaveLength(1);
+    expect(output).not.toContain('phase="working"');
+    expect(output).toContain('phase="completed"');
+    expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
   });
 
   it("keeps terminal entries separate when message IDs differ", () => {
@@ -123,6 +130,21 @@ describe("daemon logger", () => {
 
     const output = terminal.text();
     expect((output.match(/One visible status/g) ?? [])).toHaveLength(1);
+    expect((output.match(/Feishu connection state changed/g) ?? [])).toHaveLength(1);
+  });
+
+  it("retires a live status when the same message becomes a result", () => {
+    const terminal = new TerminalScreen(100);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working" } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "result", operation: "update", messageId: "message-1", content: { status: "completed", summary: "Done" } } }, "Feishu outbound message");
+    logger.info({ connected: true }, "Feishu connection state changed");
+
+    const output = terminal.text();
+    expect(output).not.toContain('phase="working"');
+    expect(output).toContain('status="completed"');
+    expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
     expect((output.match(/Feishu connection state changed/g) ?? [])).toHaveLength(1);
   });
 

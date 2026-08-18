@@ -6,10 +6,12 @@ const LEVEL_NAMES: Record<number, string> = { 10: "TRACE", 20: "DEBUG", 30: "INF
 const LEVEL_COLORS: Record<string, string> = { TRACE: "\u001b[90m", DEBUG: "\u001b[36m", INFO: "\u001b[32m", WARN: "\u001b[33m", ERROR: "\u001b[31m", FATAL: "\u001b[31;1m" };
 const RESET = "\u001b[0m";
 const DIM = "\u001b[2m";
+const CLEAR_LINE = "\u001b[2K";
+const CURSOR_UP = "\u001b[1A";
 const LOG_METADATA = new Set(["level", "time", "pid", "hostname", "service", "msg"]);
 const LIVE_MESSAGE_KINDS = new Set(["status", "approval", "result"]);
 
-interface LogTarget { write(content: string): unknown }
+interface LogTarget { write(content: string): unknown; columns?: number }
 
 export interface LoggerOptions {
   output?: LogTarget;
@@ -47,9 +49,31 @@ export function formatLogRecord(record: Record<string, unknown>, color = false):
   return `${prefix} ${message}${fields.length ? `\n${fields.join("\n")}` : ""}\n`;
 }
 
+function truncateToCells(value: string, maxCells: number): string {
+  let cells = 0;
+  let output = "";
+  for (const character of value) {
+    const width = character.codePointAt(0)! <= 0x7f ? 1 : 2;
+    if (cells + width > maxCells - 3) return `${output}...`;
+    cells += width;
+    output += character;
+  }
+  return output;
+}
+
+function formatLiveRecord(record: Record<string, unknown>, maxCells: number): string {
+  const feishu = record["feishu"] as Record<string, unknown>;
+  const content = feishu["content"] && typeof feishu["content"] === "object" ? feishu["content"] as Record<string, unknown> : null;
+  const level = LEVEL_NAMES[Number(record["level"])] ?? "LOG";
+  const details = ["phase", "status", "title", "safeSummary", "summary"]
+    .flatMap((key) => content?.[key] === undefined ? [] : [`${key}=${JSON.stringify(content[key])}`]);
+  const output = `${timestamp(record["time"])} ${level} [${String(feishu["kind"])}/${String(feishu["operation"])}] ${String(feishu["messageId"])}${details.length ? ` ${details.join(" ")}` : ""}`;
+  return truncateToCells(output, maxCells);
+}
+
 class PrettyLogStream extends Writable {
   private buffered = "";
-  private readonly liveRecords = new Map<string, { rendered: string; lines: number; fingerprint: string }>();
+  private readonly liveRecords = new Map<string, { rendered: string; fingerprint: string }>();
 
   constructor(private readonly target: LogTarget, private readonly color: boolean, private readonly liveStatus = false) { super(); }
 
@@ -75,11 +99,16 @@ class PrettyLogStream extends Writable {
       const record = JSON.parse(line) as Record<string, unknown>;
       const liveKey = this.liveKey(record);
       if (this.liveStatus && liveKey) {
-        const rendered = formatLogRecord(record, this.color);
         const fingerprint = this.liveFingerprint(record);
         if (this.liveRecords.get(liveKey)?.fingerprint === fingerprint) return;
         this.clearLiveRecords();
-        this.liveRecords.set(liveKey, { rendered, lines: rendered.split("\n").length - 1, fingerprint });
+        if (this.isFinalLiveRecord(record)) {
+          this.liveRecords.delete(liveKey);
+          this.target.write(`${formatLiveRecord(record, this.terminalWidth())}\n`);
+          this.renderLiveRecords();
+          return;
+        }
+        this.liveRecords.set(liveKey, { rendered: formatLiveRecord(record, this.terminalWidth()), fingerprint });
         this.renderLiveRecords();
         return;
       }
@@ -105,7 +134,16 @@ class PrettyLogStream extends Writable {
     const feishu = record["feishu"];
     if (!feishu || typeof feishu !== "object") return null;
     const value = feishu as Record<string, unknown>;
-    return LIVE_MESSAGE_KINDS.has(String(value["kind"])) && typeof value["messageId"] === "string" ? `message:${value["messageId"]}` : null;
+    const kind = String(value["kind"]);
+    const operation = String(value["operation"]);
+    if (!LIVE_MESSAGE_KINDS.has(kind) || typeof value["messageId"] !== "string") return null;
+    if (kind === "result" && operation !== "update") return null;
+    return `message:${value["messageId"]}`;
+  }
+
+  private isFinalLiveRecord(record: Record<string, unknown>): boolean {
+    const value = record["feishu"] as Record<string, unknown>;
+    return value["kind"] === "result" || (value["kind"] === "approval" && value["operation"] !== "send");
   }
 
   private liveFingerprint(record: Record<string, unknown>): string {
@@ -122,14 +160,20 @@ class PrettyLogStream extends Writable {
 
   private clearLiveRecords(): void {
     if (!this.liveRecords.size) return;
-    const lines = [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
-    this.target.write(`\u001b[${lines}A`);
-    for (let index = 0; index < lines; index += 1) this.target.write(`\u001b[2K\u001b[1B`);
-    this.target.write(`\u001b[${lines}A\r`);
+    this.target.write("\r");
+    for (let index = this.liveRecords.size - 1; index >= 0; index -= 1) {
+      this.target.write(CLEAR_LINE);
+      if (index > 0) this.target.write(CURSOR_UP);
+    }
   }
 
   private renderLiveRecords(): void {
-    for (const entry of this.liveRecords.values()) this.target.write(entry.rendered);
+    const entries = [...this.liveRecords.values()];
+    entries.forEach((entry, index) => this.target.write(`${index ? "\n" : ""}${entry.rendered}`));
+  }
+
+  private terminalWidth(): number {
+    return typeof this.target.columns === "number" && Number.isFinite(this.target.columns) ? Math.max(4, Math.floor(this.target.columns) - 1) : 119;
   }
 }
 

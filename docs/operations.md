@@ -57,7 +57,7 @@ pnpm pulsectl db delivery_queue --limit 20
 
 Diagnostics verifies the pinned Codex version, shared app-server health, SQLite integrity, owner/chat binding, credential presence without displaying values, registered directory existence, and queued delivery count.
 
-`pnpm start` displays daemon events as readable timestamped entries with structured fields on indented lines. In an interactive terminal, updates to the same Feishu card replace its previous entry by message ID. The color-free `daemon.log` and redacted `daemon.jsonl` files remain append-only and record every update for audit and tooling use. When either file reaches `logMaxBytes`, startup moves it to a single `.previous` file before opening a fresh log. The daemon records Feishu connection transitions, retry state, and every successfully delivered user-visible Feishu message.
+`pnpm start` displays daemon events as readable timestamped entries with structured fields on indented lines. In an interactive terminal, mutable Feishu cards use compact one-row entries, and an update replaces the previous row with the same message ID. The color-free `daemon.log` and redacted `daemon.jsonl` files remain append-only and record every complete update for audit and tooling use. When either file reaches `logMaxBytes`, startup moves it to a single `.previous` file before opening a fresh log. The daemon records Feishu connection transitions, retry state, and every successfully delivered user-visible Feishu message.
 
 ## Service Management
 
