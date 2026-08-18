@@ -40,7 +40,7 @@ describe("daemon logger", () => {
     expect(structured["token"]).toBe("[REDACTED]");
   });
 
-  it("rewrites live Feishu status updates in the terminal", () => {
+  it("appends changed Feishu status updates without terminal redraws", () => {
     const terminal = new PassThrough();
     const terminalText = capture(terminal);
     const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
@@ -51,7 +51,7 @@ describe("daemon logger", () => {
     const output = terminalText();
     expect(output).toContain('"phase": "working"');
     expect(output).toContain('"phase": "completed"');
-    expect(output).toMatch(/\u001b\[\d+A/);
+    expect(output).not.toContain("\u001b[");
   });
 
   it("coalesces duplicate status sends for the same Codex turn", () => {
@@ -64,6 +64,20 @@ describe("daemon logger", () => {
     logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-2", content: { ...content, updatedAt: 2 } } }, "Feishu outbound message");
 
     expect((terminalText().match(/Codex is working\.\.\./g) ?? []).length).toBe(1);
+  });
+
+  it("does not reprint a status when another log is emitted", () => {
+    const terminal = new PassThrough();
+    const terminalText = capture(terminal);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: "One visible status" } } }, "Feishu outbound message");
+    logger.info({ connected: true }, "Feishu connection state changed");
+
+    const output = terminalText();
+    expect((output.match(/One visible status/g) ?? []).length).toBe(1);
+    expect((output.match(/Feishu connection state changed/g) ?? []).length).toBe(1);
+    expect(output).not.toContain("\u001b[");
   });
 
   it("rotates an oversized log and keeps one previous file", async () => {

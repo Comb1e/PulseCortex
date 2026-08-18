@@ -39,6 +39,7 @@ class FakeMessaging implements MessagingAdapter {
   statuses: SessionView[] = [];
   choices: ChoiceView[] = [];
   results: TurnResultView[] = [];
+  resultUpdateRefs: MessageRef[] = [];
   outputs: OutputView[] = [];
   texts: string[] = [];
   async connect(): Promise<void> {}
@@ -49,6 +50,7 @@ class FakeMessaging implements MessagingAdapter {
   async updateApproval(ref: MessageRef, view: ApprovalResolutionView): Promise<void> { this.approvalUpdateRefs.push(ref); this.approvalUpdates.push(view); }
   async removeApproval(ref: MessageRef): Promise<void> { this.approvalRemovalRefs.push(ref); }
   async sendResult(view: TurnResultView): Promise<void> { this.results.push(view); }
+  async updateResult(ref: MessageRef, view: TurnResultView): Promise<void> { this.resultUpdateRefs.push(ref); this.results.push(view); }
   async sendChoices(view: ChoiceView): Promise<void> { this.choices.push(view); }
   async sendQuestion(_view: QuestionView): Promise<void> {}
   async sendOutput(view: OutputView): Promise<void> { this.outputs.push(view); }
@@ -228,6 +230,8 @@ describe("session coordinator", () => {
     await logs.append("turn", "stdout", "first turn output\n");
     driver.emit({ type: "turn.completed", sessionId: "session", turnId: "turn", status: "completed", occurredAt: Date.now() });
     await vi.waitFor(() => expect(messaging.results).toHaveLength(1));
+    expect(messaging.resultUpdateRefs).toEqual([{ messageId: "message", chatId: "chat" }]);
+    expect(messaging.statuses.some((view) => view.phase === "completed")).toBe(false);
     const oldLogsToken = messaging.results[0]!.actionTokens.logs;
 
     await messaging.command!({ eventId: "second", messageId: "second", actor, name: "text", args: [], text: "second task", receivedAt: Date.now() });

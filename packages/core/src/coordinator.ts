@@ -71,7 +71,7 @@ interface SessionRefreshResult {
   newlyUncontrollable: ProjectSession[];
 }
 
-type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "approval.remove" | "result" | "choices" | "question" | "output";
+type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "approval.remove" | "result" | "result.update" | "choices" | "question" | "output";
 const SESSION_DISCOVERY_INTERVAL_MS = 2_000;
 
 const HELP = `PulseCortex commands:
@@ -504,22 +504,22 @@ export class SessionCoordinator {
   }
 
   private async completeRuntime(runtime: RuntimeTurn, status: "completed" | "stopped"): Promise<void> {
-    runtime.phase = "completed"; runtime.safeSummary ||= status === "stopped" ? "Turn stopped." : "Turn completed."; runtime.dirty = true;
+    runtime.phase = "completed"; runtime.safeSummary ||= status === "stopped" ? "Turn stopped." : "Turn completed."; runtime.dirty = false;
     this.store.updateTurn(runtime.turnId, { state: "completed", safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary, completed: true });
     this.store.addMilestone(runtime.session.id, runtime.turnId, "turn.completed", { status, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary });
     this.store.audit({ eventType: "turn.completed", summary: status, sessionId: runtime.session.id, turnId: runtime.turnId });
-    await this.flushStatus(runtime.session.id, true);
+    await this.statusFlushes.get(runtime.session.id);
     await this.sendResult(runtime, status === "stopped" ? "stopped" : "completed");
     if (this.selectedSession?.id === runtime.session.id) this.selectedSession = { ...runtime.session, state: "completed", lastTurnId: runtime.turnId, updatedAt: Date.now() };
     this.runtimes.delete(runtime.session.id);
   }
 
   private async failRuntime(runtime: RuntimeTurn, error: string): Promise<void> {
-    runtime.phase = "failed"; runtime.safeSummary = redact(error, this.redactions).slice(0, 1_500); runtime.dirty = true;
+    runtime.phase = "failed"; runtime.safeSummary = redact(error, this.redactions).slice(0, 1_500); runtime.dirty = false;
     this.store.updateTurn(runtime.turnId, { state: "failed", safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary, completed: true });
     this.store.addMilestone(runtime.session.id, runtime.turnId, "turn.failed", { error: runtime.safeSummary });
     this.store.audit({ eventType: "turn.failed", summary: runtime.safeSummary, sessionId: runtime.session.id, turnId: runtime.turnId });
-    await this.flushStatus(runtime.session.id, true);
+    await this.statusFlushes.get(runtime.session.id);
     await this.sendResult(runtime, "failed");
     if (this.selectedSession?.id === runtime.session.id) this.selectedSession = { ...runtime.session, state: "failed", lastTurnId: runtime.turnId, updatedAt: Date.now() };
     this.runtimes.delete(runtime.session.id);
@@ -536,7 +536,13 @@ export class SessionCoordinator {
         newTask: this.issue("task.new", runtime.session.id, runtime.turnId, runtime.session.id, expiresAt, {}),
       },
     };
-    await this.safeSend("result", view, () => this.messaging.sendResult(view), view, `turn:${runtime.turnId}:result`);
+    const queueKey = `turn:${runtime.turnId}:status`;
+    if (runtime.statusRef) {
+      const payload = { ref: runtime.statusRef, view };
+      await this.safeSend("result.update", payload, () => this.messaging.updateResult(runtime.statusRef!, view), payload, queueKey);
+    } else {
+      await this.safeSend("result", view, () => this.messaging.sendResult(view), view, queueKey);
+    }
   }
 
   private async sendProjectChoices(description?: string): Promise<void> {
@@ -812,6 +818,7 @@ export class SessionCoordinator {
         break;
       }
       case "result": await this.messaging.sendResult(payload as unknown as TurnResultView); break;
+      case "result.update": { const value = payload as unknown as { ref: MessageRef; view: TurnResultView }; await this.messaging.updateResult(value.ref, value.view); break; }
       case "choices": await this.messaging.sendChoices(payload as unknown as ChoiceView); break;
       case "question": await this.messaging.sendQuestion(payload as unknown as QuestionView); break;
       case "output": {

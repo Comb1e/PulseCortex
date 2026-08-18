@@ -91,6 +91,20 @@ describe("Feishu card rendering", () => {
     expect(recallMessage).toHaveBeenCalledWith("approval-message");
   });
 
+  it("replaces the working card with the final result card", async () => {
+    const db = store();
+    const updateCard = vi.fn().mockResolvedValue(undefined);
+    const adapter = new FeishuAdapter({ appId: "id", appSecret: "secret", store: db, channel: { ...channel, updateCard } });
+
+    await adapter.updateResult({ messageId: "status-message", chatId: "chat" }, {
+      sessionId: "session", turnId: "turn", title: "Task", projectName: "app", status: "completed", summary: "Done", changedFileCount: 1, testSummary: "Passed", actionTokens: { diff: "d", logs: "l", continue: "c", newTask: "n" },
+    });
+
+    expect(updateCard).toHaveBeenCalledOnce();
+    expect(updateCard.mock.calls[0]?.[0]).toBe("status-message");
+    expect(JSON.stringify(updateCard.mock.calls[0]?.[1])).toContain("New task");
+  });
+
   it("renders bounded status actions", () => {
     const card = statusCard({ sessionId: "s", turnId: "t", title: "Task", projectName: "app", phase: "working", startedAt: 0, updatedAt: 10_000, safeSummary: "Working", recentCommands: ["pnpm test"], actionTokens: { stop: "s", logs: "l", diff: "d" } });
     expect(JSON.stringify(card)).toContain("pnpm test");

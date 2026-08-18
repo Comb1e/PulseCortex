@@ -173,6 +173,11 @@ export class FeishuAdapter implements MessagingAdapter {
     const { actionTokens: _, ...content } = view;
     this.reportOutbound({ kind: "result", operation: "send", ...ref, content });
   }
+  async updateResult(ref: MessageRef, view: TurnResultView): Promise<void> {
+    await retryTransient(() => this.channel.updateCard(ref.messageId, resultCard(view)));
+    const { actionTokens: _, ...content } = view;
+    this.reportOutbound({ kind: "result", operation: "update", ...ref, content });
+  }
   async sendChoices(view: ChoiceView): Promise<void> {
     const ref = await this.sendCard(choiceCard(view));
     const { previousToken: _, nextToken: __, ...safeView } = view;
