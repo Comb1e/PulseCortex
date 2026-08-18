@@ -86,6 +86,7 @@ async function main(): Promise<void> {
       try {
         await messaging.connect();
         logger.info("Feishu long connection established");
+        await coordinator?.notifyStartup();
         try { await coordinator?.initialize(); }
         catch (error) { logger.warn({ errorMessage: redact((error as Error).message, patterns) }, "Could not discover running Codex sessions at startup"); }
         return;

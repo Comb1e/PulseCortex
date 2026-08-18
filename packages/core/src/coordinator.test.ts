@@ -409,6 +409,21 @@ describe("session coordinator", () => {
     expect(driver.steered.at(-1)).toEqual({ id: "startup-codex", text: "continue work" });
   });
 
+  it("announces that PulseCortex started", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, new FakeDriver(), messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await coordinator.notifyStartup();
+
+    expect(messaging.texts).toEqual(["PulseCortex started and is ready to receive Feishu messages."]);
+  });
+
   it("restores the last project and uses it for the first task after startup", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();
@@ -599,8 +614,7 @@ describe("session coordinator", () => {
     coordinators.push(coordinator);
 
     await coordinator.initialize();
-    expect(messaging.texts.at(-1)).toContain("launched outside the PulseCortex shared app-server");
-    expect(messaging.texts.at(-1)).toContain("pnpm pulsectl codex repo");
+    expect(messaging.texts.some((text) => text.includes("launched outside the PulseCortex shared app-server"))).toBe(false);
     await messaging.command!({ eventId: "projects-foreign", messageId: "projects-foreign", actor, name: "projects", args: [], text: "/projects", receivedAt: Date.now() });
     await messaging.action!({ eventId: "choose-foreign", actor, kind: "project.select", token: messaging.choices[0]!.choices[0]!.token, receivedAt: Date.now() });
     expect(messaging.texts.at(-1)).toContain("cannot receive Feishu messages");

@@ -68,7 +68,6 @@ interface ProjectSession {
 
 interface SessionRefreshResult {
   newlyControllable: ProjectSession[];
-  newlyUncontrollable: ProjectSession[];
 }
 
 type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "approval.remove" | "result" | "result.update" | "choices" | "question" | "output";
@@ -144,8 +143,13 @@ export class SessionCoordinator {
     catch (error) { this.initialization = null; throw error; }
   }
 
+  async notifyStartup(): Promise<void> {
+    const message = "PulseCortex started and is ready to receive Feishu messages.";
+    await this.safeSend("text", message, () => this.messaging.sendText(message));
+  }
+
   async syncRunningSessions(): Promise<void> {
-    const { newlyControllable, newlyUncontrollable } = await this.refreshSessions();
+    const { newlyControllable } = await this.refreshSessions();
     if (newlyControllable.length) {
       const preferred = this.selectedProjectId
         ? newlyControllable.filter((candidate) => candidate.project.id === this.selectedProjectId)
@@ -160,12 +164,6 @@ export class SessionCoordinator {
         const message = `Detected ${newlyControllable.length} controllable Codex sessions in registered projects. Use /sessions to choose the default.`;
         await this.safeSend("text", message, () => this.messaging.sendText(message));
       }
-    }
-    if (newlyUncontrollable.length) {
-      const message = newlyUncontrollable.length === 1
-        ? standaloneSessionMessage(newlyUncontrollable[0]!)
-        : `Detected ${newlyUncontrollable.length} active Codex sessions in registered projects, but they were launched outside the PulseCortex shared app-server and cannot receive Feishu messages. Close them and relaunch with pnpm pulsectl codex or install the PulseCortex shell integration.`;
-      await this.safeSend("text", message, () => this.messaging.sendText(message));
     }
   }
 
@@ -743,11 +741,9 @@ export class SessionCoordinator {
     const projects = this.store.listProjects();
     const discovered = await this.driver.listSessions(projects);
     const previousControllable = this.controllableSessions;
-    const previousUncontrollable = this.uncontrollableSessions;
     const currentControllable = new Map<string, ProjectSession>();
     const currentUncontrollable = new Map<string, ProjectSession>();
     const newlyControllable: ProjectSession[] = [];
-    const newlyUncontrollable: ProjectSession[] = [];
     for (const info of discovered) {
       const session = this.store.upsertDiscoveredSession(info);
       const project = this.store.getProject(info.projectId);
@@ -759,7 +755,6 @@ export class SessionCoordinator {
         if (!previousControllable.has(info.id) && !this.runtimes.has(info.id) && this.selectedSession?.id !== info.id) newlyControllable.push(candidate);
       } else if (isActiveState(info.state)) {
         currentUncontrollable.set(info.id, candidate);
-        if (!previousUncontrollable.has(info.id)) newlyUncontrollable.push(candidate);
       }
       if (this.selectedSession?.id === info.id) this.selectedSession = session;
       if (!controllable || !info.activeTurnId || info.state === "idle" || !isActiveState(info.state) || this.runtimes.has(info.id)) continue;
@@ -774,7 +769,7 @@ export class SessionCoordinator {
     }
     this.controllableSessions = currentControllable;
     this.uncontrollableSessions = currentUncontrollable;
-    return { newlyControllable, newlyUncontrollable };
+    return { newlyControllable };
   }
 
   private async sendPagedOutput(kind: "logs.show" | "diff.show", sessionId: string | undefined, requestedPage: number, requestedTurnId?: string): Promise<void> {
