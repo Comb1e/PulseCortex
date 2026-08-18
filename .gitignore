@@ -1,10 +1,43 @@
+# Dependencies and package-manager caches
 node_modules/
+.pnpm-store/
+
+# Build and test output
 dist/
-*.tsbuildinfo
-.pulsecortex/
-.env
 coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# Local application state
+.pulsecortex/
 *.db
 *.db-shm
 *.db-wal
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
 *.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files and tool caches
+.cache/
+.tmp/
+tmp/
+temp/
