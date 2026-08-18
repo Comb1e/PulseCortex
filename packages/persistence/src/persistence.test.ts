@@ -62,7 +62,8 @@ describe("project ambiguity", () => {
     await mkdir(child);
     const store = memoryStore();
     store.addProject("root", await realpath(root));
-    expect(() => store.addProject("child", child)).toThrow(/overlaps/u);
+    const canonicalChild = await realpath(child);
+    expect(() => store.addProject("child", canonicalChild)).toThrow(/overlaps/u);
   });
 
   it("stores typed local settings and clears a removed default project", () => {

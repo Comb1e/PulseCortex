@@ -10,7 +10,7 @@ Prompts, agent messages, source excerpts, command summaries, diffs, test results
 
 ## Requirements
 
-- Node.js 22 or 24 LTS and pnpm 11
+- Node.js 25.9.0 or newer and pnpm 11
 - An installed, authenticated Codex CLI `0.147.x`
 - A Feishu enterprise self-built application with bot capability
 - Outbound internet access to Feishu and the model provider
