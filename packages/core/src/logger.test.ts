@@ -1,10 +1,10 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, readdir, utimes, writeFile } from "node:fs/promises";
 import { PassThrough, Writable } from "node:stream";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { createLogger, formatLogRecord, rotateLogFile } from "./logger.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createLogger, formatLogRecord, retainDailyLogs } from "./logger.js";
 
 function capture(stream: PassThrough): () => string {
   const chunks: Buffer[] = [];
@@ -58,6 +58,8 @@ class TerminalScreen extends Writable {
 }
 
 describe("daemon logger", () => {
+  afterEach(() => vi.useRealTimers());
+
   it("formats structured records for terminal reading", () => {
     const output = formatLogRecord({ level: 40, time: new Date(2026, 7, 18, 9, 5, 4).getTime(), service: "pulsecortex", msg: "Connection retry", retryMs: 2500, detail: { connected: false } });
     expect(output).toContain("2026-08-18 09:05:04 WARN  Connection retry");
@@ -67,22 +69,21 @@ describe("daemon logger", () => {
     expect(output).not.toContain("\u001b[");
   });
 
-  it("prints readable output and persists human and redacted structured logs", async () => {
+  it("prints readable output and persists one redacted daily log", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
-    const humanLogPath = path.join(directory, "daemon.log");
-    const structuredLogPath = path.join(directory, "daemon.jsonl");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 18, 9, 5, 4));
     const terminal = new PassThrough();
     const terminalText = capture(terminal);
-    const logger = createLogger("info", { output: terminal, color: false, humanLogPath, structuredLogPath });
+    const logger = createLogger("info", { output: terminal, color: false, logDir: directory });
 
     logger.info({ connected: true, token: "secret-value" }, "Feishu connected");
 
     expect(terminalText()).toContain("INFO  Feishu connected");
     expect(terminalText()).toContain("  connected: true\n  token: [REDACTED]");
-    expect(await readFile(humanLogPath, "utf8")).toBe(terminalText());
-    const structured = JSON.parse((await readFile(structuredLogPath, "utf8")).trim()) as Record<string, unknown>;
-    expect(structured["msg"]).toBe("Feishu connected");
-    expect(structured["token"]).toBe("[REDACTED]");
+    expect(await readdir(directory)).toEqual(["2026-08-18.log"]);
+    expect(await readFile(path.join(directory, "2026-08-18.log"), "utf8")).toBe(terminalText());
+    expect(terminalText()).not.toContain("secret-value");
   });
 
   it("replaces the terminal entry for an updated Feishu message", () => {
@@ -97,6 +98,20 @@ describe("daemon logger", () => {
     expect(output).toContain('"phase": "completed"');
     expect(output.replaceAll("\n", "")).toContain(`"safeSummary": "${"y".repeat(200)}"`);
     expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
+  });
+
+  it("keeps only the latest resolved approval entry for a message ID", () => {
+    const terminal = new TerminalScreen();
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+
+    logger.info({ feishu: { kind: "approval", operation: "send", messageId: "approval-1", content: { title: "Run command" } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "approval", operation: "update", messageId: "approval-1", content: { title: "Run command", decision: "accept", resolvedAt: 1 } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "approval", operation: "update", messageId: "approval-1", content: { title: "Run command", decision: "acceptForSession", resolvedAt: 2 } } }, "Feishu outbound message");
+
+    const output = terminal.text();
+    expect(output).not.toContain('"decision": "accept"');
+    expect(output).toContain('"decision": "acceptForSession"');
+    expect((output.match(/approval-1/g) ?? [])).toHaveLength(1);
   });
 
   it("keeps terminal entries separate when message IDs differ", () => {
@@ -151,28 +166,45 @@ describe("daemon logger", () => {
 
   it("stores every update while replacing it in the terminal", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
-    const humanLogPath = path.join(directory, "daemon.log");
-    const structuredLogPath = path.join(directory, "daemon.jsonl");
     const terminal = new PassThrough();
-    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true, humanLogPath, structuredLogPath });
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true, logDir: directory });
 
     logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working" } } }, "Feishu outbound message");
     logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed" } } }, "Feishu outbound message");
 
-    const humanLog = await readFile(humanLogPath, "utf8");
-    const structuredLog = await readFile(structuredLogPath, "utf8");
-    expect(humanLog).toContain('"phase": "working"');
-    expect(humanLog).toContain('"phase": "completed"');
-    expect(structuredLog.trim().split("\n")).toHaveLength(2);
+    const [fileName] = await readdir(directory);
+    const dailyLog = await readFile(path.join(directory, fileName!), "utf8");
+    expect(dailyLog).toContain('"phase": "working"');
+    expect(dailyLog).toContain('"phase": "completed"');
   });
 
-  it("rotates an oversized log and keeps one previous file", async () => {
+  it("rolls over to a new file when the local date changes", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
-    const filePath = path.join(directory, "daemon.log");
-    await writeFile(filePath, "old log content", "utf8");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 18, 23, 59, 59));
+    const logger = createLogger("info", { output: new PassThrough(), color: false, logDir: directory });
 
-    expect(rotateLogFile(filePath, 5)).toBe(true);
-    expect(await readFile(`${filePath}.previous`, "utf8")).toBe("old log content");
-    expect(rotateLogFile(filePath, 5)).toBe(false);
+    logger.info("Before midnight");
+    vi.setSystemTime(new Date(2026, 7, 19, 0, 0, 1));
+    logger.info("After midnight");
+
+    expect((await readdir(directory)).sort()).toEqual(["2026-08-18.log", "2026-08-19.log"]);
+    expect(await readFile(path.join(directory, "2026-08-18.log"), "utf8")).toContain("Before midnight");
+    expect(await readFile(path.join(directory, "2026-08-19.log"), "utf8")).toContain("After midnight");
+  });
+
+  it("retains today's file while removing expired and over-budget daily logs", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
+    const now = new Date(2026, 7, 19, 12).getTime();
+    const recent = path.join(directory, "2026-08-18.log");
+    const expired = path.join(directory, "2026-08-01.log");
+    await writeFile(path.join(directory, "2026-08-19.log"), "today", "utf8");
+    await writeFile(recent, "recent", "utf8");
+    await writeFile(expired, "expired", "utf8");
+    await utimes(recent, new Date(now - 86_400_000), new Date(now - 86_400_000));
+    await utimes(expired, new Date(now - 18 * 86_400_000), new Date(now - 18 * 86_400_000));
+
+    expect(await retainDailyLogs(directory, 7, 8, now)).toEqual({ removed: 2, bytes: 5 });
+    expect(await readdir(directory)).toEqual(["2026-08-19.log"]);
   });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { defaultCodexAppServerUrl } from "./index.js";
+import path from "node:path";
+import { defaultCodexAppServerUrl, loadConfig } from "./index.js";
 
 describe("defaultCodexAppServerUrl", () => {
   it("uses separate ports for Windows and Linux", () => {
@@ -9,5 +10,19 @@ describe("defaultCodexAppServerUrl", () => {
 
   it("keeps the original port on macOS", () => {
     expect(defaultCodexAppServerUrl("darwin")).toBe("ws://127.0.0.1:4500");
+  });
+});
+
+describe("runtime paths", () => {
+  it("stores daemon logs in the logs directory", async () => {
+    const previous = process.env["PULSECORTEX_DATA_DIR"];
+    process.env["PULSECORTEX_DATA_DIR"] = path.resolve("runtime-data");
+    try {
+      const config = await loadConfig({ requireSecrets: false });
+      expect(config.logDir).toBe(path.resolve("runtime-data", "logs"));
+    } finally {
+      if (previous === undefined) delete process.env["PULSECORTEX_DATA_DIR"];
+      else process.env["PULSECORTEX_DATA_DIR"] = previous;
+    }
   });
 });

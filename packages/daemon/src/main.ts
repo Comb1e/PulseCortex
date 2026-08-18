@@ -1,8 +1,7 @@
 import { mkdir } from "node:fs/promises";
-import path from "node:path";
 import { loadConfig } from "@pulsecortex/config";
 import { CodexAppServerDriver } from "@pulsecortex/codex-driver";
-import { createLogger, SessionCoordinator } from "@pulsecortex/core";
+import { createLogger, retainDailyLogs, SessionCoordinator } from "@pulsecortex/core";
 import { FeishuAdapter } from "@pulsecortex/feishu-adapter";
 import { CommandLogStore, ControllerStore } from "@pulsecortex/persistence";
 import { redact } from "@pulsecortex/domain";
@@ -10,10 +9,10 @@ import { redact } from "@pulsecortex/domain";
 async function main(): Promise<void> {
   const config = await loadConfig();
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
+  await mkdir(config.logDir, { recursive: true, mode: 0o700 });
   await mkdir(config.commandLogDir, { recursive: true, mode: 0o700 });
-  const humanLogPath = path.join(config.dataDir, "daemon.log");
-  const structuredLogPath = path.join(config.dataDir, "daemon.jsonl");
-  const logger = createLogger(config.logLevel, { humanLogPath, structuredLogPath, maxFileBytes: config.logMaxBytes, liveStatus: process.stdout.isTTY === true });
+  await retainDailyLogs(config.logDir, config.logRetentionDays, config.logMaxBytes);
+  const logger = createLogger(config.logLevel, { logDir: config.logDir, liveStatus: process.stdout.isTTY === true });
   const patterns = config.redactionPatterns.map((pattern) => new RegExp(pattern, "giu"));
   const store = new ControllerStore(config.databasePath, config.settingsPath);
   const interrupted = store.markActiveTurnsInterrupted();
@@ -88,10 +87,11 @@ async function main(): Promise<void> {
 
   const retention = setInterval(() => {
     store.applyRetention(config.auditRetentionDays);
+    void retainDailyLogs(config.logDir, config.logRetentionDays, config.logMaxBytes).catch((error) => logger.warn({ errorMessage: redact((error as Error).message, patterns) }, "daemon log retention failed"));
     void commandLogs.retain(config.logRetentionDays, config.logMaxBytes).catch((error) => logger.warn({ errorMessage: redact((error as Error).message, patterns) }, "command log retention failed"));
   }, 24 * 60 * 60_000);
   retention.unref();
-  logger.info({ dataDir: config.dataDir, humanLogPath, structuredLogPath }, "PulseCortex daemon ready");
+  logger.info({ dataDir: config.dataDir, logDir: config.logDir }, "PulseCortex daemon ready");
 }
 
 main().catch((error) => {

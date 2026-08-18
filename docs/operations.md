@@ -57,7 +57,7 @@ pnpm pulsectl db delivery_queue --limit 20
 
 Diagnostics verifies the pinned Codex version, shared app-server health, SQLite integrity, owner/chat binding, credential presence without displaying values, registered directory existence, and queued delivery count.
 
-`pnpm start` displays daemon events as readable timestamped entries with structured fields on indented lines. In an interactive terminal, mutable Feishu card entries are width-wrapped and replaced in place by message ID, preserving their complete visible details without duplicate rows. The color-free `daemon.log` and redacted `daemon.jsonl` files remain append-only and record every complete update for audit and tooling use. When either file reaches `logMaxBytes`, startup moves it to a single `.previous` file before opening a fresh log. The daemon records Feishu connection transitions, retry state, and every successfully delivered user-visible Feishu message.
+`pnpm start` displays daemon events as readable timestamped entries with structured fields on indented lines. In an interactive terminal, mutable Feishu card entries are width-wrapped and replaced in place by message ID, preserving their complete visible details without duplicate rows. The color-free, redacted `logs/YYYY-MM-DD.log` file remains append-only and records every complete update for the local calendar day. The daemon starts a new file at midnight without requiring a restart. Daily logs observe `logRetentionDays` and share the `logMaxBytes` directory budget; the active day's file is always retained. The daemon records Feishu connection transitions, retry state, and every successfully delivered user-visible Feishu message.
 
 ## Service Management
 
@@ -84,4 +84,4 @@ Stopping PulseCortex with Ctrl+C, a terminal hangup, or the service manager also
 - Missing project directory: diagnostics fails and new/resumed work is blocked by path validation.
 - Invalid/stale/duplicate card: no effect; audit records a rejected action where attribution is available.
 
-SQLite WAL files, command-log files, `daemon.log`, and `daemon.jsonl` are part of controller state. Stop the daemon before a manual backup and back up the entire data directory. Never edit the database while the daemon is running.
+SQLite WAL files, command-log files, and the `logs` directory are part of controller state. Stop the daemon before a manual backup and back up the entire data directory. Never edit the database while the daemon is running.

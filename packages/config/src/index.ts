@@ -27,7 +27,7 @@ const ConfigSchema = z.object({
 
 export type PublicConfig = z.infer<typeof ConfigSchema>;
 export interface Secrets { appId: string; appSecret: string; actionSigningKey: string }
-export interface RuntimeConfig extends PublicConfig { dataDir: string; databasePath: string; settingsPath: string; commandLogDir: string; secrets: Secrets }
+export interface RuntimeConfig extends PublicConfig { dataDir: string; databasePath: string; settingsPath: string; logDir: string; commandLogDir: string; secrets: Secrets }
 
 export function defaultDataDir(): string {
   if (process.env["PULSECORTEX_DATA_DIR"]) return path.resolve(process.env["PULSECORTEX_DATA_DIR"]);
@@ -85,6 +85,7 @@ export async function loadConfig(options: { requireSecrets?: boolean } = {}): Pr
     dataDir: resolvedDataDir,
     databasePath: path.join(resolvedDataDir, "pulsecortex.db"),
     settingsPath: path.join(resolvedDataDir, "settings.json"),
+    logDir: path.join(resolvedDataDir, "logs"),
     commandLogDir: path.join(resolvedDataDir, "command-logs"),
     secrets,
   };

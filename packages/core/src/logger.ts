@@ -1,4 +1,6 @@
-import { rmSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { mkdir, readdir, stat, unlink } from "node:fs/promises";
+import path from "node:path";
 import { Writable } from "node:stream";
 import pino, { type Logger, type StreamEntry } from "pino";
 
@@ -15,12 +17,15 @@ export interface LoggerOptions {
   output?: LogTarget;
   color?: boolean;
   liveStatus?: boolean;
-  humanLogPath?: string;
-  structuredLogPath?: string;
-  maxFileBytes?: number;
+  logDir?: string;
 }
 
 function pad(value: number): string { return String(value).padStart(2, "0"); }
+
+function dateStamp(value: unknown): string {
+  const date = new Date(typeof value === "number" ? value : Date.now());
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
 
 function timestamp(value: unknown): string {
   const date = new Date(typeof value === "number" ? value : Date.now());
@@ -105,12 +110,6 @@ class PrettyLogStream extends Writable {
         if (this.liveRecords.get(liveKey)?.fingerprint === fingerprint) return;
         this.clearLiveRecords();
         const rendered = wrapForTerminal(formatLogRecord(record, false), this.terminalWidth());
-        if (this.isFinalLiveRecord(record)) {
-          this.liveRecords.delete(liveKey);
-          this.target.write(rendered.rendered);
-          this.renderLiveRecords();
-          return;
-        }
         this.liveRecords.set(liveKey, { ...rendered, fingerprint });
         this.renderLiveRecords();
         return;
@@ -144,11 +143,6 @@ class PrettyLogStream extends Writable {
     return `message:${value["messageId"]}`;
   }
 
-  private isFinalLiveRecord(record: Record<string, unknown>): boolean {
-    const value = record["feishu"] as Record<string, unknown>;
-    return value["kind"] === "result" || (value["kind"] === "approval" && value["operation"] !== "send");
-  }
-
   private liveFingerprint(record: Record<string, unknown>): string {
     const feishu = record["feishu"];
     if (!feishu || typeof feishu !== "object") return "";
@@ -178,32 +172,71 @@ class PrettyLogStream extends Writable {
   }
 }
 
-export function rotateLogFile(filePath: string, maxBytes: number): boolean {
-  try {
-    if (statSync(filePath).size < maxBytes) return false;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
+class DailyLogStream extends Writable {
+  private buffered = "";
+
+  constructor(private readonly directory: string) {
+    super();
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
-  rmSync(`${filePath}.previous`, { force: true });
-  renameSync(filePath, `${filePath}.previous`);
-  return true;
+
+  override _write(chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    this.buffered += chunk.toString();
+    let newline = this.buffered.indexOf("\n");
+    try {
+      while (newline >= 0) {
+        const line = this.buffered.slice(0, newline);
+        this.buffered = this.buffered.slice(newline + 1);
+        if (line) this.writeLine(line);
+        newline = this.buffered.indexOf("\n");
+      }
+      callback();
+    } catch (error) {
+      callback(error as Error);
+    }
+  }
+
+  override _final(callback: (error?: Error | null) => void): void {
+    try {
+      if (this.buffered) this.writeLine(this.buffered);
+      callback();
+    } catch (error) {
+      callback(error as Error);
+    }
+  }
+
+  private writeLine(line: string): void {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    const filePath = path.join(this.directory, `${dateStamp(record["time"])}.log`);
+    appendFileSync(filePath, formatLogRecord(record, false), { encoding: "utf8", mode: 0o600 });
+  }
+}
+
+export async function retainDailyLogs(directory: string, maxAgeDays: number, maxBytes: number, now = Date.now()): Promise<{ removed: number; bytes: number }> {
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const today = dateStamp(now);
+  const names = (await readdir(directory)).filter((name) => /^\d{4}-\d{2}-\d{2}\.log$/u.test(name));
+  const entries = await Promise.all(names.map(async (name) => ({ name, info: await stat(path.join(directory, name)) })));
+  entries.sort((a, b) => b.name.localeCompare(a.name));
+  const cutoff = now - maxAgeDays * 86_400_000;
+  let keptBytes = 0;
+  let removed = 0;
+  for (const entry of entries) {
+    const isCurrent = entry.name === `${today}.log`;
+    const remove = !isCurrent && (entry.info.mtimeMs < cutoff || keptBytes + entry.info.size > maxBytes);
+    if (remove) {
+      await unlink(path.join(directory, entry.name));
+      removed += 1;
+    } else keptBytes += entry.info.size;
+  }
+  return { removed, bytes: keptBytes };
 }
 
 export function createLogger(level = "info", options: LoggerOptions = {}): Logger {
   const output = options.output ?? process.stdout;
   const useColor = options.color ?? (output === process.stdout && process.stdout.isTTY === true && process.env["NO_COLOR"] === undefined);
   const streams: Array<StreamEntry<string>> = [{ level, stream: new PrettyLogStream(output, useColor, options.liveStatus ?? false) }];
-  const maxFileBytes = options.maxFileBytes ?? 100_000_000;
-  if (options.humanLogPath) {
-    rotateLogFile(options.humanLogPath, maxFileBytes);
-    const humanFile = pino.destination({ dest: options.humanLogPath, mkdir: true, sync: true });
-    streams.push({ level, stream: new PrettyLogStream(humanFile, false) });
-  }
-  if (options.structuredLogPath) {
-    rotateLogFile(options.structuredLogPath, maxFileBytes);
-    streams.push({ level, stream: pino.destination({ dest: options.structuredLogPath, mkdir: true, sync: true }) });
-  }
+  if (options.logDir) streams.push({ level, stream: new DailyLogStream(options.logDir) });
   return pino({
     level,
     base: { service: "pulsecortex" },
