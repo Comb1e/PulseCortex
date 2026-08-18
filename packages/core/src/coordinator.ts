@@ -34,6 +34,13 @@ interface PendingInputState {
   answers: Record<string, string>;
 }
 
+interface PendingApprovalState {
+  id: string;
+  kind: ApprovalView["kind"];
+  summary: string;
+  ref?: MessageRef;
+}
+
 interface RuntimeTurn {
   session: StoredSession;
   project: Project;
@@ -48,7 +55,7 @@ interface RuntimeTurn {
   testSummary: string;
   statusRef: MessageRef | null;
   actionTokens: SessionView["actionTokens"];
-  pendingApproval?: { id: string; kind: ApprovalView["kind"]; summary: string; ref?: MessageRef };
+  pendingApprovals: Map<string, PendingApprovalState>;
   pendingInput?: PendingInputState;
   dirty: boolean;
 }
@@ -357,7 +364,7 @@ export class SessionCoordinator {
     switch (event.type) {
       case "turn.started": runtime.phase = "working"; runtime.safeSummary = "Codex is working..."; runtime.dirty = true; this.store.updateTurn(runtime.turnId, { state: "working" }); await this.flushStatus(runtime.session.id, true); break;
       case "agent.message.delta": this.appendReply(runtime, event.messageId ?? "default", event.delta); runtime.dirty = true; break;
-      case "command.started": runtime.recentCommands = [...runtime.recentCommands.slice(-4), event.command]; runtime.phase = "working"; runtime.dirty = true; break;
+      case "command.started": runtime.recentCommands = [...runtime.recentCommands.slice(-4), event.command]; if (!runtime.pendingApprovals.size) runtime.phase = "working"; runtime.dirty = true; break;
       case "command.completed": {
         const command = runtime.recentCommands.at(-1) ?? "";
         if (/\b(test|check|lint|build)\b/iu.test(command)) runtime.testSummary = event.exitCode === 0 ? `Passed: ${command}` : `Failed (${String(event.exitCode ?? "unknown")}): ${command}`;
@@ -373,7 +380,8 @@ export class SessionCoordinator {
 
   private async handleApprovalEvent(runtime: RuntimeTurn, event: Extract<AgentEvent, { type: "approval.requested" }>): Promise<void> {
     runtime.phase = "awaiting_approval";
-    runtime.pendingApproval = { id: event.approvalId, kind: event.kind, summary: event.title };
+    const pending: PendingApprovalState = { id: event.approvalId, kind: event.kind, summary: event.title };
+    runtime.pendingApprovals.set(event.approvalId, pending);
     runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "awaiting_approval" });
     this.store.addMilestone(runtime.session.id, runtime.turnId, event.type, { approvalId: event.approvalId, kind: event.kind, title: event.title });
@@ -391,22 +399,25 @@ export class SessionCoordinator {
     };
     await this.safeSend("approval", view, async () => {
       const ref = await this.messaging.sendApproval(view);
-      if (runtime.pendingApproval?.id === event.approvalId) runtime.pendingApproval.ref = ref;
+      if (runtime.pendingApprovals.get(event.approvalId) === pending) pending.ref = ref;
     });
     await this.flushStatus(runtime.session.id, true);
   }
 
   private async resolveApproval(record: InteractionRecord, decision: "accept" | "decline", actor: { tenantId: string; userId: string }): Promise<void> {
     const runtime = this.runtimes.get(record.sessionId);
-    if (!runtime || record.sessionId !== runtime.session.id || record.turnId !== runtime.turnId || runtime.pendingApproval?.id !== record.requestId) return;
-    const pending = runtime.pendingApproval;
+    const pending = runtime?.pendingApprovals.get(record.requestId);
+    if (!runtime || !pending || record.sessionId !== runtime.session.id || record.turnId !== runtime.turnId) return;
     await this.driver.resolveApproval(record.requestId, decision);
     await this.resolveApprovalCard(pending, decision);
-    delete runtime.pendingApproval;
-    runtime.phase = "working";
-    runtime.safeSummary = decision === "accept" ? "Approval granted once. Codex is continuing..." : "Request denied. Codex is continuing...";
+    runtime.pendingApprovals.delete(record.requestId);
+    const pendingCount = runtime.pendingApprovals.size;
+    runtime.phase = pendingCount ? "awaiting_approval" : "working";
+    runtime.safeSummary = pendingCount
+      ? `${pendingCount} approval request${pendingCount === 1 ? "" : "s"} still pending.`
+      : decision === "accept" ? "Approval granted once. Codex is continuing..." : "Request denied. Codex is continuing...";
     runtime.dirty = true;
-    this.store.updateTurn(runtime.turnId, { state: "working" });
+    this.store.updateTurn(runtime.turnId, { state: runtime.phase });
     this.store.audit({ eventType: "approval.decided", summary: decision, actor, sessionId: runtime.session.id, turnId: runtime.turnId });
     await this.flushStatus(runtime.session.id, true);
   }
@@ -465,12 +476,11 @@ export class SessionCoordinator {
     if (record && (record.sessionId !== runtime.session.id || record.turnId !== runtime.turnId)) return;
     runtime.phase = "stopping"; runtime.safeSummary = "Stopping Codex..."; runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "stopping" });
-    if (runtime.pendingApproval) {
-      const pending = runtime.pendingApproval;
+    for (const pending of runtime.pendingApprovals.values()) {
       await this.driver.resolveApproval(pending.id, "cancel").catch(() => undefined);
       await this.resolveApprovalCard(pending, "cancel");
-      delete runtime.pendingApproval;
     }
+    runtime.pendingApprovals.clear();
     await this.driver.interruptTurn(runtime.session.id);
     this.store.audit({ eventType: "turn.stopped", summary: `Stop requested from ${source}`, sessionId: runtime.session.id, turnId: runtime.turnId });
     await this.flushStatus(runtime.session.id, true);
@@ -652,7 +662,8 @@ export class SessionCoordinator {
   }
 
   private makeStatusView(runtime: RuntimeTurn): SessionView {
-    return { sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, phase: runtime.phase, startedAt: runtime.startedAt, updatedAt: Date.now(), safeSummary: runtime.safeSummary, ...(runtime.replies.length ? { replies: runtime.replies.map((reply) => reply.text) } : {}), recentCommands: runtime.recentCommands, ...(runtime.pendingApproval ? { pendingApproval: { id: runtime.pendingApproval.id, kind: runtime.pendingApproval.kind, summary: runtime.pendingApproval.summary } } : {}), actionTokens: runtime.actionTokens };
+    const pendingApproval = [...runtime.pendingApprovals.values()].at(-1);
+    return { sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, phase: runtime.phase, startedAt: runtime.startedAt, updatedAt: Date.now(), safeSummary: runtime.safeSummary, ...(runtime.replies.length ? { replies: runtime.replies.map((reply) => reply.text) } : {}), recentCommands: runtime.recentCommands, ...(pendingApproval ? { pendingApproval: { id: pendingApproval.id, kind: pendingApproval.kind, summary: pendingApproval.summary } } : {}), actionTokens: runtime.actionTokens };
   }
 
   private appendReply(runtime: RuntimeTurn, messageId: string, delta: string): void {
@@ -670,7 +681,7 @@ export class SessionCoordinator {
     return runtime.replies.map((reply) => reply.text).join("\n\n");
   }
 
-  private async resolveApprovalCard(pending: NonNullable<RuntimeTurn["pendingApproval"]>, decision: ApprovalResolutionView["decision"]): Promise<void> {
+  private async resolveApprovalCard(pending: PendingApprovalState, decision: ApprovalResolutionView["decision"]): Promise<void> {
     if (!pending.ref) return;
     const resolution: ApprovalResolutionView = { title: pending.summary, decision, resolvedAt: Date.now() };
     await this.safeSend("approval.update", { ref: pending.ref, resolution }, () => this.messaging.updateApproval(pending.ref!, resolution), { ref: pending.ref, resolution }, `approval:${pending.id}:resolution`);
@@ -680,7 +691,7 @@ export class SessionCoordinator {
     const expiresAt = Date.now() + 14 * 86_400_000;
     return {
       session: { ...session, lastTurnId: turnId, state: phase, updatedAt: Date.now() }, project, turnId, phase, startedAt, safeSummary,
-      replies: [], recentCommands: [], diff: "", changedFileCount: 0, testSummary: "", statusRef: null,
+      replies: [], recentCommands: [], diff: "", changedFileCount: 0, testSummary: "", statusRef: null, pendingApprovals: new Map(),
       actionTokens: {
         stop: this.issue("turn.stop", session.id, turnId, turnId, expiresAt, {}),
         logs: this.issue("logs.show", session.id, turnId, turnId, expiresAt, { page: 1 }),
@@ -770,7 +781,8 @@ export class SessionCoordinator {
         const view = payload as unknown as ApprovalView;
         const ref = await this.messaging.sendApproval(view);
         const runtime = this.runtimes.get(view.sessionId);
-        if (runtime?.turnId === view.turnId && runtime.pendingApproval?.id === view.approvalId) runtime.pendingApproval.ref = ref;
+        const pending = runtime?.pendingApprovals.get(view.approvalId);
+        if (runtime?.turnId === view.turnId && pending) pending.ref = ref;
         break;
       }
       case "approval.update": { const value = payload as unknown as { ref: MessageRef; resolution: ApprovalResolutionView }; await this.messaging.updateApproval(value.ref, value.resolution); break; }

@@ -34,6 +34,7 @@ class FakeMessaging implements MessagingAdapter {
   action?: (action: ChannelAction) => Promise<void>;
   approvals: ApprovalView[] = [];
   approvalUpdates: ApprovalResolutionView[] = [];
+  approvalUpdateRefs: MessageRef[] = [];
   statuses: SessionView[] = [];
   choices: ChoiceView[] = [];
   results: TurnResultView[] = [];
@@ -43,8 +44,8 @@ class FakeMessaging implements MessagingAdapter {
   async disconnect(): Promise<void> {}
   async sendStatus(view: SessionView): Promise<MessageRef> { this.statuses.push(view); return { messageId: "message", chatId: "chat" }; }
   async updateStatus(_ref: MessageRef, view: SessionView): Promise<void> { this.statuses.push(view); }
-  async sendApproval(view: ApprovalView): Promise<MessageRef> { this.approvals.push(view); return { messageId: "approval", chatId: "chat" }; }
-  async updateApproval(_ref: MessageRef, view: ApprovalResolutionView): Promise<void> { this.approvalUpdates.push(view); }
+  async sendApproval(view: ApprovalView): Promise<MessageRef> { this.approvals.push(view); return { messageId: view.approvalId, chatId: "chat" }; }
+  async updateApproval(ref: MessageRef, view: ApprovalResolutionView): Promise<void> { this.approvalUpdateRefs.push(ref); this.approvalUpdates.push(view); }
   async sendResult(view: TurnResultView): Promise<void> { this.results.push(view); }
   async sendChoices(view: ChoiceView): Promise<void> { this.choices.push(view); }
   async sendQuestion(_view: QuestionView): Promise<void> {}
@@ -80,6 +81,35 @@ describe("session coordinator", () => {
     expect(driver.decisions).toEqual([{ id: "approval", decision: "accept" }]);
     expect(messaging.approvalUpdates).toEqual([expect.objectContaining({ title: "Run tests", decision: "accept" })]);
     expect(db.inspectAudit().some((row) => row["event_type"] === "action.rejected")).toBe(true);
+  });
+
+  it("resolves multiple simultaneous approvals and updates each card", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "run both commands", receivedAt: Date.now() });
+
+    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "first", kind: "command", title: "Run first command", command: "pnpm test", occurredAt: Date.now() });
+    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "second", kind: "command", title: "Run second command", command: "pnpm build", occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.approvals).toHaveLength(2));
+
+    await messaging.action!({ eventId: "approve-first", actor, kind: "approval.accept", token: messaging.approvals[0]!.actionTokens.accept, receivedAt: Date.now() });
+    expect(messaging.statuses.at(-1)?.phase).toBe("awaiting_approval");
+    await messaging.action!({ eventId: "approve-second", actor, kind: "approval.accept", token: messaging.approvals[1]!.actionTokens.accept, receivedAt: Date.now() });
+
+    expect(driver.decisions).toEqual([{ id: "first", decision: "accept" }, { id: "second", decision: "accept" }]);
+    expect(messaging.approvalUpdates).toEqual([
+      expect.objectContaining({ title: "Run first command", decision: "accept" }),
+      expect.objectContaining({ title: "Run second command", decision: "accept" }),
+    ]);
+    expect(messaging.approvalUpdateRefs.map((ref) => ref.messageId)).toEqual(["first", "second"]);
+    expect(messaging.statuses.at(-1)?.phase).toBe("working");
   });
 
   it("keeps separate Codex replies in the status view", async () => {
