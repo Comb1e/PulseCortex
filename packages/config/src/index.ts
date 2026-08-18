@@ -3,6 +3,10 @@ import path from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import { z } from "zod";
 
+export function defaultCodexAppServerUrl(platform: NodeJS.Platform = process.platform): string {
+  return platform === "linux" ? "ws://127.0.0.1:4501" : "ws://127.0.0.1:4500";
+}
+
 const ConfigSchema = z.object({
   dataDir: z.string().min(1).optional(),
   statusUpdateIntervalMs: z.number().int().min(500).max(30_000).default(2_000),
@@ -17,7 +21,7 @@ const ConfigSchema = z.object({
       const url = new URL(value);
       return url.protocol === "ws:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) && !!url.port && url.pathname === "/";
     } catch { return false; }
-  }, "codexAppServerUrl must be a loopback ws:// URL with an explicit port").default("ws://127.0.0.1:4500"),
+  }, "codexAppServerUrl must be a loopback ws:// URL with an explicit port").default(defaultCodexAppServerUrl()),
   logLevel: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
 });
 

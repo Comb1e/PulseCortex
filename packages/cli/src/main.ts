@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { access, mkdir, stat, writeFile } from "node:fs/promises";
 import { Command } from "commander";
-import { loadConfig, defaultDataDir } from "@pulsecortex/config";
+import { loadConfig, defaultCodexAppServerUrl, defaultDataDir } from "@pulsecortex/config";
 import { codexEnvironment, detectCodexVersion, resolveCodexInvocation } from "@pulsecortex/codex-driver";
 import { canonicalProjectPath, isPathInside } from "@pulsecortex/domain";
 import { installCodexShell, installService, serviceArtifact, serviceStatus, uninstallCodexShell, uninstallService } from "@pulsecortex/installer";
@@ -52,7 +52,7 @@ program.command("init").description("Create non-secret config and a permission-r
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const configPath = path.join(dataDir, "config.json");
   const envPath = path.join(dataDir, "pulsecortex.env");
-  try { await access(configPath); } catch { await writeFile(configPath, `${JSON.stringify({ statusUpdateIntervalMs: 2000, approvalTtlMs: 900000, auditRetentionDays: 30, logRetentionDays: 7, logMaxBytes: 100000000, redactionPatterns: [], codexAppServerUrl: "ws://127.0.0.1:4500" }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 }); }
+  try { await access(configPath); } catch { await writeFile(configPath, `${JSON.stringify({ statusUpdateIntervalMs: 2000, approvalTtlMs: 900000, auditRetentionDays: 30, logRetentionDays: 7, logMaxBytes: 100000000, redactionPatterns: [], codexAppServerUrl: defaultCodexAppServerUrl() }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 }); }
   try { await access(envPath); } catch { await writeFile(envPath, "# Keep this file readable only by your desktop user.\nFEISHU_APP_ID=\nFEISHU_APP_SECRET=\n# Generate at least 32 random bytes, for example: openssl rand -base64 48\nPULSECORTEX_ACTION_SIGNING_KEY=\n", { encoding: "utf8", mode: 0o600 }); }
   await withStore(() => undefined);
   if (process.platform === "win32") {

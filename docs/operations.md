@@ -10,7 +10,7 @@ Non-secret settings live in `config.json` below the platform data directory:
 
 `PULSECORTEX_DATA_DIR` overrides the directory. `PULSECORTEX_ENV_FILE` overrides the secret-file path.
 
-Supported settings include status/approval intervals, metadata/log retention, log byte ceiling, Feishu or Lark domain, log level, JavaScript regular expressions for additional redaction, and `codexAppServerUrl`. The latter defaults to `ws://127.0.0.1:4500` and must remain a loopback `ws://` URL with an explicit port.
+Supported settings include status/approval intervals, metadata/log retention, log byte ceiling, Feishu or Lark domain, log level, JavaScript regular expressions for additional redaction, and `codexAppServerUrl`. The latter defaults to `ws://127.0.0.1:4500` on Windows and macOS and `ws://127.0.0.1:4501` on Linux, including WSL. It must remain a loopback `ws://` URL with an explicit port. Existing `config.json` files retain their explicit value; change the Linux/WSL value to port `4501` manually when upgrading an initialized installation.
 
 Runtime preferences are stored in `settings.json` rather than `config.json` or SQLite. The file is created below the platform data directory with this shape:
 
