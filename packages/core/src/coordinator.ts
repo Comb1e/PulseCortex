@@ -98,6 +98,7 @@ export class SessionCoordinator {
   private selectedProjectId: string | null = null;
   private pendingPrompt: string | null = null;
   private pendingPromptCreatesSession = false;
+  private pendingInstructionChoices = false;
   private readonly tokens: ActionTokenService;
   private readonly redactions: RegExp[];
   private readonly statusTimer: NodeJS.Timeout;
@@ -344,14 +345,15 @@ export class SessionCoordinator {
     await this.messaging.sendText(acknowledgement);
   }
 
-  private async createSelectedSession(project: Project, prompt: string | null): Promise<void> {
+  private async createSelectedSession(project: Project, prompt: string | null, announceEmpty = true): Promise<StoredSession> {
     this.rememberProject(project.id);
     const title = redact(prompt?.trim() || `New ${project.name} task`, this.redactions).slice(0, 120);
     const id = await this.driver.createSession(project, { title });
     const session = this.store.createSession({ id, projectId: project.id, title });
     this.selectedSession = session;
     if (prompt) await this.startTurn(session, prompt);
-    else await this.messaging.sendText(`Session created for ${project.name}. Send the task when ready.`);
+    else if (announceEmpty) await this.messaging.sendText(`Session created for ${project.name}. Send the task when ready.`);
+    return session;
   }
 
   private async createSessionForUnselectedSend(prompt: string): Promise<void> {
@@ -577,6 +579,12 @@ export class SessionCoordinator {
     const project = this.store.getProject(projectId); if (!project) return;
     if (this.selectedSession?.projectId !== project.id) this.selectedSession = null;
     this.rememberProject(project.id);
+    const showInstructionChoices = this.pendingInstructionChoices; this.pendingInstructionChoices = false;
+    if (showInstructionChoices) {
+      await this.createSelectedSession(project, null, false);
+      await this.sendInstructionChoices();
+      return;
+    }
     const prompt = this.pendingPrompt; this.pendingPrompt = null;
     const createNewSession = this.pendingPromptCreatesSession; this.pendingPromptCreatesSession = false;
     if (createNewSession) { await this.createSelectedSession(project, prompt); return; }
@@ -628,7 +636,17 @@ export class SessionCoordinator {
   private async sendInstructionChoices(): Promise<void> {
     await this.refreshSessions();
     this.selectSoleControllableSession();
-    const session = this.selectedSession;
+    let session = this.selectedSession;
+    if (!session && !this.store.listSessions(1).length) {
+      const projects = this.store.listProjects();
+      const project = this.selectedProject() ?? (projects.length === 1 ? projects[0]! : null);
+      if (project) session = await this.createSelectedSession(project, null, false);
+      else {
+        this.pendingInstructionChoices = projects.length > 1;
+        await this.sendProjectChoices("Choose the project for this new session.");
+        return;
+      }
+    }
     if (!session) {
       const message = "No Codex session is selected. Use /sessions or /new first.";
       await this.safeSend("text", message, () => this.messaging.sendText(message));

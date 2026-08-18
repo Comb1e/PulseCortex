@@ -15,8 +15,9 @@ export function parseCommand(raw: string): ParsedCommand {
   if (!text.startsWith("/")) return { name: "text", args: [], text };
   const [head = "", ...args] = text.slice(1).split(/\s+/u);
   const normalized = head.toLowerCase().split("@")[0] ?? "";
+  const commandName = normalized === "instruction" ? "instructions" : normalized;
   return {
-    name: COMMANDS.has(normalized as CommandName) ? normalized as CommandName : "unknown",
+    name: COMMANDS.has(commandName as CommandName) ? commandName as CommandName : "unknown",
     args,
     text,
   };

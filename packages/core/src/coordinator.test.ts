@@ -690,6 +690,48 @@ describe("session coordinator", () => {
     expect(messaging.texts.at(-1)).toContain("Using Codex's Plan instructions");
   });
 
+  it("creates a session before showing instructions when none exist", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "instructions", messageId: "instructions", actor, name: "instructions", args: [], text: "/instruction", receivedAt: Date.now() });
+
+    expect(db.getSession("session")?.projectId).toBe(project.id);
+    expect(driver.started).toHaveLength(0);
+    expect(messaging.texts).toHaveLength(0);
+    expect(messaging.choices.at(-1)).toMatchObject({ title: "Choose Codex instructions", actionKind: "instructions.select" });
+    expect(messaging.choices.at(-1)?.description).toContain("New repo task");
+  });
+
+  it("shows instructions after choosing a project when no sessions exist", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("first", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    const second = db.addProject("second", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "instructions", messageId: "instructions", actor, name: "instructions", args: [], text: "/instruction", receivedAt: Date.now() });
+    expect(messaging.choices.at(-1)).toMatchObject({ title: "Choose a project", description: "Choose the project for this new session." });
+    const projectChoice = messaging.choices.at(-1)!.choices.find((choice) => choice.value === second.id)!;
+    await messaging.action!({ eventId: "choose-second", actor, kind: "project.select", token: projectChoice.token, receivedAt: Date.now() });
+
+    expect(db.getSession("session")?.projectId).toBe(second.id);
+    expect(messaging.choices.at(-1)).toMatchObject({ title: "Choose Codex instructions", actionKind: "instructions.select" });
+    expect(messaging.texts).toHaveLength(0);
+  });
+
   it("reports a session owned by another Codex runtime instead of failing silently", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();
