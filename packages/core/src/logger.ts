@@ -6,8 +6,6 @@ const LEVEL_NAMES: Record<number, string> = { 10: "TRACE", 20: "DEBUG", 30: "INF
 const LEVEL_COLORS: Record<string, string> = { TRACE: "\u001b[90m", DEBUG: "\u001b[36m", INFO: "\u001b[32m", WARN: "\u001b[33m", ERROR: "\u001b[31m", FATAL: "\u001b[31;1m" };
 const RESET = "\u001b[0m";
 const DIM = "\u001b[2m";
-const CLEAR_LINE = "\u001b[2K";
-const CURSOR_UP = "\u001b[1A";
 const LOG_METADATA = new Set(["level", "time", "pid", "hostname", "service", "msg"]);
 const LIVE_MESSAGE_KINDS = new Set(["status", "approval", "result"]);
 
@@ -49,31 +47,35 @@ export function formatLogRecord(record: Record<string, unknown>, color = false):
   return `${prefix} ${message}${fields.length ? `\n${fields.join("\n")}` : ""}\n`;
 }
 
-function truncateToCells(value: string, maxCells: number): string {
-  let cells = 0;
-  let output = "";
-  for (const character of value) {
-    const width = character.codePointAt(0)! <= 0x7f ? 1 : 2;
-    if (cells + width > maxCells - 3) return `${output}...`;
-    cells += width;
-    output += character;
-  }
-  return output;
+function characterWidth(character: string): number {
+  return character.codePointAt(0)! <= 0x7f ? 1 : 2;
 }
 
-function formatLiveRecord(record: Record<string, unknown>, maxCells: number): string {
-  const feishu = record["feishu"] as Record<string, unknown>;
-  const content = feishu["content"] && typeof feishu["content"] === "object" ? feishu["content"] as Record<string, unknown> : null;
-  const level = LEVEL_NAMES[Number(record["level"])] ?? "LOG";
-  const details = ["phase", "status", "title", "safeSummary", "summary"]
-    .flatMap((key) => content?.[key] === undefined ? [] : [`${key}=${JSON.stringify(content[key])}`]);
-  const output = `${timestamp(record["time"])} ${level} [${String(feishu["kind"])}/${String(feishu["operation"])}] ${String(feishu["messageId"])}${details.length ? ` ${details.join(" ")}` : ""}`;
-  return truncateToCells(output, maxCells);
+function wrapForTerminal(value: string, maxCells: number): { rendered: string; lines: number } {
+  const wrapped = value.split("\n").flatMap((line) => {
+    if (!line) return [""];
+    const chunks: string[] = [];
+    let chunk = "";
+    let cells = 0;
+    for (const character of line) {
+      const width = characterWidth(character);
+      if (chunk && cells + width > maxCells) {
+        chunks.push(chunk);
+        chunk = "";
+        cells = 0;
+      }
+      chunk += character;
+      cells += width;
+    }
+    if (chunk) chunks.push(chunk);
+    return chunks;
+  }).join("\n");
+  return { rendered: wrapped, lines: Math.max(1, wrapped.split("\n").length - 1) };
 }
 
 class PrettyLogStream extends Writable {
   private buffered = "";
-  private readonly liveRecords = new Map<string, { rendered: string; fingerprint: string }>();
+  private readonly liveRecords = new Map<string, { rendered: string; lines: number; fingerprint: string }>();
 
   constructor(private readonly target: LogTarget, private readonly color: boolean, private readonly liveStatus = false) { super(); }
 
@@ -102,13 +104,14 @@ class PrettyLogStream extends Writable {
         const fingerprint = this.liveFingerprint(record);
         if (this.liveRecords.get(liveKey)?.fingerprint === fingerprint) return;
         this.clearLiveRecords();
+        const rendered = wrapForTerminal(formatLogRecord(record, false), this.terminalWidth());
         if (this.isFinalLiveRecord(record)) {
           this.liveRecords.delete(liveKey);
-          this.target.write(`${formatLiveRecord(record, this.terminalWidth())}\n`);
+          this.target.write(rendered.rendered);
           this.renderLiveRecords();
           return;
         }
-        this.liveRecords.set(liveKey, { rendered: formatLiveRecord(record, this.terminalWidth()), fingerprint });
+        this.liveRecords.set(liveKey, { ...rendered, fingerprint });
         this.renderLiveRecords();
         return;
       }
@@ -160,16 +163,14 @@ class PrettyLogStream extends Writable {
 
   private clearLiveRecords(): void {
     if (!this.liveRecords.size) return;
-    this.target.write("\r");
-    for (let index = this.liveRecords.size - 1; index >= 0; index -= 1) {
-      this.target.write(CLEAR_LINE);
-      if (index > 0) this.target.write(CURSOR_UP);
-    }
+    const lines = [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
+    this.target.write(`\u001b[${lines}A`);
+    for (let index = 0; index < lines; index += 1) this.target.write(`\u001b[2K\u001b[1B`);
+    this.target.write(`\u001b[${lines}A\r`);
   }
 
   private renderLiveRecords(): void {
-    const entries = [...this.liveRecords.values()];
-    entries.forEach((entry, index) => this.target.write(`${index ? "\n" : ""}${entry.rendered}`));
+    for (const entry of this.liveRecords.values()) this.target.write(entry.rendered);
   }
 
   private terminalWidth(): number {

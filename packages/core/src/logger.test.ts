@@ -93,8 +93,9 @@ describe("daemon logger", () => {
     logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed", safeSummary: "y".repeat(200) } } }, "Feishu outbound message");
 
     const output = terminal.text();
-    expect(output).not.toContain('phase="working"');
-    expect(output).toContain('phase="completed"');
+    expect(output).not.toContain('"phase": "working"');
+    expect(output).toContain('"phase": "completed"');
+    expect(output.replaceAll("\n", "")).toContain(`"safeSummary": "${"y".repeat(200)}"`);
     expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
   });
 
@@ -142,8 +143,8 @@ describe("daemon logger", () => {
     logger.info({ connected: true }, "Feishu connection state changed");
 
     const output = terminal.text();
-    expect(output).not.toContain('phase="working"');
-    expect(output).toContain('status="completed"');
+    expect(output).not.toContain('"phase": "working"');
+    expect(output).toContain('"status": "completed"');
     expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
     expect((output.match(/Feishu connection state changed/g) ?? [])).toHaveLength(1);
   });
