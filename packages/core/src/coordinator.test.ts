@@ -88,6 +88,32 @@ describe("session coordinator", () => {
     expect(db.inspectAudit().some((row) => row["event_type"] === "action.rejected")).toBe(true);
   });
 
+  it("updates the starting card when Codex starts during its initial send", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    let releaseSend!: () => void;
+    let sendStarted!: () => void;
+    const sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    const started = new Promise<void>((resolve) => { sendStarted = resolve; });
+    const originalSendStatus = messaging.sendStatus.bind(messaging);
+    messaging.sendStatus = async (view) => { sendStarted(); await sendGate; return originalSendStatus(view); };
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    const starting = messaging.command!({ eventId: "start-race", messageId: "start-race", actor, name: "text", args: [], text: "work", receivedAt: Date.now() });
+    await started;
+    driver.emit({ type: "turn.started", sessionId: "session", turnId: "turn", occurredAt: Date.now() });
+    releaseSend();
+    await starting;
+    await vi.waitFor(() => expect(messaging.statuses.at(-1)?.phase).toBe("working"));
+    expect(messaging.statuses.map((view) => view.phase)).toEqual(["starting", "working"]);
+  });
+
   it("enables Codex auto approve from command cards only", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();

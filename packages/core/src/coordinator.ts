@@ -361,8 +361,7 @@ export class SessionCoordinator {
     const runtime = this.makeRuntime(session, project, turnId, "starting", Date.now(), "Codex is starting...");
     this.runtimes.set(session.id, runtime);
     this.selectedSession = runtime.session;
-    const view = this.makeStatusView(runtime);
-    await this.safeSend("status", view, async () => { if (this.runtimes.get(session.id)?.turnId === turnId) runtime.statusRef = await this.messaging.sendStatus(view); }, view, `turn:${turnId}:status`);
+    await this.flushStatus(session.id, true);
   }
 
   private async handleAgentEvent(event: AgentEvent): Promise<void> {
@@ -733,7 +732,9 @@ export class SessionCoordinator {
 
   private async flushStatus(sessionId: string, force = false): Promise<void> {
     const runtime = this.runtimes.get(sessionId);
-    if (!runtime || (!runtime.dirty && !force) || this.statusFlushes.has(sessionId)) return;
+    if (!runtime || (!runtime.dirty && !force)) return;
+    const pending = this.statusFlushes.get(sessionId);
+    if (pending) { await pending; return; }
     runtime.dirty = false;
     const view = this.makeStatusView(runtime);
     this.store.updateTurn(runtime.turnId, { state: runtime.phase, safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary });
@@ -744,6 +745,9 @@ export class SessionCoordinator {
     })().finally(() => { this.statusFlushes.delete(sessionId); });
     this.statusFlushes.set(sessionId, flush);
     await flush;
+    // Events can update the view while the adapter is sending it. Keep those
+    // changes on the same card instead of leaving an orphaned starting card.
+    if (this.runtimes.get(sessionId) === runtime && runtime.dirty) await this.flushStatus(sessionId);
   }
 
   private selectedRuntime(): RuntimeTurn | null {
