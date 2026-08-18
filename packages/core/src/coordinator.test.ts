@@ -296,6 +296,26 @@ describe("session coordinator", () => {
     expect(messaging.outputs.at(-1)?.content).toBe("first turn output\n");
   });
 
+  it("combines Codex messages and commands in chronological logs", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "work", receivedAt: Date.now() });
+    driver.emit({ type: "agent.message.delta", sessionId: "session", turnId: "turn", messageId: "reply", delta: "I will run tests.\n", occurredAt: Date.now() });
+    driver.emit({ type: "command.started", sessionId: "session", turnId: "turn", commandId: "command", command: "pnpm test", occurredAt: Date.now() });
+    await logs.append("turn", "stdout", "all tests passed\n");
+    driver.emit({ type: "agent.message.delta", sessionId: "session", turnId: "turn", messageId: "reply", delta: "The tests are green.\n", occurredAt: Date.now() });
+
+    await vi.waitFor(async () => expect(await logs.read("turn")).toBe("I will run tests.\n$ pnpm test\nall tests passed\nThe tests are green.\n"));
+  });
+
   it("runs and addresses multiple Codex sessions independently", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();

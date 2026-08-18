@@ -19,4 +19,18 @@ describe("command log store", () => {
 
     expect(await store.read("missing")).toBe("No command output recorded.");
   });
+
+  it("keeps messages, commands, and command output in one append order", async () => {
+    const store = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+
+    const writes = [
+      store.append("turn", "message", "I will inspect the project.\n"),
+      store.append("turn", "command", "$ pnpm test\n"),
+      store.append("turn", "stdout", "all tests passed\n"),
+      store.append("turn", "message", "The tests are green.\n"),
+    ];
+    await Promise.all(writes);
+
+    expect(await store.read("turn")).toBe("I will inspect the project.\n$ pnpm test\nall tests passed\nThe tests are green.\n");
+  });
 });

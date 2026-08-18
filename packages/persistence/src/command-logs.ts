@@ -8,16 +8,28 @@ function safeId(id: string): string {
 }
 
 export class CommandLogStore {
+  private readonly pendingWrites = new Map<string, Promise<void>>();
+
   constructor(private readonly directory: string, private readonly configuredRedactions: RegExp[] = []) {}
 
-  async append(turnId: string, stream: "stdout" | "stderr", content: string): Promise<void> {
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    const line = JSON.stringify({ at: Date.now(), stream, text: redact(content, this.configuredRedactions) });
-    await appendFile(path.join(this.directory, `${safeId(turnId)}.jsonl`), `${line}\n`, { encoding: "utf8", mode: 0o600 });
+  append(turnId: string, stream: "stdout" | "stderr" | "message" | "command", content: string): Promise<void> {
+    const id = safeId(turnId);
+    const previous = this.pendingWrites.get(id) ?? Promise.resolve();
+    const write = previous.catch(() => undefined).then(async () => {
+      await mkdir(this.directory, { recursive: true, mode: 0o700 });
+      const line = JSON.stringify({ at: Date.now(), stream, text: redact(content, this.configuredRedactions) });
+      await appendFile(path.join(this.directory, `${id}.jsonl`), `${line}\n`, { encoding: "utf8", mode: 0o600 });
+    });
+    this.pendingWrites.set(id, write);
+    return write.finally(() => {
+      if (this.pendingWrites.get(id) === write) this.pendingWrites.delete(id);
+    });
   }
 
   async read(turnId: string): Promise<string> {
-    const file = BunNotAvailableReadShim(path.join(this.directory, `${safeId(turnId)}.jsonl`));
+    const id = safeId(turnId);
+    await this.pendingWrites.get(id)?.catch(() => undefined);
+    const file = BunNotAvailableReadShim(path.join(this.directory, `${id}.jsonl`));
     try {
       const contents = await file;
       return contents

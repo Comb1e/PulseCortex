@@ -84,7 +84,7 @@ const HELP = `PulseCortex commands:
 /send <session-id> <message> - message a specific session
 /status - show the selected session's active turn
 /stop - interrupt the selected session's active turn
-/logs - show bounded command output
+/logs - show chronological Codex logs
 /diff - show the current unified diff
 /help - show this help
 
@@ -397,8 +397,12 @@ export class SessionCoordinator {
     if (!runtime || event.sessionId !== runtime.session.id || event.turnId !== runtime.turnId) return;
     switch (event.type) {
       case "turn.started": runtime.phase = "working"; runtime.safeSummary = "Codex is working..."; runtime.dirty = true; this.store.updateTurn(runtime.turnId, { state: "working" }); await this.flushStatus(runtime.session.id, true); break;
-      case "agent.message.delta": this.appendReply(runtime, event.messageId ?? "default", event.delta); runtime.dirty = true; break;
-      case "command.started": runtime.recentCommands = [...runtime.recentCommands.slice(-4), event.command]; if (!runtime.pendingApprovals.size) runtime.phase = "working"; runtime.dirty = true; break;
+      case "agent.message.delta":
+        void this.commandLogs.append(runtime.turnId, "message", event.delta).catch(() => undefined);
+        this.appendReply(runtime, event.messageId ?? "default", event.delta); runtime.dirty = true; break;
+      case "command.started":
+        void this.commandLogs.append(runtime.turnId, "command", `$ ${event.command}\n`).catch(() => undefined);
+        runtime.recentCommands = [...runtime.recentCommands.slice(-4), event.command]; if (!runtime.pendingApprovals.size) runtime.phase = "working"; runtime.dirty = true; break;
       case "command.completed": {
         const command = runtime.recentCommands.at(-1) ?? "";
         if (/\b(test|check|lint|build)\b/iu.test(command)) runtime.testSummary = event.exitCode === 0 ? `Passed: ${command}` : `Failed (${String(event.exitCode ?? "unknown")}): ${command}`;
@@ -929,7 +933,7 @@ export class SessionCoordinator {
     const page = paginate(redact(content, this.redactions), requestedPage);
     const expiresAt = Date.now() + 15 * 60_000;
     return {
-      title: kind === "logs.show" ? "Command logs" : "Unified diff", content: page.text, page: page.page, totalPages: page.totalPages, actionKind: kind,
+      title: kind === "logs.show" ? "Codex logs" : "Unified diff", content: page.text, page: page.page, totalPages: page.totalPages, actionKind: kind,
       ...(page.page > 1 ? { previousToken: this.issue(kind, sessionId, turnId, turnId, expiresAt, { page: page.page - 1 }) } : {}),
       ...(page.page < page.totalPages ? { nextToken: this.issue(kind, sessionId, turnId, turnId, expiresAt, { page: page.page + 1 }) } : {}),
     };
