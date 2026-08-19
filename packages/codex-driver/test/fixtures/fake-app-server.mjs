@@ -117,6 +117,16 @@ lines.on("line", (line) => {
       send({ id: "mcp-rpc", method: "mcpServer/elicitation/request", params: { threadId: sessionId, turnId, serverName: "test", mode: "form", _meta: null, message: "Input needed", requestedSchema: { type: "object", properties: {} } } });
       return;
     }
+    if (scenario === "tool-call-warning-threshold") {
+      for (let index = 1; index <= 4; index += 1) {
+        send({ id: `before-reset-${index}`, method: "item/tool/call", params: { threadId: sessionId, turnId, callId: `before-reset-${index}`, namespace: null, tool: `unregistered-before-reset-${index}`, arguments: {} } });
+      }
+      send({ id: "successful-time-call", method: "currentTime/read", params: { threadId: sessionId, turnId } });
+      for (let index = 1; index <= 6; index += 1) {
+        send({ id: `after-reset-${index}`, method: "item/tool/call", params: { threadId: sessionId, turnId, callId: `after-reset-${index}`, namespace: null, tool: `unregistered-after-reset-${index}`, arguments: {} } });
+      }
+      return;
+    }
     if (scenario === "server-resolved") {
       send({ id: "resolved-rpc", method: "item/commandExecution/requestApproval", params: { threadId: sessionId, turnId, itemId: "cmd", startedAtMs: Date.now(), environmentId: null, command: "pnpm test" } });
       setImmediate(() => {
@@ -150,6 +160,11 @@ lines.on("line", (line) => {
     if (message.id === "mcp-rpc" && (message.result?.action !== "decline" || message.result?.content !== null)) process.exit(7);
     hostResponses.add(message.id);
     if (hostResponses.size === 3) send({ method: "turn/completed", params: { threadId: sessionId, turn: { id: turnId, status: "completed", error: null } } });
+  } else if (scenario === "tool-call-warning-threshold" && (/^(before|after)-reset-\d+$/u.test(message.id) || message.id === "successful-time-call")) {
+    if (message.id === "successful-time-call" && !Number.isInteger(message.result?.currentTimeAt)) process.exit(8);
+    if (message.id !== "successful-time-call" && (message.result?.success !== false || message.result?.contentItems?.[0]?.type !== "inputText")) process.exit(9);
+    hostResponses.add(message.id);
+    if (hostResponses.size === 11) send({ method: "turn/completed", params: { threadId: sessionId, turn: { id: turnId, status: "completed", error: null } } });
   } else if (message.method === "environment/status") {
     send({ id: message.id, result: { status: "disconnected", error: { code: "offline", message: "tool host is offline", additionalDetails: null } } });
   } else if (message.method === "turn/steer" || message.method === "turn/interrupt") {

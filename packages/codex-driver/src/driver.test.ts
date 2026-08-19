@@ -276,8 +276,32 @@ describe("Codex app-server contract", () => {
     await driver.startTurn(sessionId, "exercise host requests");
     await completed;
 
-    expect(diagnostics).toContain("Rejected an unregistered dynamic tool call");
+    expect(diagnostics).not.toContain("Rejected an unregistered dynamic tool call");
     expect(diagnostics).toContain("Declined MCP elicitation because remote structured input is not enabled");
+    await driver.stop();
+  });
+
+  it("warns only after five consecutive rejected dynamic tool calls", async () => {
+    const diagnostics: Array<{ level: string; message: string; details?: Record<string, unknown> }> = [];
+    const driver = new CodexAppServerDriver({
+      executable: process.execPath,
+      args: [fixture, "tool-call-warning-threshold"],
+      verifyVersion: false,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    driver.subscribe((event) => { if (event.type === "turn.completed") complete(); });
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+    await driver.startTurn(sessionId, "repeat invalid dynamic tool calls");
+    await completed;
+
+    const warnings = diagnostics.filter((diagnostic) => diagnostic.message === "Rejected an unregistered dynamic tool call");
+    expect(warnings).toEqual([expect.objectContaining({
+      level: "warn",
+      details: expect.objectContaining({ consecutiveFailures: 5, tool: "unregistered-after-reset-5" }),
+    })]);
     await driver.stop();
   });
 

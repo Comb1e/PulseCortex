@@ -61,6 +61,7 @@ function textInput(text: string): Array<{ type: "text"; text: string; text_eleme
 
 const MANAGED_THREAD_CONFIG = { features: { multi_agent: false } } as const;
 const TOOL_ARGUMENT_ERROR_PREFIX = "failed to parse function arguments:";
+const TOOL_CALL_WARNING_THRESHOLD = 5;
 
 function functionCallOutputText(output: FunctionCallOutputBody): string {
   if (typeof output === "string") return output;
@@ -159,6 +160,7 @@ export class CodexAppServerDriver implements AgentDriver {
   private readonly managedSessions = new Set<SessionId>();
   private readonly sessionSettings = new Map<SessionId, SessionSettings>();
   private readonly eventBuffers = new Map<SessionId, AgentEvent[]>();
+  private readonly toolCallFailureStreaks = new Map<string, number>();
   private cliVersion = "unknown";
   private codexHome: string | null = null;
   private stderrBuffer = "";
@@ -217,7 +219,7 @@ export class CodexAppServerDriver implements AgentDriver {
     }
   }
 
-  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.stderrBuffer = ""; this.activeTurns.clear(); this.failedTurns.clear(); this.projectRoots.clear(); this.sessionCwds.clear(); this.disconnectedEnvironments.clear(); this.directInputSessions.clear(); this.managedSessions.clear(); this.sessionSettings.clear(); this.pending.clear(); this.validatingServerRequests.clear(); this.resolvedServerRequests.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
+  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.stderrBuffer = ""; this.activeTurns.clear(); this.failedTurns.clear(); this.projectRoots.clear(); this.sessionCwds.clear(); this.disconnectedEnvironments.clear(); this.directInputSessions.clear(); this.managedSessions.clear(); this.sessionSettings.clear(); this.pending.clear(); this.validatingServerRequests.clear(); this.resolvedServerRequests.clear(); this.eventBuffers.clear(); this.toolCallFailureStreaks.clear(); await this.transport.stop(); }
 
   async createSession(project: Project, options: SessionOptions): Promise<SessionId> {
     this.assertStarted();
@@ -437,6 +439,7 @@ export class CodexAppServerDriver implements AgentDriver {
     this.assertSession(id);
     if (this.activeTurns.has(id)) throw new Error("This session already has an active turn");
     for (const key of this.failedTurns) if (key.startsWith(`${id}:`)) this.failedTurns.delete(key);
+    this.clearToolCallFailureStreaks(id);
     await this.assertEnvironmentAvailable(id);
     const root = this.projectRoots.get(id)!;
     const cwd = this.sessionCwds.get(id) ?? root;
@@ -523,6 +526,7 @@ export class CodexAppServerDriver implements AgentDriver {
     const turnId = String(params["turnId"] ?? this.activeTurns.get(sessionId) ?? "");
     const baseId = String(params["approvalId"] ?? params["itemId"] ?? params["callId"] ?? request.id);
     const approvalId = `${sessionId}:${turnId}:${baseId}`;
+    if (request.method !== "item/tool/call") this.clearToolCallFailureStreaks(sessionId, turnId);
     if (request.method === "item/tool/requestUserInput") {
       const input = request.params as ToolRequestUserInputParams;
       if (input.questions.some((question) => question.isSecret)) {
@@ -614,7 +618,12 @@ export class CodexAppServerDriver implements AgentDriver {
         contentItems: [{ type: "inputText", text: "PulseCortex did not register this dynamic tool for remote execution." }],
         success: false,
       });
-      this.reportDiagnostic("warn", "Rejected an unregistered dynamic tool call", sessionId, { turnId, tool: params["tool"], namespace: params["namespace"] });
+      const consecutiveFailures = this.recordToolCallFailure(sessionId, turnId);
+      if (consecutiveFailures === TOOL_CALL_WARNING_THRESHOLD) {
+        this.reportDiagnostic("warn", "Rejected an unregistered dynamic tool call", sessionId, {
+          turnId, tool: params["tool"], namespace: params["namespace"], consecutiveFailures,
+        });
+      }
       return;
     }
     if (request.method === "account/chatgptAuthTokens/refresh" || request.method === "attestation/generate") {
@@ -702,6 +711,7 @@ export class CodexAppServerDriver implements AgentDriver {
       case "turn/completed": {
         const input = message.params as TurnCompletedNotification;
         this.activeTurns.delete(input.threadId);
+        this.clearToolCallFailureStreaks(input.threadId, input.turn.id);
         this.clearPendingRequests(input.threadId, input.turn.id);
         if (input.turn.status === "failed") this.emit({ type: "turn.failed", sessionId: input.threadId, turnId: input.turn.id, error: input.turn.error?.message ?? "Codex turn failed", occurredAt: now() });
         else this.emit({ type: "turn.completed", sessionId: input.threadId, turnId: input.turn.id, status: input.turn.status === "interrupted" ? "stopped" : "completed", occurredAt: now() });
@@ -714,6 +724,7 @@ export class CodexAppServerDriver implements AgentDriver {
             this.activeTurns.delete(sessionId);
           }
           if (sessionId && turnId) this.failedTurns.add(`${sessionId}:${turnId}`);
+          this.clearToolCallFailureStreaks(sessionId, turnId);
           this.clearPendingRequests(sessionId, turnId);
           this.emit({ type: "turn.failed", sessionId, turnId, error: String(error?.["message"] ?? "Codex turn error"), occurredAt: now() });
         }
@@ -723,6 +734,7 @@ export class CodexAppServerDriver implements AgentDriver {
   }
 
   private handleItemStarted(input: ItemStartedNotification): void {
+    this.clearToolCallFailureStreaks(input.threadId, input.turnId);
     if (input.item.type === "commandExecution") this.emit({ type: "command.started", sessionId: input.threadId, turnId: input.turnId, commandId: input.item.id, command: summarizeCommand(input.item.command), occurredAt: input.startedAtMs });
   }
 
@@ -772,6 +784,19 @@ export class CodexAppServerDriver implements AgentDriver {
     }
     this.pending.set(approvalId, pending);
     return true;
+  }
+  private recordToolCallFailure(sessionId: SessionId, turnId: TurnId): number {
+    const key = `${sessionId}:${turnId}`;
+    const failures = (this.toolCallFailureStreaks.get(key) ?? 0) + 1;
+    this.toolCallFailureStreaks.set(key, failures);
+    return failures;
+  }
+  private clearToolCallFailureStreaks(sessionId: SessionId, turnId?: TurnId): void {
+    if (turnId) {
+      this.toolCallFailureStreaks.delete(`${sessionId}:${turnId}`);
+      return;
+    }
+    for (const key of this.toolCallFailureStreaks.keys()) if (key.startsWith(`${sessionId}:`)) this.toolCallFailureStreaks.delete(key);
   }
   private handleStderr(output: string): void {
     this.reportDiagnostic("warn", "Codex app-server stderr", undefined, { output: output.trim() });
@@ -831,6 +856,7 @@ export class CodexAppServerDriver implements AgentDriver {
     this.validatingServerRequests.clear();
     this.resolvedServerRequests.clear();
     this.eventBuffers.clear();
+    this.toolCallFailureStreaks.clear();
     this.emit({ type: "driver.crashed", error: error.message, occurredAt: now() });
   }
   private async handleProtocolError(error: Error): Promise<void> {
@@ -848,6 +874,7 @@ export class CodexAppServerDriver implements AgentDriver {
     this.validatingServerRequests.clear();
     this.resolvedServerRequests.clear();
     this.eventBuffers.clear();
+    this.toolCallFailureStreaks.clear();
     await this.transport.stop();
     this.emit({ type: "driver.crashed", error: error.message, occurredAt: now() });
   }
