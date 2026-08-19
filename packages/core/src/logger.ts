@@ -62,33 +62,31 @@ function characterWidth(character: string): number {
   return character.codePointAt(0)! <= 0x7f ? 1 : 2;
 }
 
-function truncateToCells(value: string, maxCells: number): string {
-  const totalCells = [...value].reduce((total, character) => total + characterWidth(character), 0);
-  if (totalCells <= maxCells) return value;
-  let output = "";
-  let cells = 0;
-  for (const character of value) {
-    const width = characterWidth(character);
-    if (cells + width > maxCells - 3) return `${output}...`;
-    output += character;
-    cells += width;
-  }
-  return output;
-}
-
-function formatLiveRecord(record: Record<string, unknown>, maxCells: number): string {
-  const feishu = record["feishu"] as Record<string, unknown>;
-  const content = feishu["content"] && typeof feishu["content"] === "object" ? feishu["content"] as Record<string, unknown> : null;
-  const level = LEVEL_NAMES[Number(record["level"])] ?? "LOG";
-  const details = ["phase", "status", "title", "decision", "safeSummary", "summary"]
-    .flatMap((key) => content?.[key] === undefined ? [] : [`${key}=${JSON.stringify(content[key])}`]);
-  const value = `${timestamp(record["time"])} ${level} ${String(feishu["messageId"])} [${String(feishu["kind"])}/${String(feishu["operation"])}]${details.length ? ` ${details.join(" ")}` : ""}`
-    .replaceAll(/\s+/gu, " ");
-  return `${truncateToCells(value, maxCells)}\n`;
+function wrapForTerminal(value: string, maxCells: number): { rendered: string; lines: number } {
+  const wrapped = value.split("\n").flatMap((line) => {
+    if (!line) return [""];
+    const chunks: string[] = [];
+    let chunk = "";
+    let cells = 0;
+    for (const character of line) {
+      const width = characterWidth(character);
+      if (chunk && cells + width > maxCells) {
+        chunks.push(chunk);
+        chunk = "";
+        cells = 0;
+      }
+      chunk += character;
+      cells += width;
+    }
+    if (chunk) chunks.push(chunk);
+    return chunks;
+  }).join("\n");
+  return { rendered: wrapped, lines: Math.max(1, wrapped.split("\n").length - 1) };
 }
 
 interface LiveRecord {
   rendered: string;
+  lines: number;
   liveKey: string;
   messageId: string;
   fingerprint: string;
@@ -169,24 +167,26 @@ class PrettyLogStream extends Writable {
     if (!this.canClearFooter()) {
       const abandoned = this.liveRecords.size;
       this.liveRecords.clear();
-      const rendered = formatLiveRecord(record, this.terminalWidth());
-      if (event.lifecycle === "active") this.liveRecords.set(event.liveKey, { ...event, rendered, fingerprint });
+      const rendered = this.renderLiveRecord(record);
+      if (event.lifecycle === "active" && rendered.lines < this.terminalRows()) {
+        this.liveRecords.set(event.liveKey, { ...event, ...rendered, fingerprint });
+      }
       this.rememberFingerprint(event.liveKey, fingerprint);
-      this.emitFrame(rendered, at, "footer-reset", event.messageId, 0, `footer-geometry-unreachable-with-${abandoned}-entries`);
+      this.emitFrame(rendered.rendered, at, "footer-reset", event.messageId, 0, `footer-geometry-unreachable-with-${abandoned}-entries`);
       return;
     }
 
-    const clearedLines = this.liveRecords.size;
+    const clearedLines = this.liveFooterLines();
     const committed = this.takeSettledExcept(event.liveKey);
     this.liveRecords.delete(event.liveKey);
     this.liveRecords.set(event.liveKey, {
       ...event,
-      rendered: formatLiveRecord(record, this.terminalWidth()),
+      ...this.renderLiveRecord(record),
       fingerprint,
     });
     this.rememberFingerprint(event.liveKey, fingerprint);
 
-    while (this.liveRecords.size >= this.terminalRows()) {
+    while (this.liveFooterLines() >= this.terminalRows()) {
       const oldestKey = this.liveRecords.keys().next().value as string | undefined;
       if (!oldestKey) break;
       committed.push(this.liveRecords.get(oldestKey)!.rendered);
@@ -211,7 +211,7 @@ class PrettyLogStream extends Writable {
       return;
     }
 
-    const clearedLines = this.liveRecords.size;
+    const clearedLines = this.liveFooterLines();
     const settled = this.takeSettledExcept(null);
     const frame = `${this.clearTerminalLines(clearedLines)}${settled.join("")}${content}${this.renderLiveRecords()}`;
     this.emitFrame(frame, at, "ordinary-with-footer", undefined, clearedLines, settled.length ? "settled-committed" : undefined);
@@ -261,9 +261,17 @@ class PrettyLogStream extends Writable {
     return [...this.liveRecords.values()].map((entry) => entry.rendered).join("");
   }
 
+  private renderLiveRecord(record: Record<string, unknown>): { rendered: string; lines: number } {
+    return wrapForTerminal(formatLogRecord(record, false), this.terminalWidth());
+  }
+
+  private liveFooterLines(): number {
+    return [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
+  }
+
   private canClearFooter(): boolean {
     if (!this.liveRecords.size) return true;
-    return this.footerColumns === this.terminalColumns() && this.liveRecords.size < this.terminalRows();
+    return this.footerColumns === this.terminalColumns() && this.liveFooterLines() < this.terminalRows();
   }
 
   private rememberFingerprint(key: string, fingerprint: string): void {
@@ -289,7 +297,7 @@ class PrettyLogStream extends Writable {
       columns: this.terminalColumns(),
       rows: this.terminalRowsValue(),
       footerEntries: this.liveRecords.size,
-      footerLines: this.liveRecords.size,
+      footerLines: this.liveFooterLines(),
       clearedLines,
       emittedBytes,
       ...(reason ? { reason } : {}),
