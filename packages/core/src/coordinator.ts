@@ -14,7 +14,9 @@ import {
   type MessageRef,
   type OutputView,
   type Project,
+  type QuestionResolutionView,
   type QuestionView,
+  type InputQuestion,
   type SessionView,
   type StoredSession,
   type TurnPhase,
@@ -30,8 +32,14 @@ interface CoordinatorOptions {
 
 interface PendingInputState {
   requestId: string;
-  questions: AgentEvent & { type: "input.requested" } extends infer E ? E extends { questions: infer Q } ? Q : never : never;
+  questions: PendingQuestionState[];
   answers: Record<string, string>;
+}
+
+interface PendingQuestionState {
+  question: InputQuestion;
+  view: QuestionView;
+  ref?: MessageRef;
 }
 
 interface PendingApprovalState {
@@ -73,7 +81,7 @@ interface SessionRefreshResult {
   newlyControllable: ProjectSession[];
 }
 
-type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "approval.remove" | "result" | "result.update" | "choices" | "question" | "output";
+type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "approval.remove" | "result" | "result.update" | "choices" | "question" | "question.update" | "output";
 const SESSION_DISCOVERY_INTERVAL_MS = 2_000;
 
 const CODEX_BUILTIN_COMMANDS = [
@@ -287,7 +295,7 @@ export class SessionCoordinator {
       case "session.continue": await this.resumeStoredSession(record.sessionId); break;
       case "task.new": await this.promptForNewSession(null); break;
       case "sessions.more": await this.sendSessionChoices(Number(record.payload["page"] ?? 1), false); break;
-      case "input.answer": await this.answerStructuredInput(record); break;
+      case "input.answer": await this.answerStructuredInput(record, action.formValues); break;
     }
   }
 
@@ -495,7 +503,7 @@ export class SessionCoordinator {
       await this.resolveApprovalCard(approval, "cancel");
       runtime.pendingApprovals.delete(requestId);
     }
-    if (runtime.pendingInput?.requestId === requestId) delete runtime.pendingInput;
+    if (runtime.pendingInput?.requestId === requestId) await this.withdrawPendingInput(runtime);
     runtime.phase = runtime.pendingApprovals.size ? "awaiting_approval" : runtime.pendingInput ? "awaiting_input" : "working";
     runtime.safeSummary = runtime.phase === "working" ? "Codex withdrew the pending request and is continuing..." : runtime.safeSummary;
     runtime.dirty = true;
@@ -574,46 +582,65 @@ export class SessionCoordinator {
   }
 
   private async handleInputEvent(runtime: RuntimeTurn, event: Extract<AgentEvent, { type: "input.requested" }>): Promise<void> {
+    if (runtime.pendingInput) await this.withdrawPendingInput(runtime);
     runtime.phase = "awaiting_input";
-    runtime.pendingInput = { requestId: event.requestId, questions: event.questions, answers: {} };
+    const owner = this.requireOwner();
+    const questions = event.questions.map((question): PendingQuestionState => {
+      const expiresAt = Date.now() + this.options.approvalTtlMs;
+      const view: QuestionView = {
+        sessionId: runtime.session.id, turnId: runtime.turnId, requestId: event.requestId, questionId: question.id, title: question.header, question: redact(question.question, this.redactions), freeformAccepted: question.allowFreeform,
+        options: question.options.map((option) => ({ label: option.label, ...(option.description ? { description: option.description } : {}) })),
+        submissionToken: this.issueForOwner(owner, "input.answer", runtime.session.id, runtime.turnId, event.requestId, expiresAt, { questionId: question.id }),
+      };
+      return { question, view };
+    });
+    const pending: PendingInputState = { requestId: event.requestId, questions, answers: {} };
+    runtime.pendingInput = pending;
     runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "awaiting_input" });
     this.store.addMilestone(runtime.session.id, runtime.turnId, event.type, { requestId: event.requestId, questionIds: event.questions.map((q) => q.id) });
-    const owner = this.requireOwner();
-    for (const question of event.questions) {
-      const expiresAt = Date.now() + this.options.approvalTtlMs;
-      const view: QuestionView = {
-        sessionId: runtime.session.id, turnId: runtime.turnId, requestId: event.requestId, title: question.header, question: redact(question.question, this.redactions), freeformAccepted: question.allowFreeform,
-        options: question.options.map((option) => ({ label: option.label, ...(option.description ? { description: option.description } : {}), value: option.label, token: this.issueForOwner(owner, "input.answer", runtime.session.id, runtime.turnId, event.requestId, expiresAt, { questionId: question.id, answer: option.label }) })),
-      };
-      await this.safeSend("question", view, () => this.messaging.sendQuestion(view));
+    for (const state of questions) {
+      const { view } = state;
+      await this.safeSend("question", view, async () => {
+        const ref = await this.messaging.sendQuestion(view);
+        if (runtime.pendingInput === pending && pending.questions.includes(state)) state.ref = ref;
+      });
     }
     await this.flushStatus(runtime.session.id, true);
   }
 
-  private async answerStructuredInput(record: InteractionRecord): Promise<void> {
+  private async answerStructuredInput(record: InteractionRecord, formValues?: Record<string, string>): Promise<void> {
     const runtime = this.runtimes.get(record.sessionId);
     const pending = runtime?.pendingInput;
-    if (!runtime || !pending || pending.requestId !== record.requestId) return;
+    if (!runtime || !pending || pending.requestId !== record.requestId || record.turnId !== runtime.turnId) return;
     const questionId = String(record.payload["questionId"] ?? "");
-    const answer = String(record.payload["answer"] ?? "");
-    if (!pending.questions.some((question) => question.id === questionId)) return;
+    const state = pending.questions.find((item) => item.question.id === questionId);
+    const selectedIndex = formValues?.["choice"];
+    if (!state || questionId in pending.answers || selectedIndex === undefined || !/^(?:0|[1-9]\d*)$/u.test(selectedIndex)) return;
+    const option = state.question.options[Number(selectedIndex)];
+    if (!option) return;
+    const note = (formValues?.["note"] ?? "").trim().slice(0, 1_000);
+    const answer = note ? `${option.label}\n\nNote: ${note}` : option.label;
     pending.answers[questionId] = answer;
+    await this.resolveQuestionCard(state, {
+      title: state.view.title, question: state.view.question, status: "selected", answer: option.label, ...(note ? { note } : {}), resolvedAt: Date.now(),
+    });
     await this.finishInputIfComplete(runtime);
   }
 
   private async answerFreeformInput(runtime: RuntimeTurn, text: string): Promise<void> {
     const pending = runtime.pendingInput;
     if (!pending) return;
-    const question = pending.questions.find((item) => !(item.id in pending.answers) && item.allowFreeform);
-    if (!question) { await this.messaging.sendText("Please use one of the answer buttons on the question card."); return; }
-    pending.answers[question.id] = text;
+    const state = pending.questions.find((item) => !(item.question.id in pending.answers) && item.question.allowFreeform);
+    if (!state) { await this.messaging.sendText("Please submit one of the choices on the question card."); return; }
+    pending.answers[state.question.id] = text;
+    await this.resolveQuestionCard(state, { title: state.view.title, question: state.view.question, status: "custom", answer: text, resolvedAt: Date.now() });
     await this.finishInputIfComplete(runtime);
   }
 
   private async finishInputIfComplete(runtime: RuntimeTurn): Promise<void> {
     const pending = runtime.pendingInput;
-    if (!pending || pending.questions.some((question) => !(question.id in pending.answers))) return;
+    if (!pending || pending.questions.some((state) => !(state.question.id in pending.answers))) return;
     await this.driver.resolveInput(pending.requestId, pending.answers);
     this.store.audit({ eventType: "input.answered", summary: `${pending.questions.length} agent question(s) answered`, sessionId: runtime.session.id, turnId: runtime.turnId });
     delete runtime.pendingInput; runtime.phase = "working"; runtime.safeSummary = "Answer sent. Codex is continuing..."; runtime.dirty = true;
@@ -633,6 +660,7 @@ export class SessionCoordinator {
       await this.resolveApprovalCard(pending, "cancel");
     }
     runtime.pendingApprovals.clear();
+    if (runtime.pendingInput) await this.withdrawPendingInput(runtime);
     await this.driver.interruptTurn(runtime.session.id);
     this.store.audit({ eventType: "turn.stopped", summary: `Stop requested from ${source}`, sessionId: runtime.session.id, turnId: runtime.turnId });
     await this.flushStatus(runtime.session.id, true);
@@ -640,6 +668,7 @@ export class SessionCoordinator {
 
   private async completeRuntime(runtime: RuntimeTurn, status: "completed" | "stopped"): Promise<void> {
     for (const pending of runtime.pendingApprovals.values()) clearTimeout(pending.expiryTimer);
+    if (runtime.pendingInput) await this.withdrawPendingInput(runtime);
     runtime.phase = "completed"; runtime.safeSummary ||= status === "stopped" ? "Turn stopped." : "Turn completed."; runtime.dirty = false;
     this.store.updateTurn(runtime.turnId, { state: "completed", safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary, completed: true });
     this.store.addMilestone(runtime.session.id, runtime.turnId, "turn.completed", { status, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary });
@@ -657,6 +686,7 @@ export class SessionCoordinator {
 
   private async failRuntime(runtime: RuntimeTurn, error: string): Promise<void> {
     for (const pending of runtime.pendingApprovals.values()) clearTimeout(pending.expiryTimer);
+    if (runtime.pendingInput) await this.withdrawPendingInput(runtime);
     runtime.phase = "failed"; runtime.safeSummary = redact(error, this.redactions).slice(0, 1_500); runtime.dirty = false;
     this.store.updateTurn(runtime.turnId, { state: "failed", safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary, completed: true });
     this.store.addMilestone(runtime.session.id, runtime.turnId, "turn.failed", { error: runtime.safeSummary });
@@ -937,6 +967,24 @@ export class SessionCoordinator {
     }
   }
 
+  private async resolveQuestionCard(state: PendingQuestionState, resolution: QuestionResolutionView): Promise<void> {
+    if (!state.ref) return;
+    const payload = { ref: state.ref, resolution };
+    await this.safeSend("question.update", payload, () => this.messaging.updateQuestion(state.ref!, resolution), payload, `question:${state.view.requestId}:${state.question.id}:resolution`);
+  }
+
+  private async withdrawPendingInput(runtime: RuntimeTurn): Promise<void> {
+    const pending = runtime.pendingInput;
+    if (!pending) return;
+    const resolvedAt = Date.now();
+    for (const state of pending.questions) {
+      if (!(state.question.id in pending.answers)) {
+        await this.resolveQuestionCard(state, { title: state.view.title, question: state.view.question, status: "withdrawn", resolvedAt });
+      }
+    }
+    if (runtime.pendingInput === pending) delete runtime.pendingInput;
+  }
+
   private makeRuntime(session: StoredSession, project: Project, turnId: string, phase: TurnPhase, startedAt: number, safeSummary: string): RuntimeTurn {
     const expiresAt = Date.now() + 14 * 86_400_000;
     return {
@@ -1049,7 +1097,17 @@ export class SessionCoordinator {
       case "result": await this.messaging.sendResult(payload as unknown as TurnResultView); break;
       case "result.update": { const value = payload as unknown as { ref: MessageRef; view: TurnResultView }; await this.messaging.updateResult(value.ref, value.view); break; }
       case "choices": await this.messaging.sendChoices(payload as unknown as ChoiceView); break;
-      case "question": await this.messaging.sendQuestion(payload as unknown as QuestionView); break;
+      case "question": {
+        const view = payload as unknown as QuestionView;
+        const runtime = this.runtimes.get(view.sessionId);
+        const state = runtime?.pendingInput?.requestId === view.requestId
+          ? runtime.pendingInput.questions.find((item) => item.question.id === view.questionId)
+          : undefined;
+        if (!state || runtime?.turnId !== view.turnId) break;
+        state.ref = await this.messaging.sendQuestion(view);
+        break;
+      }
+      case "question.update": { const value = payload as unknown as { ref: MessageRef; resolution: QuestionResolutionView }; await this.messaging.updateQuestion(value.ref, value.resolution); break; }
       case "output": {
         if ("content" in payload) await this.messaging.sendOutput(payload as unknown as OutputView);
         else await this.messaging.sendOutput(await this.makeOutputView(payload["actionKind"] as "logs.show" | "diff.show", String(payload["sessionId"]), String(payload["turnId"]), Number(payload["page"] ?? 1)));

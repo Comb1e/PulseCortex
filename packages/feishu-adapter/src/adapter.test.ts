@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CardActionEvent, NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import { ControllerStore } from "@pulsecortex/persistence";
 import { FeishuAdapter } from "./adapter.js";
-import { approvalCard, choiceCard, resolvedApprovalCard, statusCard } from "./cards.js";
+import { approvalCard, choiceCard, questionCard, resolvedApprovalCard, resolvedQuestionCard, statusCard } from "./cards.js";
 
 const stores: ControllerStore[] = [];
 afterEach(() => { while (stores.length) stores.pop()?.close(); });
@@ -37,6 +37,22 @@ describe("Feishu inbound contract", () => {
     const handler = vi.fn(); adapter.onAction(handler);
     const action = { messageId: "message", chatId: "chat", operator: { openId: "owner" }, action: { tag: "button", value: { kind: "turn.stop", token: "signed" } }, raw: { token: "event-token" } } as CardActionEvent;
     await adapter.acceptAction(action); await adapter.acceptAction(action);
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("normalizes raw form values and rejects malformed fields", async () => {
+    const db = store();
+    const { code } = db.createPairingCode();
+    db.consumePairingCode(code, { tenantId: "tenant", userId: "owner" });
+    db.setOwnerChat({ tenantId: "tenant", userId: "owner" }, "chat");
+    const adapter = new FeishuAdapter({ appId: "id", appSecret: "secret", store: db, channel });
+    const handler = vi.fn(); adapter.onAction(handler);
+    const base = { messageId: "message", chatId: "chat", operator: { openId: "owner" }, action: { tag: "button", value: { kind: "input.answer", token: "signed" } }, raw: { token: "form-event", header: { tenant_key: "tenant" }, action: { form_value: { choice: "2", note: "hello" } } } } as unknown as CardActionEvent;
+    await adapter.acceptAction(base);
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ formValues: { choice: "2", note: "hello" } }));
+
+    const malformed = { messageId: "message", chatId: "chat", operator: { openId: "owner" }, action: { tag: "button", value: { kind: "input.answer", token: "signed" } }, raw: { token: "bad-form-event", header: { tenant_key: "tenant" }, action: { form_value: { choice: 2 } } } } as unknown as CardActionEvent;
+    await adapter.acceptAction(malformed);
     expect(handler).toHaveBeenCalledOnce();
   });
 });
@@ -83,6 +99,36 @@ describe("Feishu card rendering", () => {
     const autoApproved = JSON.stringify(resolvedApprovalCard({ title: "Command approval requested", decision: "acceptForSession", resolvedAt: 1 }));
     expect(autoApproved).toContain("Auto approve enabled");
     expect(autoApproved).not.toContain('"tag":"button"');
+  });
+
+  it("renders complete question forms and static resolutions", () => {
+    const view = { sessionId: "s", turnId: "t", requestId: "r", questionId: "q", title: "Question", question: "A complete question with all source text", options: Array.from({ length: 10 }, (_, index) => ({ label: `Option ${index}`, description: `Description ${index}` })), freeformAccepted: true, submissionToken: "secret-token" } as const;
+    const card = questionCard(view);
+    const json = JSON.stringify(card);
+    expect(json).toContain("Option 9");
+    expect(json).toContain("Description 9");
+    expect(json).toContain('"text_size":"notation"');
+    expect(json).toContain('"tag":"form"');
+    expect(json).toContain('"action_type":"form_submit"');
+    expect(json).toContain("secret-token");
+    expect(JSON.stringify(resolvedQuestionCard({ title: "Question", question: view.question, status: "selected", answer: "Option 9", note: "Context", resolvedAt: 1 }))).not.toContain('"tag":"button"');
+    expect(JSON.stringify(resolvedQuestionCard({ title: "Question", question: view.question, status: "withdrawn", resolvedAt: 1 }))).not.toContain('"tag":"form"');
+  });
+
+  it("returns question references and omits submission tokens from outbound reports", async () => {
+    const db = store();
+    const { code } = db.createPairingCode();
+    db.consumePairingCode(code, { tenantId: "tenant", userId: "owner" });
+    db.setOwnerChat({ tenantId: "tenant", userId: "owner" }, "chat");
+    const outbound: unknown[] = [];
+    const updateCard = vi.fn().mockResolvedValue(undefined);
+    const adapter = new FeishuAdapter({ appId: "id", appSecret: "secret", store: db, channel: { ...channel, send: vi.fn().mockResolvedValue({ messageId: "question-message" }), updateCard }, onOutboundMessage: (message) => outbound.push(message) });
+    const view = { sessionId: "s", turnId: "t", requestId: "r", questionId: "q", title: "Question", question: "Choose", options: [{ label: "A" }], freeformAccepted: false, submissionToken: "secret-token" };
+    const ref = await adapter.sendQuestion(view);
+    await adapter.updateQuestion(ref, { title: "Question", question: "Choose", status: "selected", answer: "A", resolvedAt: 1 });
+    expect(ref).toEqual({ messageId: "question-message", chatId: "chat" });
+    expect(JSON.stringify(outbound)).not.toContain("secret-token");
+    expect(updateCard).toHaveBeenCalledWith("question-message", expect.any(Object));
   });
 
   it("recalls a resolved approval so the working card returns to the bottom", async () => {

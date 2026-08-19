@@ -138,10 +138,21 @@ export interface QuestionView {
   sessionId: SessionId;
   turnId: TurnId;
   requestId: string;
+  questionId: string;
   title: string;
   question: string;
-  options: Array<{ label: string; description?: string; token: string; value: string }>;
+  options: Array<{ label: string; description?: string }>;
   freeformAccepted: boolean;
+  submissionToken: string;
+}
+
+export interface QuestionResolutionView {
+  title: string;
+  question: string;
+  status: "selected" | "custom" | "withdrawn";
+  answer?: string;
+  note?: string;
+  resolvedAt: number;
 }
 
 export interface OutputView {
@@ -204,6 +215,7 @@ export interface ChannelAction {
   kind: ChannelActionKind;
   token: string;
   value?: string;
+  formValues?: Record<string, string>;
   receivedAt: number;
 }
 

@@ -2,9 +2,9 @@ import {
   Domain, LoggerLevel, createLarkChannel,
   type CardActionEvent, type LarkChannel, type LarkChannelError, type NormalizedMessage,
 } from "@larksuiteoapi/node-sdk";
-import { parseCommand, redact, type ChannelAction, type ChannelCommand, type MessagingAdapter, type MessageRef, type ApprovalResolutionView, type ApprovalView, type ChoiceView, type OutputView, type QuestionView, type SessionView, type TurnResultView } from "@pulsecortex/domain";
+import { parseCommand, redact, type ChannelAction, type ChannelCommand, type MessagingAdapter, type MessageRef, type ApprovalResolutionView, type ApprovalView, type ChoiceView, type OutputView, type QuestionResolutionView, type QuestionView, type SessionView, type TurnResultView } from "@pulsecortex/domain";
 import type { ControllerStore } from "@pulsecortex/persistence";
-import { approvalCard, choiceCard, outputCard, questionCard, resolvedApprovalCard, resultCard, statusCard } from "./cards.js";
+import { approvalCard, choiceCard, outputCard, questionCard, resolvedApprovalCard, resolvedQuestionCard, resultCard, statusCard } from "./cards.js";
 
 interface ChannelLike {
   connect(): Promise<void>;
@@ -37,7 +37,7 @@ export interface FeishuOutboundMessage {
 }
 
 type RawMessage = { sender?: { tenant_key?: string } };
-type RawAction = { token?: string; header?: { event_id?: string; tenant_key?: string } };
+type RawAction = { token?: string; header?: { event_id?: string; tenant_key?: string }; action?: { form_value?: unknown } };
 
 function tenantFromMessage(message: NormalizedMessage): string {
   return (message.raw as RawMessage | undefined)?.sender?.tenant_key ?? "unknown-tenant";
@@ -45,6 +45,20 @@ function tenantFromMessage(message: NormalizedMessage): string {
 
 function actionValue(event: CardActionEvent): { kind?: string; token?: string; value?: string } {
   return event.action.value && typeof event.action.value === "object" ? event.action.value as { kind?: string; token?: string; value?: string } : {};
+}
+
+function formValues(event: CardActionEvent): Record<string, string> | null | undefined {
+  const value = (event.raw as RawAction | undefined)?.action?.form_value;
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const entries = Object.entries(value);
+  if (entries.length > 20) return null;
+  const normalized: Record<string, string> = {};
+  for (const [key, fieldValue] of entries) {
+    if (!key || key.length > 64 || typeof fieldValue !== "string" || fieldValue.length > 4_000) return null;
+    normalized[key] = fieldValue;
+  }
+  return normalized;
 }
 
 function eventIdForAction(event: CardActionEvent): string {
@@ -138,7 +152,12 @@ export class FeishuAdapter implements MessagingAdapter {
     }
     const value = actionValue(event);
     if (!value.kind || !value.token) return;
-    const action = { eventId, actor, kind: value.kind as ChannelAction["kind"], token: value.token, ...(value.value === undefined ? {} : { value: value.value }), receivedAt: Date.now() } as ChannelAction;
+    const normalizedFormValues = formValues(event);
+    if (normalizedFormValues === null) {
+      this.options.store.audit({ eventType: "action.rejected", summary: "Malformed card form values rejected", actor });
+      return;
+    }
+    const action = { eventId, actor, kind: value.kind as ChannelAction["kind"], token: value.token, ...(value.value === undefined ? {} : { value: value.value }), ...(normalizedFormValues === undefined ? {} : { formValues: normalizedFormValues }), receivedAt: Date.now() } as ChannelAction;
     void Promise.resolve(this.actionHandler?.(action)).catch((error) => this.options.store.audit({ eventType: "handler.failed", summary: redact((error as Error).message).slice(0, 500), actor }));
   }
 
@@ -184,10 +203,15 @@ export class FeishuAdapter implements MessagingAdapter {
     const content = { ...safeView, choices: view.choices.map(({ token: ___, value: ____, ...choice }) => choice) };
     this.reportOutbound({ kind: "choices", operation: "send", ...ref, content });
   }
-  async sendQuestion(view: QuestionView): Promise<void> {
+  async sendQuestion(view: QuestionView): Promise<MessageRef> {
     const ref = await this.sendCard(questionCard(view));
-    const content = { ...view, options: view.options.map(({ token: _, value: __, ...option }) => option) };
+    const { submissionToken: _, ...content } = view;
     this.reportOutbound({ kind: "question", operation: "send", ...ref, content });
+    return ref;
+  }
+  async updateQuestion(ref: MessageRef, resolution: QuestionResolutionView): Promise<void> {
+    await retryTransient(() => this.channel.updateCard(ref.messageId, resolvedQuestionCard(resolution)));
+    this.reportOutbound({ kind: "question", operation: "update", ...ref, content: resolution });
   }
   async sendOutput(view: OutputView): Promise<void> {
     const ref = await this.sendCard(outputCard(view));

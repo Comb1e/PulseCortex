@@ -1,4 +1,4 @@
-import type { ApprovalResolutionView, ApprovalView, ChoiceView, OutputView, QuestionView, SessionView, TurnResultView } from "@pulsecortex/domain";
+import type { ApprovalResolutionView, ApprovalView, ChoiceView, OutputView, QuestionResolutionView, QuestionView, SessionView, TurnResultView } from "@pulsecortex/domain";
 import { redact } from "@pulsecortex/domain";
 
 type Card = Record<string, unknown>;
@@ -123,9 +123,58 @@ export function choiceCard(view: ChoiceView): Card {
 
 export function questionCard(view: QuestionView): Card {
   const elements: Card[] = [markdown(escapeMarkdown(view.question))];
-  if (view.options.length) elements.push(buttonRow(view.options.slice(0, 8).map((option) => button(option.label, "input.answer", option.token, option.value, "primary"))));
+  for (const option of view.options) {
+    elements.push({ tag: "hr" }, markdown(`**${escapeMarkdown(option.label)}**`));
+    if (option.description) {
+      elements.push({ tag: "markdown", content: escapeMarkdown(option.description), text_size: "notation" });
+    }
+  }
+  elements.push({
+    tag: "form",
+    name: "question_answer",
+    elements: [
+      {
+        tag: "select_static",
+        name: "choice",
+        required: true,
+        width: "fill",
+        placeholder: { tag: "plain_text", content: "Select an answer" },
+        options: view.options.map((option, index) => ({ text: { tag: "plain_text", content: redact(option.label) }, value: String(index) })),
+      },
+      {
+        tag: "input",
+        name: "note",
+        input_type: "multiline_text",
+        required: false,
+        width: "fill",
+        rows: 3,
+        label: { tag: "plain_text", content: "Note (optional)" },
+        placeholder: { tag: "plain_text", content: "Add context" },
+      },
+      {
+        tag: "button",
+        name: "submit",
+        text: { tag: "plain_text", content: "Submit" },
+        type: "primary",
+        width: "fill",
+        action_type: "form_submit",
+        behaviors: [{ type: "callback", value: { kind: "input.answer", token: view.submissionToken } }],
+      },
+    ],
+  });
   if (view.freeformAccepted) elements.push(markdown("Reply in this direct chat with your answer."));
   return baseCard(view.title, elements, "purple");
+}
+
+export function resolvedQuestionCard(view: QuestionResolutionView): Card {
+  const elements: Card[] = [markdown(escapeMarkdown(view.question)), { tag: "hr" }];
+  if (view.status === "withdrawn") {
+    elements.push(markdown(`**Status:** Withdrawn\n**Resolved:** ${new Date(view.resolvedAt).toISOString()}`));
+    return baseCard(view.title, elements, "grey");
+  }
+  const answerLabel = view.status === "custom" ? "Custom answer" : "Selected";
+  elements.push(markdown(`**${answerLabel}:** ${escapeMarkdown(view.answer ?? "")}${view.note ? `\n\n**Note:** ${escapeMarkdown(view.note)}` : ""}\n\n**Resolved:** ${new Date(view.resolvedAt).toISOString()}`));
+  return baseCard(view.title, elements, "green");
 }
 
 export function outputCard(view: OutputView): Card {

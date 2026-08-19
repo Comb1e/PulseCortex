@@ -3,13 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import pino from "pino";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentCapabilities, AgentDriver, AgentEvent, AgentInstructionPreset, AgentSessionInfo, ApprovalId, ApprovalResolutionView, ApprovalView, ChannelAction, ChannelCommand, ChoiceView, MessageRef, MessagingAdapter, OutputView, Project, QuestionView, ResumeSessionOptions, SessionId, SessionOptions, SessionView, TurnId, TurnResultView, Unsubscribe } from "@pulsecortex/domain";
+import type { AgentCapabilities, AgentDriver, AgentEvent, AgentInstructionPreset, AgentSessionInfo, ApprovalId, ApprovalResolutionView, ApprovalView, ChannelAction, ChannelCommand, ChoiceView, MessageRef, MessagingAdapter, OutputView, Project, QuestionResolutionView, QuestionView, ResumeSessionOptions, SessionId, SessionOptions, SessionView, TurnId, TurnResultView, Unsubscribe } from "@pulsecortex/domain";
 import { CommandLogStore, ControllerStore } from "@pulsecortex/persistence";
 import { SessionCoordinator } from "./coordinator.js";
 
 class FakeDriver implements AgentDriver {
   handlers = new Set<(event: AgentEvent) => void>();
   decisions: Array<{ id: string; decision: string }> = [];
+  resolvedInputs: Array<{ id: string; answers: Record<string, string> }> = [];
   resumed: Array<{ id: SessionId; project: Project; options: ResumeSessionOptions }> = [];
   started: Array<{ id: SessionId; prompt: string }> = [];
   steered: Array<{ id: SessionId; text: string }> = [];
@@ -33,7 +34,7 @@ class FakeDriver implements AgentDriver {
   async steerTurn(id: SessionId, text: string): Promise<void> { this.steered.push({ id, text }); }
   async interruptTurn(_id: SessionId): Promise<void> {}
   async resolveApproval(id: ApprovalId, decision: "accept" | "acceptForSession" | "decline" | "cancel"): Promise<void> { this.decisions.push({ id, decision }); }
-  async resolveInput(_id: string, _answers: Record<string, string>): Promise<void> {}
+  async resolveInput(id: string, answers: Record<string, string>): Promise<void> { this.resolvedInputs.push({ id, answers }); }
   subscribe(handler: (event: AgentEvent) => void): Unsubscribe { this.handlers.add(handler); return () => this.handlers.delete(handler); }
   emit(event: AgentEvent): void { for (const handler of this.handlers) handler(event); }
 }
@@ -50,6 +51,9 @@ class FakeMessaging implements MessagingAdapter {
   results: TurnResultView[] = [];
   resultUpdateRefs: MessageRef[] = [];
   outputs: OutputView[] = [];
+  questions: QuestionView[] = [];
+  questionUpdates: Array<{ ref: MessageRef; resolution: QuestionResolutionView }> = [];
+  failQuestionUpdate = false;
   texts: string[] = [];
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
@@ -61,7 +65,8 @@ class FakeMessaging implements MessagingAdapter {
   async sendResult(view: TurnResultView): Promise<void> { this.results.push(view); }
   async updateResult(ref: MessageRef, view: TurnResultView): Promise<void> { this.resultUpdateRefs.push(ref); this.results.push(view); }
   async sendChoices(view: ChoiceView): Promise<void> { this.choices.push(view); }
-  async sendQuestion(_view: QuestionView): Promise<void> {}
+  async sendQuestion(view: QuestionView): Promise<MessageRef> { this.questions.push(view); return { messageId: `question-${this.questions.length}`, chatId: "chat" }; }
+  async updateQuestion(ref: MessageRef, resolution: QuestionResolutionView): Promise<void> { if (this.failQuestionUpdate) { this.failQuestionUpdate = false; throw new Error("temporary card failure"); } this.questionUpdates.push({ ref, resolution }); }
   async sendOutput(view: OutputView): Promise<void> { this.outputs.push(view); }
   async sendText(text: string): Promise<void> { this.texts.push(text); }
   onCommand(handler: (command: ChannelCommand) => Promise<void>): void { this.command = handler; }
@@ -73,6 +78,63 @@ const coordinators: SessionCoordinator[] = [];
 afterEach(async () => { while (coordinators.length) await coordinators.pop()?.stop(); while (stores.length) stores.pop()?.close(); });
 
 describe("session coordinator", () => {
+  it("submits a question choice with an optional note and resolves the card", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId); db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "answer a question", receivedAt: Date.now() });
+    driver.emit({ type: "input.requested", sessionId: "session", turnId: "turn", requestId: "request", questions: [{ id: "q1", header: "Choose", question: "Which?", options: [{ label: "First", description: "Detailed first" }, { label: "Second" }], allowFreeform: false }], occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.questions).toHaveLength(1));
+    const question = messaging.questions[0]!;
+    await messaging.action!({ eventId: "answer", actor, kind: "input.answer", token: question.submissionToken, formValues: { choice: "1", note: "  extra context  " }, receivedAt: Date.now() });
+    await vi.waitFor(() => expect(driver.resolvedInputs).toHaveLength(1));
+    expect(driver.resolvedInputs[0]).toEqual({ id: "request", answers: { q1: "Second\n\nNote: extra context" } });
+    expect(messaging.questionUpdates[0]).toMatchObject({ ref: { messageId: "question-1" }, resolution: { status: "selected", answer: "Second", note: "extra context" } });
+  });
+
+  it("waits for every question and preserves direct-chat freeform answers", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId); db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "answer questions", receivedAt: Date.now() });
+    driver.emit({ type: "input.requested", sessionId: "session", turnId: "turn", requestId: "request", questions: [{ id: "q1", header: "One", question: "First?", options: [{ label: "A" }], allowFreeform: true }, { id: "q2", header: "Two", question: "Second?", options: [{ label: "B" }], allowFreeform: false }], occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.questions).toHaveLength(2));
+    await messaging.command!({ eventId: "freeform", messageId: "freeform", actor, name: "text", args: [], text: "custom answer", receivedAt: Date.now() });
+    expect(driver.resolvedInputs).toHaveLength(0);
+    await messaging.action!({ eventId: "choice", actor, kind: "input.answer", token: messaging.questions[1]!.submissionToken, formValues: { choice: "0" }, receivedAt: Date.now() });
+    await vi.waitFor(() => expect(driver.resolvedInputs).toHaveLength(1));
+    expect(driver.resolvedInputs[0]).toEqual({ id: "request", answers: { q1: "custom answer", q2: "B" } });
+    expect(messaging.questionUpdates.map(({ resolution }) => resolution.status)).toEqual(["custom", "selected"]);
+  });
+
+  it("queues a failed card replacement without blocking the driver", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId); db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging(); messaging.failQuestionUpdate = true;
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "answer", receivedAt: Date.now() });
+    driver.emit({ type: "input.requested", sessionId: "session", turnId: "turn", requestId: "request", questions: [{ id: "q1", header: "Choose", question: "Which?", options: [{ label: "A" }], allowFreeform: false }], occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.questions).toHaveLength(1));
+    const question = messaging.questions[0]!;
+    await messaging.action!({ eventId: "good", actor, kind: "input.answer", token: question.submissionToken, formValues: { choice: "0" }, receivedAt: Date.now() });
+    await vi.waitFor(() => expect(driver.resolvedInputs).toHaveLength(1));
+    expect(db.inspectTable("delivery_queue").some((row) => row["kind"] === "question.update")).toBe(true);
+  });
+
   it("starts an allowlisted turn and consumes an owner-bound approval only once", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();

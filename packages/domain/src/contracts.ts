@@ -17,6 +17,7 @@ import type {
   ResumeSessionOptions,
   SessionView,
   QuestionView,
+  QuestionResolutionView,
   TurnId,
   TurnResultView,
   Unsubscribe,
@@ -34,7 +35,8 @@ export interface MessagingAdapter {
   sendResult(result: TurnResultView): Promise<void>;
   updateResult(ref: MessageRef, result: TurnResultView): Promise<void>;
   sendChoices(view: ChoiceView): Promise<void>;
-  sendQuestion(view: QuestionView): Promise<void>;
+  sendQuestion(view: QuestionView): Promise<MessageRef>;
+  updateQuestion(ref: MessageRef, resolution: QuestionResolutionView): Promise<void>;
   sendOutput(view: OutputView): Promise<void>;
   sendText(text: string): Promise<void>;
   onCommand(handler: (command: ChannelCommand) => Promise<void>): void;
