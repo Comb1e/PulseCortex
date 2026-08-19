@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/feishu-adapter",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Feishu transport, cards, and message normalization for PulseCortex",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/Comb1e/PulseCortex.git", "directory": "packages/feishu-adapter" },

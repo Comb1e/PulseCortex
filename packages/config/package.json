@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/config",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Validated PulseCortex configuration and environment loading",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/Comb1e/PulseCortex.git", "directory": "packages/config" },
