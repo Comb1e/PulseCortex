@@ -774,6 +774,7 @@ describe("session coordinator", () => {
     await messaging.action!({ eventId: "select-session", actor, kind: "session.select", token: messaging.choices[0]!.choices[0]!.token, receivedAt: Date.now() });
     await messaging.command!({ eventId: "instructions", messageId: "instructions", actor, name: "instructions", args: [], text: "/instructions", receivedAt: Date.now() });
 
+    expect(messaging.texts.at(-1)).toContain("/compact - summarize the chat and free context");
     const presetCard = messaging.choices.at(-1)!;
     expect(presetCard).toMatchObject({ title: "Choose Codex instructions", actionKind: "instructions.select" });
     expect(presetCard.choices.map((choice) => choice.label)).toEqual(["Plan", "Default"]);
@@ -797,7 +798,8 @@ describe("session coordinator", () => {
 
     expect(db.getSession("session")?.projectId).toBe(project.id);
     expect(driver.started).toHaveLength(0);
-    expect(messaging.texts).toHaveLength(0);
+    expect(messaging.texts).toHaveLength(1);
+    expect(messaging.texts[0]).toContain("/init - create an AGENTS.md scaffold");
     expect(messaging.choices.at(-1)).toMatchObject({ title: "Choose Codex instructions", actionKind: "instructions.select" });
     expect(messaging.choices.at(-1)?.description).toContain("New repo task");
   });
@@ -821,7 +823,8 @@ describe("session coordinator", () => {
     await messaging.command!({ eventId: "instructions", messageId: "instructions", actor, name: "instructions", args: [], text: "/instructions", receivedAt: Date.now() });
 
     expect(db.getSession("session")?.projectId).toBe(project.id);
-    expect(messaging.texts).toHaveLength(0);
+    expect(messaging.texts).toHaveLength(1);
+    expect(messaging.texts[0]).toContain("/compact - summarize the chat and free context");
     expect(messaging.choices.at(-1)).toMatchObject({
       title: "Choose Codex instructions",
       description: expect.stringContaining("New repo task"),
@@ -847,7 +850,8 @@ describe("session coordinator", () => {
 
     expect(db.getSession("session")?.projectId).toBe(second.id);
     expect(messaging.choices.at(-1)).toMatchObject({ title: "Choose Codex instructions", actionKind: "instructions.select" });
-    expect(messaging.texts).toHaveLength(0);
+    expect(messaging.texts).toHaveLength(2);
+    expect(messaging.texts.every((text) => text.includes("/init - create an AGENTS.md scaffold"))).toBe(true);
   });
 
   it("reports a session owned by another Codex runtime instead of failing silently", async () => {

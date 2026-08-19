@@ -75,11 +75,74 @@ interface SessionRefreshResult {
 type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "approval.remove" | "result" | "result.update" | "choices" | "question" | "output";
 const SESSION_DISCOVERY_INTERVAL_MS = 2_000;
 
+const CODEX_BUILTIN_COMMANDS = [
+  ["/init", "create an AGENTS.md scaffold"],
+  ["/compact", "summarize the chat and free context"],
+  ["/status", "show session configuration and usage"],
+  ["/permissions", "configure approval permissions"],
+  ["/ide", "include IDE context"],
+  ["/keymap", "configure keyboard shortcuts"],
+  ["/vim", "toggle Vim editing mode"],
+  ["/setup-default-sandbox", "set up the Windows sandbox"],
+  ["/sandbox-add-read-dir", "grant sandbox read access"],
+  ["/agent", "switch the active agent"],
+  ["/subagents", "switch the active agent"],
+  ["/apps", "browse connected apps"],
+  ["/plugins", "browse and manage plugins"],
+  ["/hooks", "inspect lifecycle hooks"],
+  ["/clear", "start a fresh chat"],
+  ["/rename", "rename the current chat"],
+  ["/archive", "archive the current session"],
+  ["/delete", "delete the current session"],
+  ["/copy", "copy the latest response"],
+  ["/exit", "exit Codex"],
+  ["/quit", "exit Codex"],
+  ["/experimental", "toggle experimental features"],
+  ["/approve", "retry a denied action"],
+  ["/memories", "configure memory use"],
+  ["/skills", "browse and use skills"],
+  ["/import", "import Claude Code or Cursor artifacts"],
+  ["/feedback", "send diagnostics to Codex"],
+  ["/logout", "clear local Codex credentials"],
+  ["/mcp", "list MCP servers and tools"],
+  ["/mention", "attach a file or directory"],
+  ["/model", "select the model and reasoning effort"],
+  ["/fast", "toggle the Fast service tier"],
+  ["/personality", "select a communication style"],
+  ["/goal", "manage the persistent task goal"],
+  ["/ps", "show background terminals"],
+  ["/clean", "stop background terminals"],
+  ["/app", "continue the session in the desktop app"],
+  ["/side", "start a temporary side chat"],
+  ["/btw", "start a temporary side chat"],
+  ["/raw", "toggle raw scrollback mode"],
+  ["/new", "start a new chat"],
+  ["/resume", "resume a saved chat"],
+  ["/review", "review the current working tree"],
+  ["/usage", "inspect token usage and rate limits"],
+  ["/debug-config", "show configuration diagnostics"],
+  ["/statusline", "configure status-line fields"],
+  ["/title", "configure terminal title fields"],
+  ["/theme", "select a syntax-highlighting theme"],
+  ["/pets", "select or hide a terminal pet"],
+  ["/pet", "select or hide a terminal pet"],
+  ["/fork", "fork the current chat"],
+  ["/plan", "enter plan mode"],
+  ["/diff", "show Git changes"],
+] as const;
+
+function codexBuiltinCommandText(): string {
+  return [
+    "Codex built-in commands:",
+    ...CODEX_BUILTIN_COMMANDS.map(([command, description]) => `${command} - ${description}`),
+  ].join("\n");
+}
+
 const HELP = `PulseCortex commands:
 /projects - choose a locally registered project
 /new [task] - create a Codex session in the chosen project (or use /new <project> [task])
 /sessions - discover and select allowlisted Codex sessions
-/instructions - choose Codex's built-in instructions for the selected session
+/instructions - show Codex built-in commands and choose instructions for the selected session
 /resume [session-id] - resume a session
 /send <message> - message the selected session, or create one if none is selected
 /send <session-id> <message> - message a specific session
@@ -89,7 +152,9 @@ const HELP = `PulseCortex commands:
 /diff - show the current unified diff
 /help - show this help
 
-Ordinary direct messages start work or steer the selected session.`;
+Ordinary direct messages start work or steer the selected session.
+
+${codexBuiltinCommandText()}`;
 
 export class SessionCoordinator {
   private readonly runtimes = new Map<string, RuntimeTurn>();
@@ -680,6 +745,7 @@ export class SessionCoordinator {
   }
 
   private async sendInstructionChoices(): Promise<void> {
+    await this.safeSend("text", codexBuiltinCommandText(), () => this.messaging.sendText(codexBuiltinCommandText()));
     await this.refreshSessions();
     let session = this.selectedSession;
     if (!session) {
