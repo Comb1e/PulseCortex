@@ -421,7 +421,24 @@ describe("session coordinator", () => {
 
     await coordinator.notifyStartup();
 
-    expect(messaging.texts).toEqual(["PulseCortex started and is ready to receive Feishu messages."]);
+    expect(messaging.texts).toEqual(["PulseCortex started and is ready to receive Feishu messages.\nDefault project: none."]);
+  });
+
+  it("includes the default project in the startup announcement", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    const project = db.addProject("remembered", await mkdtemp(path.join(os.tmpdir(), "pulse-project-")));
+    db.setLocalSetting("defaultProject", project.name);
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, new FakeDriver(), messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await coordinator.notifyStartup();
+
+    expect(messaging.texts).toEqual(["PulseCortex started and is ready to receive Feishu messages.\nDefault project: remembered."]);
   });
 
   it("restores the last project and uses it for the first task after startup", async () => {

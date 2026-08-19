@@ -146,7 +146,7 @@ export class SessionCoordinator {
   }
 
   async notifyStartup(): Promise<void> {
-    const message = "PulseCortex started and is ready to receive Feishu messages.";
+    const message = `PulseCortex started and is ready to receive Feishu messages.\nDefault project: ${this.selectedProject()?.name ?? "none"}.`;
     await this.safeSend("text", message, () => this.messaging.sendText(message));
   }
 
