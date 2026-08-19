@@ -29,8 +29,9 @@ git tag -a v0.1.0 -m "Release v0.1.0"
 git push origin v0.1.0
 ```
 
-The `publish` workflow installs from the lockfile, checks that every version
-matches the tag, runs typecheck/tests/build, and then runs:
+The `publish` workflow is intentionally triggered only by a pushed `v*` tag.
+It installs from the lockfile, checks that every version matches the tag, runs
+typecheck/tests/build, and then runs:
 
 ```bash
 pnpm publish -r --access public --provenance --no-git-checks
