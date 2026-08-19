@@ -112,6 +112,21 @@ describe("daemon logger", () => {
     expect(terminal.writeCount()).toBe(2);
   });
 
+  it("replaces a status entry after recent commands reach the retention limit", () => {
+    const terminal = new TerminalScreen(120, 25);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+    const content = { sessionId: "session-1", turnId: "turn-1", phase: "working", safeSummary: "Codex is working..." };
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { ...content, recentCommands: ["one", "two", "three", "four"], updatedAt: 1 } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { ...content, recentCommands: ["one", "two", "three", "four", "five"], updatedAt: 2 } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { ...content, recentCommands: ["two", "three", "four", "five", "six"], updatedAt: 3 } } }, "Feishu outbound message");
+
+    const output = terminal.text();
+    expect(output).not.toContain('"one"');
+    expect(output).toContain('"six"');
+    expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
+  });
+
   it("replaces a live message even when it is taller than the terminal", () => {
     const terminal = new TerminalScreen(40, 6);
     const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });

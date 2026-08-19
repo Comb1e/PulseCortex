@@ -38,23 +38,23 @@ function timestamp(value: unknown): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function formatField(key: string, value: unknown): string {
+function formatField(key: string, value: unknown, compact = false): string {
   let rendered: string;
   if (typeof value === "string") rendered = value;
   else if (value === undefined) rendered = "undefined";
-  else rendered = JSON.stringify(value, null, 2) ?? String(value);
+  else rendered = JSON.stringify(value, null, compact ? undefined : 2) ?? String(value);
   const lines = rendered.split("\n");
   if (lines.length === 1) return `  ${key}: ${lines[0]}`;
   return `  ${key}:\n${lines.map((line) => `    ${line}`).join("\n")}`;
 }
 
-export function formatLogRecord(record: Record<string, unknown>, color = false): string {
+export function formatLogRecord(record: Record<string, unknown>, color = false, compact = false): string {
   const level = LEVEL_NAMES[Number(record["level"])] ?? String(record["level"] ?? "LOG").toUpperCase();
   const time = timestamp(record["time"]);
   const levelText = level.padEnd(5);
   const prefix = color ? `${DIM}${time}${RESET} ${LEVEL_COLORS[level] ?? ""}${levelText}${RESET}` : `${time} ${levelText}`;
   const message = typeof record["msg"] === "string" && record["msg"] ? record["msg"] : "Log event";
-  const fields = Object.entries(record).filter(([key]) => !LOG_METADATA.has(key)).map(([key, value]) => formatField(key, value));
+  const fields = Object.entries(record).filter(([key]) => !LOG_METADATA.has(key)).map(([key, value]) => formatField(key, value, compact));
   return `${prefix} ${message}${fields.length ? `\n${fields.join("\n")}` : ""}\n`;
 }
 
@@ -262,7 +262,9 @@ class PrettyLogStream extends Writable {
   }
 
   private renderLiveRecord(record: Record<string, unknown>): { rendered: string; lines: number } {
-    return wrapForTerminal(formatLogRecord(record, false), this.terminalWidth());
+    const rendered = wrapForTerminal(formatLogRecord(record, false), this.terminalWidth());
+    if (rendered.lines < this.terminalRows()) return rendered;
+    return wrapForTerminal(formatLogRecord(record, false, true), this.terminalWidth());
   }
 
   private liveFooterLines(): number {
