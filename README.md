@@ -169,6 +169,8 @@ pnpm pulsectl service status
 
 See [Feishu setup](docs/feishu-setup.md), [operations](docs/operations.md), [security](docs/security.md), and [architecture](docs/architecture.md).
 
+Package maintainers: see [publishing](docs/publishing.md) for the GitHub Actions release workflow and npm setup.
+
 ## Remote Commands
 
 | Command | Behavior |

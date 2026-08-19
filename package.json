@@ -16,6 +16,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc -b --pretty false",
     "protocol:generate": "codex app-server generate-ts --out packages/codex-driver/src/generated --experimental",
+    "publish:packages": "pnpm publish -r --access public --provenance --no-git-checks",
     "start": "node packages/daemon/dist/main.js"
   },
   "dependencies": {
