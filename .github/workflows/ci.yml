@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-        node: [25.9.0]
+        node: [25.9.0, 26.x]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

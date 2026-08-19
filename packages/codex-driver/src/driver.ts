@@ -452,9 +452,12 @@ export class CodexAppServerDriver implements AgentDriver {
         this.clearPendingRequests(id, turnId);
         await this.transport.request("turn/interrupt", { threadId: id, turnId: response.turn.id }).catch(() => undefined);
         if (wasActive) {
-          this.eventBuffers.delete(id);
           this.emit({ type: "turn.failed", sessionId: id, turnId, error: (error as Error).message, occurredAt: now() });
         }
+        // A disconnect notification can fail the turn while startTurn is still
+        // waiting for its RPC response. Deliver the buffered failure before
+        // rejecting, otherwise the outer catch would discard it.
+        this.flushEventBuffer(id);
         throw error;
       }
       setImmediate(() => this.flushEventBuffer(id));
