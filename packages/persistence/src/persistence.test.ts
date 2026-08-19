@@ -60,7 +60,7 @@ describe("action token replay prevention", () => {
     const actor = { tenantId: "t", userId: "u" };
     const token = tokens.issue({ kind: "approval.accept", ...actor, sessionId: "s", turnId: "turn", requestId: "req", expiresAt: Date.now() - 1, payload: {} });
 
-    expect(tokens.consume(token, actor, "approval.accept", { allowExpired: true })?.requestId).toBe("req");
+    expect(tokens.consume(token, actor, "approval.accept")).toBeNull();
   });
 });
 

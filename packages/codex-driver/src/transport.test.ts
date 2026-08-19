@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
+import { codexEnvironment } from "./launcher.js";
 import { JsonlRpcTransport } from "./transport.js";
 
 const fixture = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../test/fixtures/fake-app-server.mjs");
@@ -10,6 +11,20 @@ interface TransportLifecycleAccess {
   generation: number;
   handleExit(generation: number, error: Error): void;
 }
+
+describe("Codex child environment", () => {
+  it("does not expose controller configuration or credentials", () => {
+    const environment = codexEnvironment({
+      PATH: "bin",
+      FEISHU_APP_ID: "app-id",
+      lark_app_secret: "secret",
+      PULSECORTEX_ACTION_SIGNING_KEY: "signing-key",
+      PULSECORTEX_ENV_FILE: "secret-file",
+    });
+
+    expect(environment).toEqual({ PATH: "bin" });
+  });
+});
 
 describe("Codex transport lifecycle", () => {
   it("stops the app-server process tree", async () => {

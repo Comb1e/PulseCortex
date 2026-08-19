@@ -38,6 +38,8 @@ interface PendingApprovalState {
   id: string;
   kind: ApprovalView["kind"];
   summary: string;
+  expiresAt: number;
+  expiryTimer: NodeJS.Timeout;
   ref?: MessageRef;
 }
 
@@ -172,6 +174,9 @@ export class SessionCoordinator {
     clearInterval(this.statusTimer);
     clearInterval(this.deliveryTimer);
     clearInterval(this.discoveryTimer);
+    for (const runtime of this.runtimes.values()) {
+      for (const pending of runtime.pendingApprovals.values()) clearTimeout(pending.expiryTimer);
+    }
     await Promise.all(this.statusFlushes.values());
   }
 
@@ -200,13 +205,11 @@ export class SessionCoordinator {
 
   async handleAction(action: ChannelAction): Promise<void> {
     if (!this.store.isOwner(action.actor)) return;
-    const allowExpiredApproval = action.kind === "approval.accept" || action.kind === "approval.acceptForSession" || action.kind === "approval.decline" || action.kind === "turn.stop";
-    const record = this.tokens.consume(action.token, action.actor, action.kind, { allowExpired: allowExpiredApproval });
+    const record = this.tokens.consume(action.token, action.actor, action.kind);
     if (!record) { this.store.audit({ eventType: "action.rejected", summary: `Stale, forged, or replayed action ${action.kind}`, actor: action.actor }); return; }
     this.store.audit({ eventType: "action.consumed", summary: action.kind, actor: action.actor, sessionId: record.sessionId, turnId: record.turnId });
     switch (action.kind) {
       case "approval.accept": await this.resolveApproval(record, "accept", action.actor); break;
-      case "approval.acceptForSession": await this.resolveApproval(record, "acceptForSession", action.actor); break;
       case "approval.decline": await this.resolveApproval(record, "decline", action.actor); break;
       case "turn.stop": await this.stopActiveTurn("action", record); break;
       case "logs.show": await this.sendPagedOutput("logs.show", record.sessionId, Number(record.payload["page"] ?? 1), record.turnId); break;
@@ -376,7 +379,7 @@ export class SessionCoordinator {
     const project = this.store.getProject(session.projectId);
     if (!project) throw new Error("Session project is no longer registered");
     this.rememberProject(project.id);
-    await this.driver.resumeSession(session.id, project);
+    await this.driver.resumeSession(session.id, project, { managed: session.botCreated });
     const turnId = await this.driver.startTurn(session.id, prompt);
     this.store.createTurn({ id: turnId, sessionId: session.id, prompt });
     const runtime = this.makeRuntime(session, project, turnId, "starting", Date.now(), "Codex is starting...");
@@ -418,6 +421,7 @@ export class SessionCoordinator {
   private async handleResolvedRequest(runtime: RuntimeTurn, requestId: string): Promise<void> {
     const approval = runtime.pendingApprovals.get(requestId);
     if (approval) {
+      clearTimeout(approval.expiryTimer);
       await this.resolveApprovalCard(approval, "cancel");
       runtime.pendingApprovals.delete(requestId);
     }
@@ -432,20 +436,23 @@ export class SessionCoordinator {
 
   private async handleApprovalEvent(runtime: RuntimeTurn, event: Extract<AgentEvent, { type: "approval.requested" }>): Promise<void> {
     runtime.phase = "awaiting_approval";
-    const pending: PendingApprovalState = { id: event.approvalId, kind: event.kind, summary: event.title };
+    const expiresAt = Date.now() + this.options.approvalTtlMs;
+    const expiryTimer = setTimeout(() => {
+      void this.expireApproval(runtime.session.id, runtime.turnId, event.approvalId).catch((error) => this.logger.warn({ sessionId: runtime.session.id, turnId: runtime.turnId, errorMessage: redact((error as Error).message, this.redactions) }, "Could not expire Codex approval"));
+    }, this.options.approvalTtlMs);
+    expiryTimer.unref();
+    const pending: PendingApprovalState = { id: event.approvalId, kind: event.kind, summary: event.title, expiresAt, expiryTimer };
     runtime.pendingApprovals.set(event.approvalId, pending);
     runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "awaiting_approval" });
     this.store.addMilestone(runtime.session.id, runtime.turnId, event.type, { approvalId: event.approvalId, kind: event.kind, title: event.title });
     this.store.audit({ eventType: "approval.requested", summary: `${event.kind}: ${event.title}`, sessionId: runtime.session.id, turnId: runtime.turnId });
     const owner = this.requireOwner();
-    const expiresAt = Date.now() + this.options.approvalTtlMs;
     const view: ApprovalView = {
       approvalId: event.approvalId, sessionId: runtime.session.id, turnId: runtime.turnId, kind: event.kind, title: event.title,
       ...(event.reason ? { reason: redact(event.reason, this.redactions) } : {}), ...(event.command ? { command: event.command } : {}), ...(event.files ? { files: event.files } : {}), ...(event.paths ? { paths: event.paths } : {}), ...(event.network ? { network: event.network } : {}),
       actionTokens: {
         accept: this.issueForOwner(owner, "approval.accept", runtime.session.id, runtime.turnId, event.approvalId, expiresAt, {}),
-        ...(event.kind === "command" && event.canAutoApprove === true ? { autoApprove: this.issueForOwner(owner, "approval.acceptForSession", runtime.session.id, runtime.turnId, event.approvalId, expiresAt, {}) } : {}),
         decline: this.issueForOwner(owner, "approval.decline", runtime.session.id, runtime.turnId, event.approvalId, expiresAt, {}),
         cancel: this.issueForOwner(owner, "turn.stop", runtime.session.id, runtime.turnId, event.approvalId, expiresAt, { approvalId: event.approvalId }),
       }, expiresAt,
@@ -457,26 +464,38 @@ export class SessionCoordinator {
     await this.flushStatus(runtime.session.id, true);
   }
 
-  private async resolveApproval(record: InteractionRecord, decision: "accept" | "acceptForSession" | "decline", actor: { tenantId: string; userId: string }): Promise<void> {
+  private async resolveApproval(record: InteractionRecord, decision: "accept" | "decline", actor: { tenantId: string; userId: string }): Promise<void> {
     const runtime = this.runtimes.get(record.sessionId);
     const pending = runtime?.pendingApprovals.get(record.requestId);
     if (!runtime || !pending || record.sessionId !== runtime.session.id || record.turnId !== runtime.turnId) return;
-    if (decision === "acceptForSession" && pending.kind !== "command") {
-      this.store.audit({ eventType: "approval.rejected", summary: "Auto approve is restricted to command requests", actor, sessionId: runtime.session.id, turnId: runtime.turnId });
-      return;
-    }
+    clearTimeout(pending.expiryTimer);
+    runtime.pendingApprovals.delete(record.requestId);
     await this.driver.resolveApproval(record.requestId, decision);
     await this.resolveApprovalCard(pending, decision);
-    runtime.pendingApprovals.delete(record.requestId);
     const pendingCount = runtime.pendingApprovals.size;
     runtime.phase = pendingCount ? "awaiting_approval" : "working";
     runtime.safeSummary = pendingCount
       ? `${pendingCount} approval request${pendingCount === 1 ? "" : "s"} still pending.`
-      : decision === "accept" ? "Approval granted once. Codex is continuing..." : decision === "acceptForSession" ? "Command auto approve enabled for this session. Codex is continuing..." : "Request denied. Codex is continuing...";
+      : decision === "accept" ? "Approval granted once. Codex is continuing..." : "Request denied. Codex is continuing...";
     runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: runtime.phase });
     this.store.audit({ eventType: "approval.decided", summary: decision, actor, sessionId: runtime.session.id, turnId: runtime.turnId });
     await this.flushStatus(runtime.session.id, true);
+  }
+
+  private async expireApproval(sessionId: string, turnId: string, approvalId: string): Promise<void> {
+    const runtime = this.runtimes.get(sessionId);
+    const pending = runtime?.pendingApprovals.get(approvalId);
+    if (!runtime || !pending || runtime.turnId !== turnId || pending.expiresAt > Date.now()) return;
+    runtime.pendingApprovals.delete(approvalId);
+    await this.driver.resolveApproval(approvalId, "decline").catch(() => undefined);
+    await this.resolveApprovalCard(pending, "decline");
+    runtime.phase = runtime.pendingApprovals.size ? "awaiting_approval" : runtime.pendingInput ? "awaiting_input" : "working";
+    runtime.safeSummary = runtime.pendingApprovals.size ? `${runtime.pendingApprovals.size} approval request${runtime.pendingApprovals.size === 1 ? "" : "s"} still pending.` : "Approval expired and was denied. Codex is continuing...";
+    runtime.dirty = true;
+    this.store.updateTurn(runtime.turnId, { state: runtime.phase });
+    this.store.audit({ eventType: "approval.expired", summary: pending.kind, sessionId, turnId });
+    await this.flushStatus(sessionId, true);
   }
 
   private async handleInputEvent(runtime: RuntimeTurn, event: Extract<AgentEvent, { type: "input.requested" }>): Promise<void> {
@@ -534,6 +553,7 @@ export class SessionCoordinator {
     runtime.phase = "stopping"; runtime.safeSummary = "Stopping Codex..."; runtime.dirty = true;
     this.store.updateTurn(runtime.turnId, { state: "stopping" });
     for (const pending of runtime.pendingApprovals.values()) {
+      clearTimeout(pending.expiryTimer);
       await this.driver.resolveApproval(pending.id, "cancel").catch(() => undefined);
       await this.resolveApprovalCard(pending, "cancel");
     }
@@ -544,6 +564,7 @@ export class SessionCoordinator {
   }
 
   private async completeRuntime(runtime: RuntimeTurn, status: "completed" | "stopped"): Promise<void> {
+    for (const pending of runtime.pendingApprovals.values()) clearTimeout(pending.expiryTimer);
     runtime.phase = "completed"; runtime.safeSummary ||= status === "stopped" ? "Turn stopped." : "Turn completed."; runtime.dirty = false;
     this.store.updateTurn(runtime.turnId, { state: "completed", safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary, completed: true });
     this.store.addMilestone(runtime.session.id, runtime.turnId, "turn.completed", { status, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary });
@@ -555,6 +576,7 @@ export class SessionCoordinator {
   }
 
   private async failRuntime(runtime: RuntimeTurn, error: string): Promise<void> {
+    for (const pending of runtime.pendingApprovals.values()) clearTimeout(pending.expiryTimer);
     runtime.phase = "failed"; runtime.safeSummary = redact(error, this.redactions).slice(0, 1_500); runtime.dirty = false;
     this.store.updateTurn(runtime.turnId, { state: "failed", safeSummary: runtime.safeSummary, diff: runtime.diff, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary, completed: true });
     this.store.addMilestone(runtime.session.id, runtime.turnId, "turn.failed", { error: runtime.safeSummary });
@@ -716,7 +738,7 @@ export class SessionCoordinator {
       return;
     }
     const project = this.store.getProject(session.projectId); if (!project) { await this.messaging.sendText("The session project is no longer registered."); return; }
-    try { await this.driver.resumeSession(session.id, project); }
+    try { await this.driver.resumeSession(session.id, project, { managed: session.botCreated }); }
     catch (error) {
       const errorMessage = redact((error as Error).message, this.redactions).slice(0, 500);
       this.store.audit({ eventType: "session.select.failed", summary: errorMessage, sessionId: session.id, ...(session.lastTurnId ? { turnId: session.lastTurnId } : {}) });
@@ -758,7 +780,7 @@ export class SessionCoordinator {
       }
       if (this.selectedSession?.id === info.id) this.selectedSession = session;
       if (!controllable || !info.activeTurnId || info.state === "idle" || !isActiveState(info.state) || this.runtimes.has(info.id)) continue;
-      try { await this.driver.resumeSession(info.id, project); }
+      try { await this.driver.resumeSession(info.id, project, { managed: info.botCreated }); }
       catch (error) {
         this.logger.debug({ sessionId: info.id, errorMessage: redact((error as Error).message, this.redactions).slice(0, 500) }, "Active Codex session is owned by another runtime");
         continue;

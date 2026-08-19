@@ -4,11 +4,15 @@ import path from "node:path";
 export interface CodexInvocation { executable: string; prefixArgs: string[] }
 
 export function codexEnvironment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  if (process.platform !== "win32" || !base["USERPROFILE"]) return base;
+  const sanitized = Object.fromEntries(Object.entries(base).filter(([key]) => {
+    const normalized = key.toUpperCase();
+    return !normalized.startsWith("FEISHU_") && !normalized.startsWith("LARK_") && !normalized.startsWith("PULSECORTEX_");
+  }));
+  if (process.platform !== "win32" || !sanitized["USERPROFILE"]) return sanitized;
   return {
-    ...base,
-    ...(base["HOME"] ? {} : { HOME: base["USERPROFILE"] }),
-    ...(base["CODEX_HOME"] ? {} : { CODEX_HOME: path.join(base["USERPROFILE"], ".codex") }),
+    ...sanitized,
+    ...(sanitized["HOME"] ? {} : { HOME: sanitized["USERPROFILE"] }),
+    ...(sanitized["CODEX_HOME"] ? {} : { CODEX_HOME: path.join(sanitized["USERPROFILE"], ".codex") }),
   };
 }
 

@@ -15,6 +15,10 @@ const ConfigSchema = z.object({
   logRetentionDays: z.number().int().min(1).max(90).default(7),
   logMaxBytes: z.number().int().min(1_000_000).max(2_000_000_000).default(100_000_000),
   redactionPatterns: z.array(z.string()).default([]),
+  codexPermissionProfile: z.string().trim().min(1)
+    .refine((value) => value !== ":danger-full-access", ":danger-full-access cannot be used for remotely controlled sessions")
+    .default(":workspace"),
+  codexExecutable: z.string().trim().min(1).optional(),
   feishuDomain: z.enum(["feishu", "lark"]).default("feishu"),
   codexAppServerUrl: z.string().refine((value) => {
     try {

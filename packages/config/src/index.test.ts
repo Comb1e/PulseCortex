@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
-import { defaultCodexAppServerUrl, loadConfig } from "./index.js";
+import { ConfigSchema, defaultCodexAppServerUrl, loadConfig } from "./index.js";
 
 describe("defaultCodexAppServerUrl", () => {
   it("uses separate ports for Windows and Linux", () => {
@@ -24,5 +24,15 @@ describe("runtime paths", () => {
       if (previous === undefined) delete process.env["PULSECORTEX_DATA_DIR"];
       else process.env["PULSECORTEX_DATA_DIR"] = previous;
     }
+  });
+});
+
+describe("Codex configuration", () => {
+  it("uses a named workspace permission profile by default", () => {
+    expect(ConfigSchema.parse({}).codexPermissionProfile).toBe(":workspace");
+  });
+
+  it("rejects unrestricted remote sessions", () => {
+    expect(() => ConfigSchema.parse({ codexPermissionProfile: ":danger-full-access" })).toThrow("cannot be used");
   });
 });

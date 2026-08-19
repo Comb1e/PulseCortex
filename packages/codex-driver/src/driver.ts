@@ -1,9 +1,9 @@
 import { execFile } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type {
-  AgentCapabilities, AgentDriver, AgentEvent, AgentInstructionPreset, AgentSessionInfo, ApprovalId, NetworkDestination, Project, SessionId, SessionOptions, TurnId, Unsubscribe,
+  AgentCapabilities, AgentDriver, AgentEvent, AgentInstructionPreset, AgentSessionInfo, ApprovalId, NetworkDestination, Project, ResumeSessionOptions, SessionId, SessionOptions, TurnId, Unsubscribe,
 } from "@pulsecortex/domain";
 import { canonicalProjectPath, isPathInside, summarizeCommand } from "@pulsecortex/domain";
 import type { CommandLogStore } from "@pulsecortex/persistence";
@@ -34,7 +34,7 @@ import type { TurnCompletedNotification } from "./generated/v2/TurnCompletedNoti
 import type { TurnStartResponse } from "./generated/v2/TurnStartResponse";
 import { SUPPORTED_CODEX_CLI_SERIES, SUPPORTED_PROTOCOL_MAJOR, type JsonRpcNotification, type JsonRpcRequest } from "./protocol.js";
 import { JsonlRpcTransport, type TransportOptions } from "./transport.js";
-import { resolveCodexInvocation } from "./launcher.js";
+import { codexEnvironment, resolveCodexInvocation } from "./launcher.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -51,6 +51,7 @@ export interface CodexDriverDiagnostic {
 export interface CodexDriverOptions extends TransportOptions {
   verifyVersion?: boolean;
   commandLogs?: CommandLogStore;
+  permissionProfile?: string;
   supportedCliSeries?: string;
   onDiagnostic?: (diagnostic: CodexDriverDiagnostic) => void;
 }
@@ -74,7 +75,7 @@ function parseVersion(output: string): string {
 
 export async function detectCodexVersion(executable?: string): Promise<{ version: string; compatible: boolean }> {
   const invocation = resolveCodexInvocation(executable);
-  const { stdout } = await execFileAsync(invocation.executable, [...invocation.prefixArgs, "--version"], { windowsHide: true });
+  const { stdout } = await execFileAsync(invocation.executable, [...invocation.prefixArgs, "--version"], { env: codexEnvironment(), windowsHide: true });
   const version = parseVersion(stdout);
   return { version, compatible: version.startsWith(`${SUPPORTED_CODEX_CLI_SERIES}.`) || version === SUPPORTED_CODEX_CLI_SERIES };
 }
@@ -91,16 +92,36 @@ function extractPaths(params: PermissionsRequestApprovalParams): string[] {
   return [...new Set(paths)];
 }
 
-function requestedPathInside(root: string, candidate: string): boolean {
-  return isPathInside(root, path.isAbsolute(candidate) ? candidate : path.resolve(root, candidate));
+async function canonicalPotentialPath(candidate: string): Promise<string> {
+  let cursor = path.resolve(candidate);
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      const canonical = await realpath(cursor);
+      return path.join(canonical, ...missing.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw error;
+      missing.push(path.basename(cursor));
+      cursor = parent;
+    }
+  }
 }
 
-function filesystemPermissionIsSafe(permission: AdditionalFileSystemPermissions | null | undefined, root: string): boolean {
+async function requestedPathInside(root: string, candidate: string, cwd = root): Promise<boolean> {
+  const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(cwd, candidate);
+  return isPathInside(root, await canonicalPotentialPath(resolved));
+}
+
+async function filesystemPermissionIsSafe(permission: AdditionalFileSystemPermissions | null | undefined, root: string, cwd: string): Promise<boolean> {
   if (!permission) return true;
-  if ([...(permission.read ?? []), ...(permission.write ?? [])].some((candidate) => !requestedPathInside(root, candidate))) return false;
+  for (const candidate of [...(permission.read ?? []), ...(permission.write ?? [])]) {
+    if (!await requestedPathInside(root, candidate, cwd)) return false;
+  }
   for (const entry of permission.entries ?? []) {
     if (entry.access === "deny") continue;
-    if (entry.path.type === "path") { if (!requestedPathInside(root, entry.path.path)) return false; continue; }
+    if (entry.path.type === "path") { if (!await requestedPathInside(root, entry.path.path, cwd)) return false; continue; }
     if (entry.path.type === "special" && entry.path.value.kind === "project_roots") continue;
     return false;
   }
@@ -112,27 +133,19 @@ function networkDestinations(params: CommandExecutionRequestApprovalParams): Net
   return (params.proposedNetworkPolicyAmendments ?? []).map((item) => ({ host: item.host, protocol: "network" }));
 }
 
-function canAutoApproveCommand(pending: PendingServerRequest): boolean {
-  if (pending.method === "execCommandApproval") return true;
-  if (pending.method !== "item/commandExecution/requestApproval") return false;
-  const params = pending.params as CommandExecutionRequestApprovalParams;
-  const available = params.availableDecisions;
-  return networkDestinations(params).length === 0
-    && !params.additionalPermissions?.network?.enabled
-    && !params.additionalPermissions?.fileSystem
-    && (!available || available.includes("acceptForSession"));
-}
-
 export class CodexAppServerDriver implements AgentDriver {
   private readonly transport: JsonlRpcTransport;
   private readonly handlers = new Set<(event: AgentEvent) => void>();
   private readonly pending = new Map<string, PendingServerRequest>();
+  private readonly validatingServerRequests = new Set<string>();
+  private readonly resolvedServerRequests = new Set<string>();
   private readonly activeTurns = new Map<SessionId, TurnId>();
   private readonly failedTurns = new Set<string>();
   private readonly projectRoots = new Map<SessionId, string>();
   private readonly sessionCwds = new Map<SessionId, string>();
   private readonly disconnectedEnvironments = new Map<SessionId, Set<string>>();
   private readonly directInputSessions = new Set<SessionId>();
+  private readonly managedSessions = new Set<SessionId>();
   private readonly sessionSettings = new Map<SessionId, SessionSettings>();
   private readonly eventBuffers = new Map<SessionId, AgentEvent[]>();
   private cliVersion = "unknown";
@@ -143,7 +156,13 @@ export class CodexAppServerDriver implements AgentDriver {
   constructor(private readonly options: CodexDriverOptions = {}) {
     this.transport = new JsonlRpcTransport(options);
     this.transport.on("notification", (message: JsonRpcNotification) => this.handleNotification(message));
-    this.transport.on("request", (message: JsonRpcRequest) => this.handleRequest(message));
+    this.transport.on("request", (message: JsonRpcRequest) => {
+      this.validatingServerRequests.add(String(message.id));
+      void this.handleRequest(message).catch((error) => {
+        this.transport.respondError(message.id, -32003, "PulseCortex could not validate the requested permission");
+        this.reportDiagnostic("error", "Permission validation failed", undefined, { method: message.method, error: (error as Error).message });
+      }).finally(() => this.validatingServerRequests.delete(String(message.id)));
+    });
     this.transport.on("crash", (error: Error) => this.handleCrash(error));
     this.transport.on("protocolError", (error: Error) => { void this.handleProtocolError(error); });
     this.transport.on("stdout", (output: string) => this.reportDiagnostic("debug", "Codex app-server stdout", undefined, { output: output.trim() }));
@@ -187,7 +206,7 @@ export class CodexAppServerDriver implements AgentDriver {
     }
   }
 
-  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.stderrBuffer = ""; this.activeTurns.clear(); this.failedTurns.clear(); this.projectRoots.clear(); this.sessionCwds.clear(); this.disconnectedEnvironments.clear(); this.directInputSessions.clear(); this.sessionSettings.clear(); this.pending.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
+  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.stderrBuffer = ""; this.activeTurns.clear(); this.failedTurns.clear(); this.projectRoots.clear(); this.sessionCwds.clear(); this.disconnectedEnvironments.clear(); this.directInputSessions.clear(); this.managedSessions.clear(); this.sessionSettings.clear(); this.pending.clear(); this.validatingServerRequests.clear(); this.resolvedServerRequests.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
 
   async createSession(project: Project, options: SessionOptions): Promise<SessionId> {
     this.assertStarted();
@@ -196,7 +215,7 @@ export class CodexAppServerDriver implements AgentDriver {
       runtimeWorkspaceRoots: [project.canonicalPath],
       approvalPolicy: "on-request",
       approvalsReviewer: "user",
-      sandbox: "workspace-write",
+      permissions: this.options.permissionProfile ?? ":workspace",
       config: MANAGED_THREAD_CONFIG,
       model: options.model ?? null,
       serviceName: "PulseCortex",
@@ -209,30 +228,44 @@ export class CodexAppServerDriver implements AgentDriver {
     this.projectRoots.set(response.thread.id, project.canonicalPath);
     this.sessionCwds.set(response.thread.id, response.cwd);
     this.directInputSessions.add(response.thread.id);
+    this.managedSessions.add(response.thread.id);
     this.sessionSettings.set(response.thread.id, { model: response.model, reasoningEffort: response.reasoningEffort });
+    this.reportPermissionProfile(response.thread.id, response.activePermissionProfile?.id);
     return response.thread.id;
   }
 
-  async resumeSession(id: SessionId, project: Project): Promise<void> {
-    await this.resumeSessionAtCwd(id, project, project.canonicalPath);
+  async resumeSession(id: SessionId, project: Project, options: ResumeSessionOptions): Promise<void> {
+    await this.resumeSessionAtCwd(id, project, project.canonicalPath, options.managed);
   }
 
-  private async resumeSessionAtCwd(id: SessionId, project: Project, cwd: string): Promise<void> {
+  private async resumeSessionAtCwd(id: SessionId, project: Project, cwd: string, managed: boolean): Promise<void> {
     this.assertStarted();
     const loadedRoot = this.projectRoots.get(id);
     if (loadedRoot) {
       if (!isPathInside(loadedRoot, project.canonicalPath) || !isPathInside(project.canonicalPath, loadedRoot)) throw new Error("Loaded session project does not match the registered project");
+      this.setManaged(id, managed);
       if (this.directInputSessions.has(id)) return;
     }
     const response = await this.transport.request<ThreadResumeResponse>("thread/resume", {
-      threadId: id, cwd, runtimeWorkspaceRoots: [project.canonicalPath], approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: "workspace-write", config: MANAGED_THREAD_CONFIG, excludeTurns: false,
+      threadId: id,
+      cwd,
+      excludeTurns: false,
+      ...(managed ? {
+        runtimeWorkspaceRoots: [project.canonicalPath],
+        approvalPolicy: "on-request" as const,
+        approvalsReviewer: "user" as const,
+        permissions: this.options.permissionProfile ?? ":workspace",
+        config: MANAGED_THREAD_CONFIG,
+      } : {}),
     });
     if (response.thread.id !== id || !isPathInside(project.canonicalPath, response.cwd)) throw new Error("Codex resume did not match the registered session and project");
     if (response.thread.canAcceptDirectInput === false) throw new Error("Codex rejoined the session without granting direct input");
     this.projectRoots.set(id, project.canonicalPath);
     this.sessionCwds.set(id, response.cwd);
     this.directInputSessions.add(id);
+    this.setManaged(id, managed);
     this.sessionSettings.set(id, { model: response.model, reasoningEffort: response.reasoningEffort });
+    if (managed) this.reportPermissionProfile(id, response.activePermissionProfile?.id);
     const activeTurn = response.thread.turns?.findLast((turn) => turn.status === "inProgress");
     if (activeTurn) this.activeTurns.set(id, activeTurn.id);
   }
@@ -254,6 +287,7 @@ export class CodexAppServerDriver implements AgentDriver {
       this.sessionCwds.delete(id);
       this.disconnectedEnvironments.delete(id);
       this.directInputSessions.delete(id);
+      this.managedSessions.delete(id);
       this.sessionSettings.delete(id);
       this.activeTurns.delete(id);
     }
@@ -271,9 +305,11 @@ export class CodexAppServerDriver implements AgentDriver {
         if (!project) continue;
         const isLoaded = loaded.has(thread.id);
         const isExternallyRunning = !isLoaded && writerLocked.has(thread.id);
+        const managed = thread.threadSource === "pulsecortex";
         if (isLoaded) {
           this.projectRoots.set(thread.id, project.canonicalPath);
           this.sessionCwds.set(thread.id, canonicalCwd);
+          this.setManaged(thread.id, managed);
         }
         else this.directInputSessions.delete(thread.id);
         let detail: ThreadReadResponse | undefined;
@@ -285,7 +321,7 @@ export class CodexAppServerDriver implements AgentDriver {
         else if (isLoaded) {
           this.directInputSessions.delete(thread.id);
           try {
-            await this.resumeSessionAtCwd(thread.id, project, canonicalCwd);
+            await this.resumeSessionAtCwd(thread.id, project, canonicalCwd, managed);
             detail = await this.transport.request<ThreadReadResponse>("thread/read", { threadId: thread.id, includeTurns: thread.status.type === "active" });
             canAcceptDirectInput = this.directInputSessions.has(thread.id) && detail.thread.canAcceptDirectInput !== false;
           } catch (error) {
@@ -398,11 +434,13 @@ export class CodexAppServerDriver implements AgentDriver {
       const response = await this.transport.request<TurnStartResponse>("turn/start", {
         threadId: id,
         input: textInput(prompt),
-        cwd,
-        runtimeWorkspaceRoots: [root],
-        approvalPolicy: "on-request",
-        approvalsReviewer: "user",
-        sandboxPolicy: { type: "workspaceWrite", writableRoots: [root], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
+        ...(this.managedSessions.has(id) ? {
+          cwd,
+          runtimeWorkspaceRoots: [root],
+          approvalPolicy: "on-request" as const,
+          approvalsReviewer: "user" as const,
+          permissions: this.options.permissionProfile ?? ":workspace",
+        } : {}),
       });
       if (!this.failedTurns.has(`${id}:${response.turn.id}`)) this.activeTurns.set(id, response.turn.id);
       try {
@@ -439,12 +477,9 @@ export class CodexAppServerDriver implements AgentDriver {
     await this.transport.request("turn/interrupt", { threadId: id, turnId });
   }
 
-  async resolveApproval(id: ApprovalId, decision: "accept" | "acceptForSession" | "decline" | "cancel"): Promise<void> {
+  async resolveApproval(id: ApprovalId, decision: "accept" | "decline" | "cancel"): Promise<void> {
     const pending = this.pending.get(id);
     if (!pending) throw new Error("Approval is stale or already resolved");
-    if (decision === "acceptForSession" && !canAutoApproveCommand(pending)) {
-      throw new Error("Auto approve is restricted to command requests");
-    }
     this.pending.delete(id);
     if (pending.method === "item/permissions/requestApproval") {
       if (decision === "accept") {
@@ -452,7 +487,7 @@ export class CodexAppServerDriver implements AgentDriver {
         this.transport.respond(pending.rpcId, { permissions: { ...(requested["network"] ? { network: requested["network"] } : {}), ...(requested["fileSystem"] ? { fileSystem: requested["fileSystem"] } : {}) }, scope: "turn" });
       } else this.transport.respondError(pending.rpcId, -32001, decision === "cancel" ? "Permission request cancelled" : "Permission request declined");
     } else if (pending.method === "execCommandApproval" || pending.method === "applyPatchApproval") {
-      this.transport.respond(pending.rpcId, { decision: decision === "accept" ? "approved" : decision === "acceptForSession" ? "approved_for_session" : decision === "decline" ? { denied: { rejection: "Denied by PulseCortex owner" } } : "abort" });
+      this.transport.respond(pending.rpcId, { decision: decision === "accept" ? "approved" : decision === "decline" ? { denied: { rejection: "Denied by PulseCortex owner" } } : "abort" });
     } else this.transport.respond(pending.rpcId, { decision });
   }
 
@@ -465,7 +500,7 @@ export class CodexAppServerDriver implements AgentDriver {
 
   subscribe(handler: (event: AgentEvent) => void): Unsubscribe { this.handlers.add(handler); return () => this.handlers.delete(handler); }
 
-  private handleRequest(request: JsonRpcRequest): void {
+  private async handleRequest(request: JsonRpcRequest): Promise<void> {
     const params = (request.params ?? {}) as Record<string, unknown>;
     const sessionId = String(params["threadId"] ?? params["conversationId"] ?? "");
     const turnId = String(params["turnId"] ?? this.activeTurns.get(sessionId) ?? "");
@@ -479,7 +514,7 @@ export class CodexAppServerDriver implements AgentDriver {
         this.emit({ type: "turn.failed", sessionId, turnId, error: "Codex requested secret input; remote entry is disabled", occurredAt: now() });
         return;
       }
-      this.pending.set(approvalId, { rpcId: request.id, method: request.method, params });
+      if (!this.registerPending(approvalId, { rpcId: request.id, method: request.method, params }, sessionId, turnId)) return;
       this.emit({ type: "input.requested", sessionId, turnId, requestId: approvalId, questions: input.questions.map((q) => ({ id: q.id, header: q.header, question: q.question, options: (q.options ?? []).map((option) => ({ label: option.label, description: option.description ?? undefined })), allowFreeform: q.isOther })), occurredAt: now() });
       return;
     }
@@ -492,24 +527,24 @@ export class CodexAppServerDriver implements AgentDriver {
         this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied a broad network grant without a destination.", occurredAt: now() });
         return;
       }
-      if (!root || !filesystemPermissionIsSafe(input.additionalPermissions?.fileSystem, root)) {
+      if (!root || !await filesystemPermissionIsSafe(input.additionalPermissions?.fileSystem, root, input.cwd ?? root)) {
         this.transport.respondError(request.id, -32003, "Filesystem permission outside the registered project is disabled");
         this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied filesystem access outside the registered project.", occurredAt: now() });
         return;
       }
-      this.pending.set(approvalId, { rpcId: request.id, method: request.method, params });
-      this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: network.length ? "network" : "command", title: network.length ? "Network access requested" : "Command approval requested", ...(input.reason ? { reason: input.reason } : {}), ...(input.command ? { command: summarizeCommand(input.command) } : {}), ...(network.length ? { network } : {}), canAutoApprove: canAutoApproveCommand({ rpcId: request.id, method: request.method, params }), occurredAt: now() });
+      if (!this.registerPending(approvalId, { rpcId: request.id, method: request.method, params }, sessionId, turnId)) return;
+      this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: network.length ? "network" : "command", title: network.length ? "Network access requested" : "Run command outside sandbox?", ...(input.reason ? { reason: input.reason } : {}), ...(input.command ? { command: summarizeCommand(input.command) } : {}), ...(network.length ? { network } : {}), occurredAt: now() });
       return;
     }
     if (request.method === "item/fileChange/requestApproval") {
       const input = request.params as FileChangeRequestApprovalParams;
       const root = this.projectRoots.get(sessionId);
-      if (input.grantRoot && root && !requestedPathInside(root, input.grantRoot)) {
+      if (input.grantRoot && (!root || !await requestedPathInside(root, input.grantRoot, this.sessionCwds.get(sessionId) ?? root))) {
         this.transport.respondError(request.id, -32003, "Write permission outside the registered project is disabled");
         this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied a write root outside the registered project.", occurredAt: now() });
         return;
       }
-      this.pending.set(approvalId, { rpcId: request.id, method: request.method, params });
+      if (!this.registerPending(approvalId, { rpcId: request.id, method: request.method, params }, sessionId, turnId)) return;
       this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: "file", title: "File change approval requested", ...(input.reason ? { reason: input.reason } : {}), ...(input.grantRoot ? { paths: [input.grantRoot] } : {}), occurredAt: now() });
       return;
     }
@@ -523,26 +558,29 @@ export class CodexAppServerDriver implements AgentDriver {
       const kind = input.permissions.network?.enabled ? "network" : "filesystem";
       const paths = extractPaths(input);
       const root = this.projectRoots.get(sessionId);
-      if (!root || !filesystemPermissionIsSafe(input.permissions.fileSystem, root) || paths.some((candidate) => !requestedPathInside(root, candidate))) {
+      const cwd = input.cwd ?? root ?? process.cwd();
+      if (!root || !await filesystemPermissionIsSafe(input.permissions.fileSystem, root, cwd)) {
         this.transport.respondError(request.id, -32003, "Filesystem permission outside the registered project is disabled");
         this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied filesystem access outside the registered project.", occurredAt: now() });
         return;
       }
-      this.pending.set(approvalId, { rpcId: request.id, method: request.method, params });
+      if (!this.registerPending(approvalId, { rpcId: request.id, method: request.method, params }, sessionId, turnId)) return;
       this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind, title: kind === "network" ? "Network permission requested" : "Filesystem permission requested", ...(input.reason ? { reason: input.reason } : {}), ...(paths.length ? { paths } : {}), ...(kind === "network" ? { network: [{ host: "unspecified destination", protocol: "network" }] } : {}), occurredAt: now() });
       return;
     }
     if (request.method === "execCommandApproval" || request.method === "applyPatchApproval") {
       const root = this.projectRoots.get(sessionId);
-      if (request.method === "applyPatchApproval" && (!root || Object.keys((params["fileChanges"] as object | undefined) ?? {}).some((candidate) => !requestedPathInside(root, candidate)))) {
+      const cwd = this.sessionCwds.get(sessionId) ?? root ?? process.cwd();
+      const fileChangesSafe = root && (await Promise.all(Object.keys((params["fileChanges"] as object | undefined) ?? {}).map((candidate) => requestedPathInside(root, candidate, cwd)))).every(Boolean);
+      if (request.method === "applyPatchApproval" && !fileChangesSafe) {
         this.transport.respondError(request.id, -32003, "File change outside the registered project is disabled");
         this.emit({ type: "agent.message.delta", sessionId, turnId, messageId: `policy:${approvalId}`, delta: " PulseCortex denied a file change outside the registered project.", occurredAt: now() });
         return;
       }
-      this.pending.set(approvalId, { rpcId: request.id, method: request.method, params });
+      if (!this.registerPending(approvalId, { rpcId: request.id, method: request.method, params }, sessionId, turnId)) return;
       const command = Array.isArray(params["command"]) ? (params["command"] as string[]).join(" ") : undefined;
       const fileChanges = params["fileChanges"] && typeof params["fileChanges"] === "object" ? Object.keys(params["fileChanges"] as object) : [];
-      this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: command ? "command" : "file", title: command ? "Command approval requested" : "File change approval requested", ...(command ? { command: summarizeCommand(command) } : {}), ...(fileChanges.length ? { files: fileChanges } : {}), canAutoApprove: command ? canAutoApproveCommand({ rpcId: request.id, method: request.method, params }) : false, occurredAt: now() });
+      this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: command ? "command" : "file", title: command ? "Run command outside sandbox?" : "File change approval requested", ...(command ? { command: summarizeCommand(command) } : {}), ...(fileChanges.length ? { files: fileChanges } : {}), occurredAt: now() });
       return;
     }
     if (request.method === "currentTime/read") {
@@ -605,13 +643,16 @@ export class CodexAppServerDriver implements AgentDriver {
       }
       case "serverRequest/resolved": {
         const rpcId = params["requestId"];
+        let found = false;
         for (const [requestId, pending] of this.pending) {
           if (String(pending.rpcId) !== String(rpcId)) continue;
+          found = true;
           this.pending.delete(requestId);
           const pendingSessionId = String(pending.params["threadId"] ?? pending.params["conversationId"] ?? sessionId);
           const pendingTurnId = String(pending.params["turnId"] ?? this.activeTurns.get(pendingSessionId) ?? turnId);
           this.emit({ type: "request.resolved", sessionId: pendingSessionId, turnId: pendingTurnId, requestId, occurredAt: now() });
         }
+        if (!found && this.validatingServerRequests.has(String(rpcId))) this.resolvedServerRequests.add(String(rpcId));
         break;
       }
       case "warning": this.reportDiagnostic("warn", String(params["message"] ?? "Codex warning"), sessionId || undefined); break;
@@ -706,6 +747,14 @@ export class CodexAppServerDriver implements AgentDriver {
       if (pendingSessionId === sessionId && (!turnId || !pendingTurnId || pendingTurnId === turnId)) this.pending.delete(requestId);
     }
   }
+  private registerPending(approvalId: string, pending: PendingServerRequest, sessionId: SessionId, turnId: TurnId): boolean {
+    if (this.resolvedServerRequests.delete(String(pending.rpcId))) {
+      this.emit({ type: "request.resolved", sessionId, turnId, requestId: approvalId, occurredAt: now() });
+      return false;
+    }
+    this.pending.set(approvalId, pending);
+    return true;
+  }
   private handleStderr(output: string): void {
     this.reportDiagnostic("warn", "Codex app-server stderr", undefined, { output: output.trim() });
     this.stderrBuffer = `${this.stderrBuffer}${output}`.slice(-8_000);
@@ -735,6 +784,16 @@ export class CodexAppServerDriver implements AgentDriver {
     void this.transport.request("turn/interrupt", { threadId: sessionId, turnId }).catch(() => undefined);
     this.emit({ type: "turn.failed", sessionId, turnId, error, occurredAt: now() });
   }
+  private setManaged(sessionId: SessionId, managed: boolean): void {
+    if (managed) this.managedSessions.add(sessionId);
+    else this.managedSessions.delete(sessionId);
+  }
+  private reportPermissionProfile(sessionId: SessionId, activeProfile: string | undefined): void {
+    const expected = this.options.permissionProfile ?? ":workspace";
+    this.reportDiagnostic(activeProfile && activeProfile !== expected ? "warn" : "info", activeProfile && activeProfile !== expected
+      ? "Codex selected a different permission profile for the managed session"
+      : "Codex managed-session permission profile selected", sessionId, { expected, active: activeProfile ?? "not reported" });
+  }
   private reportDiagnostic(level: CodexDriverDiagnostic["level"], message: string, sessionId?: SessionId, details?: Record<string, unknown>): void {
     if (!message.trim() && !details) return;
     this.options.onDiagnostic?.({ level, message, ...(sessionId ? { sessionId } : {}), ...(details ? { details } : {}) });
@@ -748,8 +807,11 @@ export class CodexAppServerDriver implements AgentDriver {
     this.sessionCwds.clear();
     this.disconnectedEnvironments.clear();
     this.directInputSessions.clear();
+    this.managedSessions.clear();
     this.sessionSettings.clear();
     this.pending.clear();
+    this.validatingServerRequests.clear();
+    this.resolvedServerRequests.clear();
     this.eventBuffers.clear();
     this.emit({ type: "driver.crashed", error: error.message, occurredAt: now() });
   }
@@ -762,8 +824,11 @@ export class CodexAppServerDriver implements AgentDriver {
     this.sessionCwds.clear();
     this.disconnectedEnvironments.clear();
     this.directInputSessions.clear();
+    this.managedSessions.clear();
     this.sessionSettings.clear();
     this.pending.clear();
+    this.validatingServerRequests.clear();
+    this.resolvedServerRequests.clear();
     this.eventBuffers.clear();
     await this.transport.stop();
     this.emit({ type: "driver.crashed", error: error.message, occurredAt: now() });

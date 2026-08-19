@@ -25,6 +25,10 @@ export interface SessionOptions {
   title?: string;
 }
 
+export interface ResumeSessionOptions {
+  managed: boolean;
+}
+
 export interface AgentCapabilities {
   cliVersion: string;
   protocolMajor: number;
@@ -99,13 +103,13 @@ export interface ApprovalView {
   files?: string[];
   paths?: string[];
   network?: NetworkDestination[];
-  actionTokens: { accept: string; autoApprove?: string; decline: string; cancel: string };
+  actionTokens: { accept: string; decline: string; cancel: string };
   expiresAt: number;
 }
 
 export interface ApprovalResolutionView {
   title: string;
-  decision: "accept" | "acceptForSession" | "decline" | "cancel";
+  decision: "accept" | "decline" | "cancel";
   resolvedAt: number;
 }
 
@@ -181,7 +185,6 @@ export interface ChannelCommand {
 
 export type ChannelActionKind =
   | "approval.accept"
-  | "approval.acceptForSession"
   | "approval.decline"
   | "turn.stop"
   | "logs.show"
@@ -221,7 +224,7 @@ export type AgentEvent =
   | { type: "agent.message.delta"; sessionId: SessionId; turnId: TurnId; messageId?: string; delta: string; occurredAt: number }
   | { type: "command.started"; sessionId: SessionId; turnId: TurnId; commandId: string; command: string; occurredAt: number }
   | { type: "command.completed"; sessionId: SessionId; turnId: TurnId; commandId: string; exitCode?: number; occurredAt: number }
-  | { type: "approval.requested"; sessionId: SessionId; turnId: TurnId; approvalId: ApprovalId; kind: ApprovalKind; title: string; reason?: string; command?: string; files?: string[]; paths?: string[]; network?: NetworkDestination[]; canAutoApprove?: boolean; occurredAt: number }
+  | { type: "approval.requested"; sessionId: SessionId; turnId: TurnId; approvalId: ApprovalId; kind: ApprovalKind; title: string; reason?: string; command?: string; files?: string[]; paths?: string[]; network?: NetworkDestination[]; occurredAt: number }
   | { type: "input.requested"; sessionId: SessionId; turnId: TurnId; requestId: string; questions: InputQuestion[]; occurredAt: number }
   | { type: "request.resolved"; sessionId: SessionId; turnId: TurnId; requestId: string; occurredAt: number }
   | { type: "diff.updated"; sessionId: SessionId; turnId: TurnId; diff: string; occurredAt: number }

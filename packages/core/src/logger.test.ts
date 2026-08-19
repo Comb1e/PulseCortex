@@ -124,11 +124,11 @@ describe("daemon logger", () => {
 
     logger.info({ feishu: { kind: "approval", operation: "send", messageId: "approval-1", content: { title: "Run command" } } }, "Feishu outbound message");
     logger.info({ feishu: { kind: "approval", operation: "update", messageId: "approval-1", content: { title: "Run command", decision: "accept", resolvedAt: 1 } } }, "Feishu outbound message");
-    logger.info({ feishu: { kind: "approval", operation: "update", messageId: "approval-1", content: { title: "Run command", decision: "acceptForSession", resolvedAt: 2 } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "approval", operation: "update", messageId: "approval-1", content: { title: "Run command", decision: "decline", resolvedAt: 2 } } }, "Feishu outbound message");
 
     const output = terminal.text();
     expect(output).not.toContain('"decision": "accept"');
-    expect(output).toContain('"decision": "acceptForSession"');
+    expect(output).toContain('"decision": "decline"');
     expect((output.match(/approval-1/g) ?? [])).toHaveLength(1);
   });
 

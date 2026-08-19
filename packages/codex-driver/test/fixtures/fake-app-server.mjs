@@ -8,6 +8,7 @@ let sessionId = "019fake-thread";
 let turnId = "019fake-turn";
 const scenario = process.argv[2] ?? "approval";
 let externalThreadJoined = false;
+let managedSession = false;
 const hostResponses = new Set();
 const descendant = scenario === "process-tree"
   ? spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 10000)"], { stdio: "ignore" })
@@ -25,7 +26,8 @@ lines.on("line", (line) => {
   } else if (message.method === "modelProvider/capabilities/read") {
     send({ id: message.id, result: { namespaceTools: scenario !== "no-namespace-tools", imageGeneration: true, webSearch: true } });
   } else if (message.method === "thread/start") {
-    if (message.params.sandbox !== "workspace-write"
+    if (message.params.permissions !== ":workspace"
+      || message.params.sandbox !== undefined
       || message.params.runtimeWorkspaceRoots.length !== 1
       || message.params.historyMode !== "paginated"
       || message.params.experimentalRawEvents !== true
@@ -33,7 +35,8 @@ lines.on("line", (line) => {
       send({ id: message.id, error: { code: -32000, message: "unsafe thread configuration" } });
       return;
     }
-    send({ id: message.id, result: { thread: { id: sessionId }, cwd: message.params.cwd, model: "gpt-test", reasoningEffort: "high" } });
+    managedSession = true;
+    send({ id: message.id, result: { thread: { id: sessionId }, cwd: message.params.cwd, model: "gpt-test", reasoningEffort: "high", activePermissionProfile: { id: message.params.permissions, extends: null } } });
     if (scenario === "disconnected-before-turn") send({ method: "thread/environment/disconnected", params: { threadId: sessionId, environmentId: "local-tools" } });
   } else if (message.method === "collaborationMode/list") {
     send({ id: message.id, result: { data: [
@@ -60,8 +63,8 @@ lines.on("line", (line) => {
   } else if (message.method === "thread/read") {
     send({ id: message.id, result: { thread: { id: message.params.threadId, canAcceptDirectInput: scenario !== "rejoin-loaded" || externalThreadJoined, turns: [{ id: "external-turn", status: "inProgress" }] } } });
   } else if (message.method === "thread/resume") {
-    if (message.params.config?.features?.multi_agent !== false) {
-      send({ id: message.id, error: { code: -32000, message: "managed thread enabled unsupported multi-agent tools" } });
+    if (message.params.permissions !== undefined || message.params.sandbox !== undefined || message.params.runtimeWorkspaceRoots !== undefined || message.params.approvalPolicy !== undefined || message.params.config !== undefined) {
+      send({ id: message.id, error: { code: -32000, message: "shared thread settings were overridden" } });
       return;
     }
     if (scenario === "reject-redundant-resume") {
@@ -73,15 +76,16 @@ lines.on("line", (line) => {
       return;
     }
     sessionId = message.params.threadId;
+    managedSession = false;
     externalThreadJoined = true;
     send({ id: message.id, result: { thread: { id: sessionId, canAcceptDirectInput: true, turns: [{ id: "external-turn", status: "inProgress" }] }, cwd: message.params.cwd, model: "gpt-test", reasoningEffort: "high" } });
   } else if (message.method === "turn/start") {
-    if (message.params.sandboxPolicy.type !== "workspaceWrite" || message.params.sandboxPolicy.networkAccess !== false || message.params.sandboxPolicy.writableRoots.length !== 1) {
-      send({ id: message.id, error: { code: -32000, message: "unsafe turn configuration" } });
+    if (managedSession && (message.params.permissions !== ":workspace" || message.params.sandboxPolicy !== undefined || message.params.runtimeWorkspaceRoots.length !== 1)) {
+      send({ id: message.id, error: { code: -32000, message: "managed turn permission profile missing" } });
       return;
     }
-    if (scenario === "resumed-cwd" && message.params.cwd !== path.join(process.cwd(), "packages", "core")) {
-      send({ id: message.id, error: { code: -32000, message: "turn changed the resumed working directory" } });
+    if (!managedSession && (message.params.permissions !== undefined || message.params.sandboxPolicy !== undefined || message.params.runtimeWorkspaceRoots !== undefined || message.params.approvalPolicy !== undefined || message.params.cwd !== undefined)) {
+      send({ id: message.id, error: { code: -32000, message: "shared turn settings were overridden" } });
       return;
     }
     send({ id: message.id, result: { turn: { id: turnId } } });
@@ -120,12 +124,13 @@ lines.on("line", (line) => {
     send({ method: "item/started", params: { threadId: sessionId, turnId, startedAtMs: Date.now(), item: { type: "commandExecution", id: "cmd", command: "pnpm test", status: "inProgress" } } });
     if (scenario === "unsafe-permission") {
       send({ id: "permission-rpc", method: "item/permissions/requestApproval", params: { threadId: sessionId, turnId, itemId: "permission", environmentId: null, startedAtMs: Date.now(), cwd: message.params.cwd, reason: "write root", permissions: { network: null, fileSystem: { read: null, write: null, entries: [{ access: "write", path: { type: "special", value: { kind: "root" } } }] } } } });
+    } else if (scenario === "symlink-permission") {
+      send({ id: "permission-rpc", method: "item/permissions/requestApproval", params: { threadId: sessionId, turnId, itemId: "permission", environmentId: null, startedAtMs: Date.now(), cwd: message.params.cwd, reason: "linked write path", permissions: { network: null, fileSystem: { read: null, write: null, entries: [{ access: "write", path: { type: "path", path: process.env["FAKE_PERMISSION_PATH"] } }] } } } });
     } else {
-      send({ id: "approval-rpc", method: "item/commandExecution/requestApproval", params: { threadId: sessionId, turnId, itemId: "cmd", startedAtMs: Date.now(), environmentId: null, command: "pnpm test", ...(scenario === "auto-approve" ? {} : { networkApprovalContext: { host: "registry.npmjs.org", protocol: "https" } }) } });
+      send({ id: "approval-rpc", method: "item/commandExecution/requestApproval", params: { threadId: sessionId, turnId, itemId: "cmd", startedAtMs: Date.now(), environmentId: null, command: "pnpm test", ...(scenario === "command-approval" ? {} : { networkApprovalContext: { host: "registry.npmjs.org", protocol: "https" } }) } });
     }
   } else if (message.id === "approval-rpc") {
-    const expectedDecision = scenario === "auto-approve" ? "acceptForSession" : "accept";
-    if (message.result?.decision !== expectedDecision) process.exit(3);
+    if (message.result?.decision !== "accept") process.exit(3);
     send({ method: "item/commandExecution/outputDelta", params: { threadId: sessionId, turnId, itemId: "cmd", delta: "all tests passed\n" } });
     send({ method: "item/completed", params: { threadId: sessionId, turnId, completedAtMs: Date.now(), item: { type: "commandExecution", id: "cmd", command: "pnpm test", status: "completed", exitCode: 0 } } });
     send({ method: "turn/diff/updated", params: { threadId: sessionId, turnId, diff: "diff --git a/a b/a" } });

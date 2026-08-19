@@ -30,7 +30,7 @@ export class ActionTokenService {
     return `${body}.${signature}`;
   }
 
-  consume(token: string, actor: OwnerIdentity, expectedKind?: string, options: { allowExpired?: boolean } = {}): InteractionRecord | null {
+  consume(token: string, actor: OwnerIdentity, expectedKind?: string): InteractionRecord | null {
     const [body, signature, extra] = token.split(".");
     if (!body || !signature || extra) return null;
     const expected = Buffer.from(this.sign(body), "base64url");
@@ -39,8 +39,8 @@ export class ActionTokenService {
     let claims: TokenClaims;
     try { claims = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as TokenClaims; }
     catch { return null; }
-    if (claims.v !== 1 || (!options.allowExpired && claims.exp < Date.now()) || claims.tenantId !== actor.tenantId || claims.userId !== actor.userId || (expectedKind && claims.kind !== expectedKind)) return null;
-    const record = this.store.consumeInteraction(claims.nonce, actor, Date.now(), options.allowExpired === true);
+    if (claims.v !== 1 || claims.exp <= Date.now() || claims.tenantId !== actor.tenantId || claims.userId !== actor.userId || (expectedKind && claims.kind !== expectedKind)) return null;
+    const record = this.store.consumeInteraction(claims.nonce, actor);
     if (!record || record.kind !== claims.kind || record.sessionId !== claims.sessionId || record.turnId !== claims.turnId || record.requestId !== claims.requestId || record.expiresAt !== claims.exp) return null;
     return record;
   }

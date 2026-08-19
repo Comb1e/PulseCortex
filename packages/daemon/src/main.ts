@@ -23,6 +23,8 @@ async function main(): Promise<void> {
 
   const driver = new CodexAppServerDriver({
     commandLogs,
+    ...(config.codexExecutable ? { executable: config.codexExecutable } : {}),
+    permissionProfile: config.codexPermissionProfile,
     listenUrl: config.codexAppServerUrl,
     onDiagnostic: ({ level, message, sessionId, details }) => {
       const diagnostic = {

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path";
+import os from "node:os";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -28,7 +29,7 @@ async function serviceOptions() {
 
 async function codexShellOptions() {
   const config = await loadConfig({ requireSecrets: false });
-  const invocation = resolveCodexInvocation();
+  const invocation = resolveCodexInvocation(config.codexExecutable);
   const shimEntry = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../dist/codex-shim.js");
   return { dataDir: config.dataDir, shimEntry, codexExecutable: invocation.executable, codexPrefixArgs: invocation.prefixArgs };
 }
@@ -52,7 +53,7 @@ program.command("init").description("Create non-secret config and a permission-r
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const configPath = path.join(dataDir, "config.json");
   const envPath = path.join(dataDir, "pulsecortex.env");
-  try { await access(configPath); } catch { await writeFile(configPath, `${JSON.stringify({ statusUpdateIntervalMs: 2000, approvalTtlMs: 900000, auditRetentionDays: 30, logRetentionDays: 7, logMaxBytes: 100000000, redactionPatterns: [], codexAppServerUrl: defaultCodexAppServerUrl() }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 }); }
+  try { await access(configPath); } catch { await writeFile(configPath, `${JSON.stringify({ statusUpdateIntervalMs: 2000, approvalTtlMs: 900000, auditRetentionDays: 30, logRetentionDays: 7, logMaxBytes: 100000000, redactionPatterns: [], codexPermissionProfile: ":workspace", codexAppServerUrl: defaultCodexAppServerUrl() }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 }); }
   try { await access(envPath); } catch { await writeFile(envPath, "# Keep this file readable only by your desktop user.\nFEISHU_APP_ID=\nFEISHU_APP_SECRET=\n# Generate at least 32 random bytes, for example: openssl rand -base64 48\nPULSECORTEX_ACTION_SIGNING_KEY=\n", { encoding: "utf8", mode: 0o600 }); }
   await withStore(() => undefined);
   if (process.platform === "win32") {
@@ -98,7 +99,7 @@ program.command("codex").description("Launch Codex in a registered project on th
     } catch {
       throw new Error(`PulseCortex Codex app-server is not ready at ${config.codexAppServerUrl}; start the daemon first`);
     }
-    const invocation = resolveCodexInvocation();
+    const invocation = resolveCodexInvocation(config.codexExecutable);
     const args = [...invocation.prefixArgs, "--remote", config.codexAppServerUrl, "-C", registered.canonicalPath, ...(prompt.length ? [prompt.join(" ")] : [])];
     const child = spawn(invocation.executable, args, { cwd: registered.canonicalPath, env: codexEnvironment(), stdio: "inherit", windowsHide: false });
     const exitCode = await new Promise<number>((resolve, reject) => {
@@ -111,8 +112,16 @@ program.command("codex").description("Launch Codex in a registered project on th
 program.command("diagnose").description("Check Codex, database, pairing, projects, credentials, and delivery queue").action(async () => {
   const config = await loadConfig({ requireSecrets: false });
   const checks: Array<{ name: string; ok: boolean; detail: string }> = [];
-  try { const codex = await detectCodexVersion(); checks.push({ name: "Codex", ok: codex.compatible, detail: `${codex.version}${codex.compatible ? "" : " (unsupported; requires 0.147.x)"}` }); }
+  const invocation = resolveCodexInvocation(config.codexExecutable);
+  const childEnvironment = codexEnvironment();
+  const codexHome = childEnvironment["CODEX_HOME"] ?? path.join(childEnvironment["HOME"] ?? os.homedir(), ".codex");
+  const temporaryDirectory = childEnvironment["TEMP"] ?? childEnvironment["TMP"] ?? childEnvironment["TMPDIR"] ?? os.tmpdir();
+  try { const codex = await detectCodexVersion(config.codexExecutable); checks.push({ name: "Codex", ok: codex.compatible, detail: `${codex.version}${codex.compatible ? "" : " (unsupported; requires 0.147.x)"}` }); }
   catch (error) { checks.push({ name: "Codex", ok: false, detail: (error as Error).message }); }
+  checks.push({ name: "Codex executable", ok: true, detail: [invocation.executable, ...invocation.prefixArgs].join(" ") });
+  checks.push({ name: "Permission profile", ok: true, detail: config.codexPermissionProfile });
+  checks.push({ name: "Codex home", ok: true, detail: codexHome });
+  checks.push({ name: "Temporary directory", ok: true, detail: temporaryDirectory });
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
   const store = new ControllerStore(config.databasePath, config.settingsPath);
   try {

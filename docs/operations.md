@@ -10,7 +10,18 @@ Non-secret settings live in `config.json` below the platform data directory:
 
 `PULSECORTEX_DATA_DIR` overrides the directory. `PULSECORTEX_ENV_FILE` overrides the secret-file path.
 
-Supported settings include status/approval intervals, metadata/log retention, log byte ceiling, Feishu or Lark domain, log level, JavaScript regular expressions for additional redaction, and `codexAppServerUrl`. The latter defaults to `ws://127.0.0.1:4500` on Windows and macOS and `ws://127.0.0.1:4501` on Linux, including WSL. It must remain a loopback `ws://` URL with an explicit port. Existing `config.json` files retain their explicit value; change the Linux/WSL value to port `4501` manually when upgrading an initialized installation.
+Supported settings include status/approval intervals, metadata/log retention, log byte ceiling, Feishu or Lark domain, log level, JavaScript regular expressions for additional redaction, `codexPermissionProfile`, `codexExecutable`, and `codexAppServerUrl`. `codexPermissionProfile` defaults to `:workspace`; `:danger-full-access` is rejected for remotely controlled sessions. `codexExecutable` pins the Codex executable when a supervised service has a different PATH from the interactive terminal. `codexAppServerUrl` defaults to `ws://127.0.0.1:4500` on Windows and macOS and `ws://127.0.0.1:4501` on Linux, including WSL. It must remain a loopback `ws://` URL with an explicit port. Existing `config.json` files retain their explicit values; change the Linux/WSL URL to port `4501` manually when upgrading an initialized installation.
+
+Example Windows overrides:
+
+```json
+{
+  "codexPermissionProfile": ":workspace",
+  "codexExecutable": "C:\\Users\\your-user\\AppData\\Roaming\\npm\\codex.cmd"
+}
+```
+
+Managed sessions receive this named permission profile on creation and later turns. Shared sessions launched independently through the TUI keep their existing permission, approval, workspace-root, and tool settings when PulseCortex attaches; a remote turn does not silently replace them.
 
 Runtime preferences are stored in `settings.json` rather than `config.json` or SQLite. The file is created below the platform data directory with this shape:
 
@@ -55,7 +66,7 @@ pnpm pulsectl db sessions --limit 20
 pnpm pulsectl db delivery_queue --limit 20
 ```
 
-Diagnostics verifies the pinned Codex version, shared app-server health, SQLite integrity, owner/chat binding, credential presence without displaying values, registered directory existence, and queued delivery count.
+Diagnostics verifies the configured Codex executable and pinned version, configured managed permission profile, Codex home and temporary directory, shared app-server health, SQLite integrity, owner/chat binding, credential presence without displaying values, registered directory existence, and queued delivery count. The daemon log also records the permission profile Codex reports as active for each managed session.
 
 `pnpm start` displays daemon events as readable timestamped entries with structured fields on indented lines. In an interactive terminal, mutable Feishu card entries are width-wrapped and replaced in place by message ID while the complete live block fits in the viewport. A block that would enter terminal scrollback is appended as complete entries instead, because scrollback cannot be safely rewritten. The color-free, redacted `logs/YYYY-MM-DD.log` file remains append-only and records every complete update for the local calendar day. The daemon starts a new file at midnight without requiring a restart. Daily logs observe `logRetentionDays` and share the `logMaxBytes` directory budget; the active day's file is always retained. The daemon records Feishu connection transitions, Codex app-server warnings and stderr, execution-environment connection changes, retry state, and every successfully delivered user-visible Feishu message.
 
@@ -73,7 +84,9 @@ pnpm pulsectl service status
 pnpm pulsectl service uninstall
 ```
 
-The daemon runs as the logged-in user so `codex app-server` reuses that user's existing authentication. Do not run it as a system account or copy Codex credentials into the service environment.
+The daemon runs as the logged-in user so `codex app-server` reuses that user's existing authentication. A Windows scheduled task intentionally uses a limited user token, and service managers do not inherit later terminal PATH or environment changes. This can make service-launched Codex less capable than an elevated or differently configured terminal even in the same directory. Pin `codexExecutable`, compare `pulsectl diagnose` output, and grant only the operating-system rights actually required. Do not run the daemon as a system account or copy Codex credentials into the service environment.
+
+The app-server inherits the daemon's ordinary user environment after PulseCortex removes all `FEISHU_*`, `LARK_*`, and `PULSECORTEX_*` variables. Put only controller secrets in `pulsecortex.env`; use normal user or service-manager configuration for non-secret variables that Codex genuinely requires.
 
 Stopping PulseCortex with Ctrl+C, a terminal hangup, or the service manager also stops the shared Codex app-server and its entire descendant process tree. Independently launched standalone Codex processes are not part of that tree and are left running.
 

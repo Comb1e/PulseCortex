@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { describe, expect, it } from "vitest";
 import type { AgentEvent, Project } from "@pulsecortex/domain";
@@ -14,7 +14,7 @@ describe("Codex app-server contract", () => {
     const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "reject-redundant-resume"], verifyVersion: false });
     await driver.start();
     await expect(driver.listSessions([project])).resolves.toEqual([expect.objectContaining({ id: "external-thread", projectId: "project", activeTurnId: "external-turn", state: "working", loaded: true, canAcceptDirectInput: true })]);
-    await expect(driver.resumeSession("external-thread", project)).resolves.toBeUndefined();
+    await expect(driver.resumeSession("external-thread", project, { managed: false })).resolves.toBeUndefined();
     await driver.stop();
   });
 
@@ -25,7 +25,7 @@ describe("Codex app-server contract", () => {
     await expect(driver.listSessions([project])).resolves.toEqual([
       expect.objectContaining({ id: "external-thread", loaded: true, canAcceptDirectInput: true }),
     ]);
-    await expect(driver.resumeSession("external-thread", project)).resolves.toBeUndefined();
+    await expect(driver.resumeSession("external-thread", project, { managed: false })).resolves.toBeUndefined();
     await driver.stop();
   });
 
@@ -60,7 +60,7 @@ describe("Codex app-server contract", () => {
     const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "reject-redundant-resume"], verifyVersion: false });
     await driver.start();
     const sessionId = await driver.createSession(project, {});
-    await expect(driver.resumeSession(sessionId, project)).resolves.toBeUndefined();
+    await expect(driver.resumeSession(sessionId, project, { managed: true })).resolves.toBeUndefined();
     await driver.stop();
   });
 
@@ -105,14 +105,15 @@ describe("Codex app-server contract", () => {
     await driver.stop();
   });
 
-  it("maps command auto approve to the native session decision", async () => {
-    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "auto-approve"], verifyVersion: false });
+  it("keeps command sandbox escape approval one-time only", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "command-approval"], verifyVersion: false });
     let complete!: () => void;
     const completed = new Promise<void>((resolve) => { complete = resolve; });
     driver.subscribe((event) => {
       if (event.type === "approval.requested") {
-        expect(event).toMatchObject({ kind: "command", canAutoApprove: true });
-        void driver.resolveApproval(event.approvalId, "acceptForSession");
+        expect(event).toMatchObject({ kind: "command", title: "Run command outside sandbox?" });
+        expect(event).not.toHaveProperty("canAutoApprove");
+        void driver.resolveApproval(event.approvalId, "accept");
       }
       if (event.type === "turn.completed") complete();
     });
@@ -136,6 +137,39 @@ describe("Codex app-server contract", () => {
     expect(events.some((event) => event.type === "approval.requested")).toBe(false);
     expect(events.some((event) => event.type === "agent.message.delta" && event.delta.includes("denied filesystem access"))).toBe(true);
     await driver.stop();
+  });
+
+  it("rejects filesystem grants that escape through a directory link", async () => {
+    const temporary = await mkdtemp(path.join(os.tmpdir(), "pulse-path-policy-"));
+    const registered = path.join(temporary, "registered");
+    const outside = path.join(temporary, "outside");
+    const linked = path.join(registered, "linked");
+    await mkdir(registered);
+    await mkdir(outside);
+    await symlink(outside, linked, process.platform === "win32" ? "junction" : "dir");
+    const linkedProject: Project = { ...project, canonicalPath: await realpath(registered) };
+    const driver = new CodexAppServerDriver({
+      executable: process.execPath,
+      args: [fixture, "symlink-permission"],
+      env: { ...process.env, FAKE_PERMISSION_PATH: path.join(linked, "new-file.txt") },
+      verifyVersion: false,
+    });
+    const events: AgentEvent[] = [];
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    driver.subscribe((event) => { events.push(event); if (event.type === "turn.completed") complete(); });
+
+    try {
+      await driver.start();
+      const sessionId = await driver.createSession(linkedProject, {});
+      await driver.startTurn(sessionId, "request linked write permission");
+      await completed;
+      expect(events.some((event) => event.type === "approval.requested")).toBe(false);
+      expect(events.some((event) => event.type === "agent.message.delta" && event.delta.includes("denied filesystem access"))).toBe(true);
+    } finally {
+      await driver.stop();
+      await rm(temporary, { recursive: true, force: true });
+    }
   });
 
   it("blocks new turns while the execution environment is disconnected", async () => {

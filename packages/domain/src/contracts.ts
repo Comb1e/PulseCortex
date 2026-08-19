@@ -14,6 +14,7 @@ import type {
   Project,
   SessionId,
   SessionOptions,
+  ResumeSessionOptions,
   SessionView,
   QuestionView,
   TurnId,
@@ -44,14 +45,14 @@ export interface AgentDriver {
   start(): Promise<AgentCapabilities>;
   stop(): Promise<void>;
   createSession(project: Project, options: SessionOptions): Promise<SessionId>;
-  resumeSession(id: SessionId, project: Project): Promise<void>;
+  resumeSession(id: SessionId, project: Project, options: ResumeSessionOptions): Promise<void>;
   listSessions(projects: Project[]): Promise<AgentSessionInfo[]>;
   listInstructionPresets(): Promise<AgentInstructionPreset[]>;
   selectInstructionPreset(id: SessionId, presetId: string): Promise<AgentInstructionPreset>;
   startTurn(id: SessionId, prompt: string): Promise<TurnId>;
   steerTurn(id: SessionId, text: string): Promise<void>;
   interruptTurn(id: SessionId): Promise<void>;
-  resolveApproval(id: ApprovalId, decision: "accept" | "acceptForSession" | "decline" | "cancel"): Promise<void>;
+  resolveApproval(id: ApprovalId, decision: "accept" | "decline" | "cancel"): Promise<void>;
   resolveInput(id: string, answers: Record<string, string>): Promise<void>;
   subscribe(handler: (event: AgentEvent) => void): Unsubscribe;
 }
