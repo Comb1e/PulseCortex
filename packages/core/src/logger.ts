@@ -93,6 +93,12 @@ interface LiveRecord {
   lifecycle: "active" | "settled";
 }
 
+interface TerminalRecord {
+  rendered: string;
+  lines: number;
+  liveKey?: string;
+}
+
 interface RendererTrace {
   at: number;
   transition: string;
@@ -109,6 +115,7 @@ interface RendererTrace {
 
 class PrettyLogStream extends Writable {
   private buffered = "";
+  private readonly terminalRecords: TerminalRecord[] = [];
   private readonly liveRecords = new Map<string, LiveRecord>();
   private readonly recentFingerprints = new Map<string, string>();
   private footerColumns: number | null | undefined;
@@ -164,57 +171,59 @@ class PrettyLogStream extends Writable {
       return;
     }
 
-    if (!this.canClearFooter()) {
+    const rendered = this.renderLiveRecord(record);
+    const previousIndex = this.terminalRecords.findIndex((entry) => entry.liveKey === event.liveKey);
+    const previous = previousIndex >= 0 ? this.terminalRecords[previousIndex] : undefined;
+    const clearLines = previous
+      ? this.terminalRecords.slice(previousIndex).reduce((total, entry) => total + entry.lines, 0)
+      : this.liveFooterLines();
+
+    if (!this.canClearRange(clearLines)) {
       const abandoned = this.liveRecords.size;
-      this.liveRecords.clear();
-      const rendered = this.renderLiveRecord(record);
-      if (event.lifecycle === "active" && rendered.lines < this.terminalRows()) {
-        this.liveRecords.set(event.liveKey, { ...event, ...rendered, fingerprint });
-      }
+      if (previousIndex >= 0) this.terminalRecords.splice(previousIndex, 1);
+      this.terminalRecords.push({ ...rendered, liveKey: event.liveKey });
+      this.liveRecords.set(event.liveKey, { ...event, ...rendered, fingerprint });
       this.rememberFingerprint(event.liveKey, fingerprint);
       this.emitFrame(rendered.rendered, at, "footer-reset", event.messageId, 0, `footer-geometry-unreachable-with-${abandoned}-entries`);
       return;
     }
 
-    const clearedLines = this.liveFooterLines();
-    const committed = this.takeSettledExcept(event.liveKey);
-    this.liveRecords.delete(event.liveKey);
+    if (previousIndex >= 0) this.terminalRecords.splice(previousIndex, 1);
+    this.terminalRecords.push({ ...rendered, liveKey: event.liveKey });
     this.liveRecords.set(event.liveKey, {
       ...event,
-      ...this.renderLiveRecord(record),
+      ...rendered,
       fingerprint,
     });
     this.rememberFingerprint(event.liveKey, fingerprint);
 
-    while (this.liveFooterLines() >= this.terminalRows()) {
-      const oldestKey = this.liveRecords.keys().next().value as string | undefined;
-      if (!oldestKey) break;
-      committed.push(this.liveRecords.get(oldestKey)!.rendered);
-      this.liveRecords.delete(oldestKey);
-    }
-
-    const frame = `${this.clearTerminalLines(clearedLines)}${committed.join("")}${this.renderLiveRecords()}`;
+    const start = previousIndex >= 0 ? previousIndex : this.firstLiveIndex();
+    const frame = `${this.clearTerminalLines(clearLines)}${this.renderTerminalRecords(start)}`;
     const transition = event.lifecycle === "settled" ? "live-settled" : "live-updated";
-    this.emitFrame(frame, at, transition, event.messageId, clearedLines, committed.length ? "settled-or-overflow-committed" : undefined);
+    this.emitFrame(frame, at, transition, event.messageId, clearLines);
   }
 
   private writeTerminalRecord(content: string, at: number): void {
+    const rendered = wrapForTerminal(content, this.terminalWidth());
     if (!this.liveStatus || !this.liveRecords.size) {
+      this.terminalRecords.push(rendered);
       this.emitFrame(content, at, "ordinary", undefined, 0);
       return;
     }
 
-    if (!this.canClearFooter()) {
+    const start = this.firstLiveIndex();
+    const footerLines = this.liveFooterLines();
+    if (!this.canClearRange(footerLines)) {
       const abandoned = this.liveRecords.size;
-      this.liveRecords.clear();
+      // Keep the logical footer records so a later update can still replace them.
+      this.terminalRecords.splice(start, 0, rendered);
       this.emitFrame(content, at, "footer-reset", undefined, 0, `footer-geometry-unreachable-with-${abandoned}-entries`);
       return;
     }
 
-    const clearedLines = this.liveFooterLines();
-    const settled = this.takeSettledExcept(null);
-    const frame = `${this.clearTerminalLines(clearedLines)}${settled.join("")}${content}${this.renderLiveRecords()}`;
-    this.emitFrame(frame, at, "ordinary-with-footer", undefined, clearedLines, settled.length ? "settled-committed" : undefined);
+    this.terminalRecords.splice(start, 0, rendered);
+    const frame = `${this.clearTerminalLines(footerLines)}${this.renderTerminalRecords(start)}`;
+    this.emitFrame(frame, at, "ordinary-with-footer", undefined, footerLines);
   }
 
   private liveEvent(record: Record<string, unknown>): { liveKey: string; messageId: string; lifecycle: LiveRecord["lifecycle"] } | null {
@@ -247,18 +256,8 @@ class PrettyLogStream extends Writable {
     return `\u001b[${lines}A${"\u001b[2K\u001b[1B".repeat(lines)}\u001b[${lines}A\r`;
   }
 
-  private takeSettledExcept(except: string | null): string[] {
-    const committed: string[] = [];
-    for (const [key, entry] of this.liveRecords) {
-      if (entry.lifecycle !== "settled" || key === except) continue;
-      committed.push(entry.rendered);
-      this.liveRecords.delete(key);
-    }
-    return committed;
-  }
-
-  private renderLiveRecords(): string {
-    return [...this.liveRecords.values()].map((entry) => entry.rendered).join("");
+  private renderTerminalRecords(start: number): string {
+    return this.terminalRecords.slice(start).map((entry) => entry.rendered).join("");
   }
 
   private renderLiveRecord(record: Record<string, unknown>): { rendered: string; lines: number } {
@@ -268,12 +267,18 @@ class PrettyLogStream extends Writable {
   }
 
   private liveFooterLines(): number {
-    return [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
+    const start = this.firstLiveIndex();
+    if (start < 0) return 0;
+    return this.terminalRecords.slice(start).reduce((total, entry) => total + entry.lines, 0);
   }
 
-  private canClearFooter(): boolean {
-    if (!this.liveRecords.size) return true;
-    return this.footerColumns === this.terminalColumns() && this.liveFooterLines() < this.terminalRows();
+  private firstLiveIndex(): number {
+    return this.terminalRecords.findIndex((entry) => entry.liveKey !== undefined);
+  }
+
+  private canClearRange(lines: number): boolean {
+    if (!lines) return true;
+    return this.footerColumns === this.terminalColumns() && lines < this.terminalRows();
   }
 
   private rememberFingerprint(key: string, fingerprint: string): void {

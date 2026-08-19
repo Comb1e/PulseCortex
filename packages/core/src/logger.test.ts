@@ -196,6 +196,38 @@ describe("daemon logger", () => {
     expect(output.indexOf("Second status")).toBeLessThan(output.indexOf("Updated first status"));
   });
 
+  it("replaces a message after an intervening log without duplicating its ID", () => {
+    const terminal = new TerminalScreen(120, 30);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: "Before" } } }, "Feishu outbound message");
+    logger.info({ connected: true }, "Another terminal log");
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed", safeSummary: "After" } } }, "Feishu outbound message");
+
+    const output = terminal.text();
+    expect(output).not.toContain("Before");
+    expect(output).toContain("After");
+    expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
+    expect((output.match(/Another terminal log/g) ?? [])).toHaveLength(1);
+  });
+
+  it("keeps keyed records replaceable alongside another live record", () => {
+    const terminal = new TerminalScreen(120, 30);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: "First" } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-2", content: { phase: "working", safeSummary: "Second" } } }, "Feishu outbound message");
+    logger.info({ connected: true }, "Intervening terminal log");
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed", safeSummary: "Updated first" } } }, "Feishu outbound message");
+
+    const output = terminal.text();
+    expect(output).not.toContain("First");
+    expect(output).toContain("Updated first");
+    expect(output).toContain("Second");
+    expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
+    expect((output.match(/message-2/g) ?? [])).toHaveLength(1);
+  });
+
   it("retires a live status when the same message becomes a result", () => {
     const terminal = new TerminalScreen(100);
     const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
