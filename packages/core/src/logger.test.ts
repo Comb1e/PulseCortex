@@ -105,7 +105,7 @@ describe("daemon logger", () => {
     expect(terminal.writeCount()).toBe(2);
   });
 
-  it("appends complete updates when a live message is taller than the terminal", () => {
+  it("replaces a live message even when it is taller than the terminal", () => {
     const terminal = new TerminalScreen(40, 6);
     const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
 
@@ -113,10 +113,9 @@ describe("daemon logger", () => {
     logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed", safeSummary: "y".repeat(200) } } }, "Feishu outbound message");
 
     const output = terminal.text().replaceAll("\n", "");
-    expect(output).toContain(`"safeSummary": "${"x".repeat(200)}"`);
+    expect(output).not.toContain(`"safeSummary": "${"x".repeat(200)}"`);
     expect(output).toContain(`"safeSummary": "${"y".repeat(200)}"`);
-    expect((output.match(/message-1/g) ?? [])).toHaveLength(2);
-    expect(output).not.toContain("\u001b[");
+    expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
   });
 
   it("keeps only the latest resolved approval entry for a message ID", () => {
@@ -156,16 +155,22 @@ describe("daemon logger", () => {
     expect(output).not.toContain("\u001b[");
   });
 
-  it("redraws live messages around an ordinary terminal log", () => {
+  it("replays interleaved terminal logs after replacing an earlier message ID", () => {
     const terminal = new TerminalScreen();
     const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
 
-    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: "One visible status" } } }, "Feishu outbound message");
-    logger.info({ connected: true }, "Feishu connection state changed");
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: "First status" } } }, "Feishu outbound message");
+    logger.info({ connected: true }, "Interleaved ordinary log");
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-2", content: { phase: "working", safeSummary: "Second status" } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed", safeSummary: "Updated first status" } } }, "Feishu outbound message");
 
     const output = terminal.text();
-    expect((output.match(/One visible status/g) ?? [])).toHaveLength(1);
-    expect((output.match(/Feishu connection state changed/g) ?? [])).toHaveLength(1);
+    expect(output).not.toContain("First status");
+    expect((output.match(/Interleaved ordinary log/g) ?? [])).toHaveLength(1);
+    expect((output.match(/Second status/g) ?? [])).toHaveLength(1);
+    expect((output.match(/Updated first status/g) ?? [])).toHaveLength(1);
+    expect(output.indexOf("Interleaved ordinary log")).toBeLessThan(output.indexOf("Second status"));
+    expect(output.indexOf("Second status")).toBeLessThan(output.indexOf("Updated first status"));
   });
 
   it("retires a live status when the same message becomes a result", () => {

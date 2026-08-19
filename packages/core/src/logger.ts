@@ -11,7 +11,7 @@ const DIM = "\u001b[2m";
 const LOG_METADATA = new Set(["level", "time", "pid", "hostname", "service", "msg"]);
 const LIVE_MESSAGE_KINDS = new Set(["status", "approval", "result"]);
 
-interface LogTarget { write(content: string): unknown; columns?: number; rows?: number }
+interface LogTarget { write(content: string): unknown; columns?: number }
 
 export interface LoggerOptions {
   output?: LogTarget;
@@ -83,9 +83,17 @@ function wrapForTerminal(value: string, maxCells: number): { rendered: string; l
   return { rendered: wrapped, lines: Math.max(1, wrapped.split("\n").length - 1) };
 }
 
+interface TerminalRecord {
+  rendered: string;
+  lines: number;
+  liveKey?: string;
+  fingerprint?: string;
+}
+
 class PrettyLogStream extends Writable {
   private buffered = "";
-  private readonly liveRecords = new Map<string, { rendered: string; lines: number; fingerprint: string }>();
+  private readonly terminalRecords: TerminalRecord[] = [];
+  private readonly liveRecords = new Map<string, TerminalRecord>();
 
   constructor(private readonly target: LogTarget, private readonly color: boolean, private readonly liveStatus = false) { super(); }
 
@@ -114,26 +122,44 @@ class PrettyLogStream extends Writable {
         const fingerprint = this.liveFingerprint(record);
         if (this.liveRecords.get(liveKey)?.fingerprint === fingerprint) return;
         const rendered = wrapForTerminal(formatLogRecord(record, false), this.terminalWidth());
-        const clear = this.prepareLiveRewrite();
-        this.liveRecords.set(liveKey, { ...rendered, fingerprint });
-        const frame = `${clear}${this.renderLiveRecords()}`;
-        if (!this.liveRecordsFit()) this.liveRecords.clear();
-        this.target.write(frame);
+        this.writeLiveRecord({ ...rendered, liveKey, fingerprint });
         return;
       }
-      if (this.liveStatus && this.liveRecords.size) {
-        const clear = this.prepareLiveRewrite();
-        this.target.write(`${clear}${formatLogRecord(record, this.color)}${this.renderLiveRecords()}`);
-        return;
-      }
-      this.target.write(formatLogRecord(record, this.color));
+      this.writeTerminalRecord(formatLogRecord(record, this.color));
     }
     catch {
-      if (this.liveStatus && this.liveRecords.size) {
-        const clear = this.prepareLiveRewrite();
-        this.target.write(`${clear}${line}\n${this.renderLiveRecords()}`);
-      } else this.target.write(`${line}\n`);
+      this.writeTerminalRecord(`${line}\n`);
     }
+  }
+
+  private writeLiveRecord(record: TerminalRecord & { liveKey: string; fingerprint: string }): void {
+    const previous = this.liveRecords.get(record.liveKey);
+    if (!previous) {
+      this.terminalRecords.push(record);
+      this.liveRecords.set(record.liveKey, record);
+      this.target.write(record.rendered);
+      return;
+    }
+
+    const previousIndex = this.terminalRecords.indexOf(previous);
+    if (previousIndex < 0) throw new Error(`Missing terminal record for ${record.liveKey}`);
+    const replay = this.terminalRecords.slice(previousIndex + 1);
+    const lines = previous.lines + replay.reduce((total, entry) => total + entry.lines, 0);
+    this.terminalRecords.splice(previousIndex, 1);
+    this.terminalRecords.push(record);
+    this.liveRecords.set(record.liveKey, record);
+    this.target.write(`${this.clearTerminalLines(lines)}${replay.map((entry) => entry.rendered).join("")}${record.rendered}`);
+    this.pruneTerminalHistory();
+  }
+
+  private writeTerminalRecord(content: string): void {
+    if (!this.liveStatus || !this.liveRecords.size) {
+      this.target.write(content);
+      return;
+    }
+    const record = wrapForTerminal(content, this.terminalWidth());
+    this.terminalRecords.push(record);
+    this.target.write(record.rendered);
   }
 
   private liveKey(record: Record<string, unknown>): string | null {
@@ -160,32 +186,19 @@ class PrettyLogStream extends Writable {
     return JSON.stringify(value) ?? String(value);
   }
 
-  private prepareLiveRewrite(): string {
-    if (!this.liveRecords.size) return "";
-    const lines = [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
-    if (lines >= this.terminalRows()) {
-      this.liveRecords.clear();
-      return "";
-    }
+  private clearTerminalLines(lines: number): string {
     return `\u001b[${lines}A${"\u001b[2K\u001b[1B".repeat(lines)}\u001b[${lines}A\r`;
   }
 
-  private renderLiveRecords(): string {
-    return [...this.liveRecords.values()].map((entry) => entry.rendered).join("");
-  }
-
-  private liveRecordsFit(): boolean {
-    const lines = [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
-    return lines < this.terminalRows();
+  private pruneTerminalHistory(): void {
+    const firstLiveIndex = this.terminalRecords.findIndex((entry) => entry.liveKey !== undefined);
+    if (firstLiveIndex > 0) this.terminalRecords.splice(0, firstLiveIndex);
   }
 
   private terminalWidth(): number {
     return typeof this.target.columns === "number" && Number.isFinite(this.target.columns) ? Math.max(4, Math.floor(this.target.columns) - 1) : 119;
   }
 
-  private terminalRows(): number {
-    return typeof this.target.rows === "number" && Number.isFinite(this.target.rows) ? Math.max(2, Math.floor(this.target.rows)) : Number.POSITIVE_INFINITY;
-  }
 }
 
 class DailyLogStream extends Writable {
