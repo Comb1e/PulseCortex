@@ -1,5 +1,5 @@
-import { appendFileSync, mkdirSync } from "node:fs";
-import { mkdir, readdir, stat, unlink } from "node:fs/promises";
+import { appendFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { mkdir, readdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { Writable } from "node:stream";
 import pino, { type Logger, type StreamEntry } from "pino";
@@ -25,6 +25,11 @@ function pad(value: number): string { return String(value).padStart(2, "0"); }
 function dateStamp(value: unknown): string {
   const date = new Date(typeof value === "number" ? value : Date.now());
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function hourStamp(value: unknown): string {
+  const date = new Date(typeof value === "number" ? value : Date.now());
+  return pad(date.getHours());
 }
 
 function timestamp(value: unknown): string {
@@ -185,6 +190,13 @@ class PrettyLogStream extends Writable {
 
 class DailyLogStream extends Writable {
   private buffered = "";
+  private activeDate: string | undefined;
+  private activeHour: string | undefined;
+  private activeChunk = 0;
+  private activePath: string | undefined;
+  private activeBytes = 0;
+
+  private static readonly MAX_CHUNK_BYTES = 10 * 1024 * 1024;
 
   constructor(private readonly directory: string) {
     super();
@@ -218,29 +230,82 @@ class DailyLogStream extends Writable {
 
   private writeLine(line: string): void {
     const record = JSON.parse(line) as Record<string, unknown>;
-    const filePath = path.join(this.directory, `${dateStamp(record["time"])}.log`);
-    appendFileSync(filePath, formatLogRecord(record, false), { encoding: "utf8", mode: 0o600 });
+    const date = dateStamp(record["time"]);
+    const hour = hourStamp(record["time"]);
+    const formatted = formatLogRecord(record, false);
+    const bytes = Buffer.byteLength(formatted, "utf8");
+
+    if (date !== this.activeDate || hour !== this.activeHour) this.selectLatestChunk(date, hour);
+    if (this.activeBytes > 0 && this.activeBytes + bytes > DailyLogStream.MAX_CHUNK_BYTES) {
+      this.selectChunk(date, hour, this.activeChunk + 1, 0);
+    }
+
+    appendFileSync(this.activePath!, formatted, { encoding: "utf8", mode: 0o600 });
+    this.activeBytes += bytes;
+  }
+
+  private selectLatestChunk(date: string, hour: string): void {
+    const folder = path.join(this.directory, date);
+    mkdirSync(folder, { recursive: true, mode: 0o700 });
+    const prefix = `${hour}-`;
+    const chunks = readdirSync(folder)
+      .filter((name) => name.startsWith(prefix) && /^\d{2}-\d{4,}\.log$/u.test(name))
+      .map((name) => Number(name.slice(prefix.length, -4)))
+      .filter((chunk) => Number.isSafeInteger(chunk) && chunk > 0)
+      .sort((left, right) => right - left);
+    const latest = chunks[0] ?? 0;
+    const latestPath = latest > 0 ? path.join(folder, this.chunkName(hour, latest)) : undefined;
+    const latestBytes = latestPath ? statSync(latestPath).size : 0;
+    if (latest > 0 && latestBytes < DailyLogStream.MAX_CHUNK_BYTES) this.selectChunk(date, hour, latest, latestBytes);
+    else this.selectChunk(date, hour, latest + 1, 0);
+  }
+
+  private selectChunk(date: string, hour: string, chunk: number, bytes: number): void {
+    const folder = path.join(this.directory, date);
+    mkdirSync(folder, { recursive: true, mode: 0o700 });
+    this.activeDate = date;
+    this.activeHour = hour;
+    this.activeChunk = chunk;
+    this.activePath = path.join(folder, this.chunkName(hour, chunk));
+    this.activeBytes = bytes;
+  }
+
+  private chunkName(hour: string, chunk: number): string {
+    return `${hour}-${String(chunk).padStart(4, "0")}.log`;
   }
 }
 
 export async function retainDailyLogs(directory: string, maxAgeDays: number, maxBytes: number, now = Date.now()): Promise<{ removed: number; bytes: number }> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const today = dateStamp(now);
-  const names = (await readdir(directory)).filter((name) => /^\d{4}-\d{2}-\d{2}\.log$/u.test(name));
-  const entries = await Promise.all(names.map(async (name) => ({ name, info: await stat(path.join(directory, name)) })));
+  const names = (await readdir(directory, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory() && /^\d{4}-\d{2}-\d{2}$/u.test(entry.name))
+    .map((entry) => entry.name);
+  const entries = await Promise.all(names.map(async (name) => ({ name, info: await stat(path.join(directory, name)), size: await directoryBytes(path.join(directory, name)) })));
   entries.sort((a, b) => b.name.localeCompare(a.name));
   const cutoff = now - maxAgeDays * 86_400_000;
   let keptBytes = 0;
   let removed = 0;
   for (const entry of entries) {
-    const isCurrent = entry.name === `${today}.log`;
-    const remove = !isCurrent && (entry.info.mtimeMs < cutoff || keptBytes + entry.info.size > maxBytes);
+    const isCurrent = entry.name === today;
+    const remove = !isCurrent && (entry.info.mtimeMs < cutoff || keptBytes + entry.size > maxBytes);
     if (remove) {
-      await unlink(path.join(directory, entry.name));
+      await rm(path.join(directory, entry.name), { recursive: true, force: true });
       removed += 1;
-    } else keptBytes += entry.info.size;
+    } else keptBytes += entry.size;
   }
   return { removed, bytes: keptBytes };
+}
+
+async function directoryBytes(directory: string): Promise<number> {
+  const entries = await readdir(directory, { withFileTypes: true });
+  let total = 0;
+  for (const entry of entries) {
+    const target = path.join(directory, entry.name);
+    if (entry.isDirectory()) total += await directoryBytes(target);
+    else if (entry.isFile()) total += (await stat(target)).size;
+  }
+  return total;
 }
 
 export function createLogger(level = "info", options: LoggerOptions = {}): Logger {

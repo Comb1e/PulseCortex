@@ -264,7 +264,7 @@ describe("Codex app-server contract", () => {
     await driver.stop();
   });
 
-  it("clears pending requests resolved by the app-server", async () => {
+  it("clears pending requests resolved by the app-server during validation", async () => {
     const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "server-resolved"], verifyVersion: false });
     const events: AgentEvent[] = [];
     let complete!: () => void;
@@ -275,10 +275,11 @@ describe("Codex app-server contract", () => {
     await driver.startTurn(sessionId, "wait for cancellation");
     await completed;
 
+    const resolved = events.find((event) => event.type === "request.resolved");
+    expect(resolved).toEqual(expect.objectContaining({ sessionId, requestId: `${sessionId}:${resolved?.turnId}:cmd` }));
     const approval = events.find((event) => event.type === "approval.requested");
-    expect(approval).toBeDefined();
-    expect(events).toContainEqual(expect.objectContaining({ type: "request.resolved", requestId: approval && "approvalId" in approval ? approval.approvalId : "" }));
-    if (approval?.type === "approval.requested") await expect(driver.resolveApproval(approval.approvalId, "accept")).rejects.toThrow("stale");
+    if (approval?.type === "approval.requested") expect(approval.approvalId).toBe(resolved?.type === "request.resolved" ? resolved.requestId : undefined);
+    if (resolved?.type === "request.resolved") await expect(driver.resolveApproval(resolved.requestId, "accept")).rejects.toThrow("stale");
     await driver.stop();
   });
 

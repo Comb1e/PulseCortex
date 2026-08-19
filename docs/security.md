@@ -16,7 +16,7 @@ PulseCortex is remote code execution mediated by Codex. Treat the Feishu account
 - Secret-input questions are denied and interrupt the turn instead of asking for credentials over Feishu.
 - ANSI/control characters are removed; common and configured credential patterns are redacted; mobile payloads are bounded.
 - App credentials and the action signing key load only from process environment or a restricted local environment file. They are not command arguments, repository config, SQLite values, cards, or logs.
-- Audit rows record pairing, prompts by hash, sessions, approvals, stops, failures, and delivery outcomes. Every successfully delivered Feishu text or card is also recorded after action-token removal in the redacted daily `logs/YYYY-MM-DD.log` file.
+- Audit rows record pairing, prompts by hash, sessions, approvals, stops, failures, and delivery outcomes. Every successfully delivered Feishu text or card is also recorded after action-token removal in the redacted daily `logs/YYYY-MM-DD/HH-NNNN.log` chunks.
 
 ## Residual Risk
 

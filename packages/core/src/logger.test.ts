@@ -1,4 +1,4 @@
-import { readFile, readdir, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, stat, utimes, writeFile } from "node:fs/promises";
 import { PassThrough, Writable } from "node:stream";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
@@ -84,8 +84,9 @@ describe("daemon logger", () => {
 
     expect(terminalText()).toContain("INFO  Feishu connected");
     expect(terminalText()).toContain("  connected: true\n  token: [REDACTED]");
-    expect(await readdir(directory)).toEqual(["2026-08-18.log"]);
-    expect(await readFile(path.join(directory, "2026-08-18.log"), "utf8")).toBe(terminalText());
+    expect(await readdir(directory)).toEqual(["2026-08-18"]);
+    expect(await readdir(path.join(directory, "2026-08-18"))).toEqual(["09-0001.log"]);
+    expect(await readFile(path.join(directory, "2026-08-18", "09-0001.log"), "utf8")).toBe(terminalText());
     expect(terminalText()).not.toContain("secret-value");
   });
 
@@ -184,19 +185,20 @@ describe("daemon logger", () => {
 
   it("stores every update while replacing it in the terminal", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 19, 9, 5));
     const terminal = new PassThrough();
     const logger = createLogger("info", { output: terminal, color: false, liveStatus: true, logDir: directory });
 
     logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working" } } }, "Feishu outbound message");
     logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed" } } }, "Feishu outbound message");
 
-    const [fileName] = await readdir(directory);
-    const dailyLog = await readFile(path.join(directory, fileName!), "utf8");
+    const dailyLog = await readFile(path.join(directory, "2026-08-19", "09-0001.log"), "utf8");
     expect(dailyLog).toContain('"phase": "working"');
     expect(dailyLog).toContain('"phase": "completed"');
   });
 
-  it("rolls over to a new file when the local date changes", async () => {
+  it("rolls over to a new folder and chunk when the local date changes", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 7, 18, 23, 59, 59));
@@ -206,23 +208,104 @@ describe("daemon logger", () => {
     vi.setSystemTime(new Date(2026, 7, 19, 0, 0, 1));
     logger.info("After midnight");
 
-    expect((await readdir(directory)).sort()).toEqual(["2026-08-18.log", "2026-08-19.log"]);
-    expect(await readFile(path.join(directory, "2026-08-18.log"), "utf8")).toContain("Before midnight");
-    expect(await readFile(path.join(directory, "2026-08-19.log"), "utf8")).toContain("After midnight");
+    expect((await readdir(directory)).sort()).toEqual(["2026-08-18", "2026-08-19"]);
+    expect(await readFile(path.join(directory, "2026-08-18", "23-0001.log"), "utf8")).toContain("Before midnight");
+    expect(await readFile(path.join(directory, "2026-08-19", "00-0001.log"), "utf8")).toContain("After midnight");
   });
 
-  it("retains today's file while removing expired and over-budget daily logs", async () => {
+  it("rolls over to a new hourly chunk", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 18, 9, 59, 59));
+    const logger = createLogger("info", { output: new PassThrough(), color: false, logDir: directory });
+
+    logger.info("Before hour");
+    vi.setSystemTime(new Date(2026, 7, 18, 10, 0, 1));
+    logger.info("After hour");
+
+    expect((await readdir(path.join(directory, "2026-08-18"))).sort()).toEqual(["09-0001.log", "10-0001.log"]);
+  });
+
+  it("continues the latest non-full chunk after a restart", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 18, 9, 5));
+    createLogger("info", { output: new PassThrough(), color: false, logDir: directory }).info("Before restart");
+    createLogger("info", { output: new PassThrough(), color: false, logDir: directory }).info("After restart");
+
+    expect(await readdir(path.join(directory, "2026-08-18"))).toEqual(["09-0001.log"]);
+    const content = await readFile(path.join(directory, "2026-08-18", "09-0001.log"), "utf8");
+    expect(content).toContain("Before restart");
+    expect(content).toContain("After restart");
+  });
+
+  it("starts a new chunk after a restart when the latest chunk is full", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
+    const folder = path.join(directory, "2026-08-18");
+    await mkdir(folder);
+    await writeFile(path.join(folder, "09-0001.log"), Buffer.alloc(10 * 1024 * 1024));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 18, 9, 5));
+
+    createLogger("info", { output: new PassThrough(), color: false, logDir: directory }).info("After full chunk");
+
+    expect((await readdir(folder)).sort()).toEqual(["09-0001.log", "09-0002.log"]);
+    expect(await readFile(path.join(folder, "09-0002.log"), "utf8")).toContain("After full chunk");
+  });
+
+  it("rotates before a record would exceed 10 MiB and keeps records whole", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
+    const logger = createLogger("info", { output: new PassThrough(), color: false, logDir: directory });
+
+    logger.info({ payload: "x".repeat(6 * 1024 * 1024) }, "Large record");
+    logger.info({ payload: "y".repeat(6 * 1024 * 1024) }, "After rollover");
+
+    const [folderName] = await readdir(directory);
+    const folder = path.join(directory, folderName!);
+    await expect.poll(async () => (await readdir(folder)).length).toBe(2);
+    const files = (await readdir(folder)).sort();
+    expect(files).toHaveLength(2);
+    expect(files[0]).toMatch(/^\d{2}-0001\.log$/u);
+    expect(files[1]).toMatch(/^\d{2}-0002\.log$/u);
+    expect(await readFile(path.join(folder, files[0]!), "utf8")).toContain("Large record");
+    expect(await readFile(path.join(folder, files[1]!), "utf8")).toContain("After rollover");
+    expect((await stat(path.join(folder, files[0]!))).size).toBeLessThanOrEqual(10 * 1024 * 1024);
+    expect((await stat(path.join(folder, files[1]!))).size).toBeLessThanOrEqual(10 * 1024 * 1024);
+  });
+
+  it("gives an oversized UTF-8 record its own chunk", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
+    const logger = createLogger("info", { output: new PassThrough(), color: false, logDir: directory });
+
+    logger.info({ payload: "é".repeat(5_300_000) }, "Oversized UTF-8 record");
+    logger.info("After oversized record");
+
+    const [folderName] = await readdir(directory);
+    const folder = path.join(directory, folderName!);
+    await expect.poll(async () => (await readdir(folder)).length).toBe(2);
+    const files = (await readdir(folder)).sort();
+    expect(files).toHaveLength(2);
+    expect((await stat(path.join(folder, files[0]!))).size).toBeGreaterThan(10 * 1024 * 1024);
+    expect(await readFile(path.join(folder, files[0]!), "utf8")).toContain("Oversized UTF-8 record");
+    expect(await readFile(path.join(folder, files[1]!), "utf8")).toContain("After oversized record");
+  });
+
+  it("retains today's folder while removing expired and over-budget daily folders", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
     const now = new Date(2026, 7, 19, 12).getTime();
-    const recent = path.join(directory, "2026-08-18.log");
-    const expired = path.join(directory, "2026-08-01.log");
-    await writeFile(path.join(directory, "2026-08-19.log"), "today", "utf8");
-    await writeFile(recent, "recent", "utf8");
-    await writeFile(expired, "expired", "utf8");
+    const today = path.join(directory, "2026-08-19");
+    const recent = path.join(directory, "2026-08-18");
+    const expired = path.join(directory, "2026-08-01");
+    await Promise.all([today, recent, expired].map((folder) => mkdir(folder, { recursive: true })));
+    await writeFile(path.join(today, "12-0001.log"), "today", "utf8");
+    await writeFile(path.join(recent, "12-0001.log"), "recent", "utf8");
+    await writeFile(path.join(expired, "12-0001.log"), "expired", "utf8");
     await utimes(recent, new Date(now - 86_400_000), new Date(now - 86_400_000));
     await utimes(expired, new Date(now - 18 * 86_400_000), new Date(now - 18 * 86_400_000));
+    await writeFile(path.join(directory, "2026-08-17.log"), "flat", "utf8");
+    await writeFile(path.join(directory, "unrelated.txt"), "other", "utf8");
 
     expect(await retainDailyLogs(directory, 7, 8, now)).toEqual({ removed: 2, bytes: 5 });
-    expect(await readdir(directory)).toEqual(["2026-08-19.log"]);
+    expect((await readdir(directory)).sort()).toEqual(["2026-08-17.log", "2026-08-19", "unrelated.txt"]);
   });
 });
