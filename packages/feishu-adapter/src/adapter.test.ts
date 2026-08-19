@@ -59,7 +59,7 @@ describe("Feishu card rendering", () => {
     expect(JSON.stringify(outbound)).not.toContain("secret-stop");
   });
 
-  it("offers only one-time approval for command and network requests", () => {
+  it("offers auto approve only for command requests", () => {
     const approval = approvalCard({ approvalId: "a", sessionId: "s", turnId: "t", kind: "network", title: "Network", network: [{ host: "example.com", protocol: "https" }], actionTokens: { accept: "one", decline: "no", cancel: "stop" }, expiresAt: Date.now() + 60_000 });
     const json = JSON.stringify(approval);
     expect(json).toContain('"schema":"2.0"');
@@ -67,10 +67,10 @@ describe("Feishu card rendering", () => {
     expect(json).toContain("Allow once");
     expect(json).not.toContain("Auto approve");
 
-    const command = approvalCard({ approvalId: "c", sessionId: "s", turnId: "t", kind: "command", title: "Command", command: "pnpm test", actionTokens: { accept: "one", decline: "no", cancel: "stop" }, expiresAt: Date.now() + 60_000 });
+    const command = approvalCard({ approvalId: "c", sessionId: "s", turnId: "t", kind: "command", title: "Command", command: "pnpm test", actionTokens: { accept: "one", autoApprove: "auto", decline: "no", cancel: "stop" }, expiresAt: Date.now() + 60_000 });
     const commandJson = JSON.stringify(command);
-    expect(commandJson).toContain("Allow once");
-    expect(commandJson).not.toContain("Auto approve");
+    expect(commandJson).toContain("Auto approve");
+    expect(commandJson).toContain("approval.acceptForSession");
   });
 
   it("replaces an approval with a static executed-choice card", () => {
@@ -79,6 +79,10 @@ describe("Feishu card rendering", () => {
     expect(json).toContain("Choice executed");
     expect(json).toContain("Allowed once");
     expect(json).not.toContain('"tag":"button"');
+
+    const autoApproved = JSON.stringify(resolvedApprovalCard({ title: "Command approval requested", decision: "acceptForSession", resolvedAt: 1 }));
+    expect(autoApproved).toContain("Auto approve enabled");
+    expect(autoApproved).not.toContain('"tag":"button"');
   });
 
   it("recalls a resolved approval so the working card returns to the bottom", async () => {

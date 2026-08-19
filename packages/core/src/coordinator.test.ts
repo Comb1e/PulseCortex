@@ -32,7 +32,7 @@ class FakeDriver implements AgentDriver {
   async startTurn(id: SessionId, prompt: string): Promise<TurnId> { this.started.push({ id, prompt }); return this.started.length === 1 ? "turn" : `turn-${this.started.length}`; }
   async steerTurn(id: SessionId, text: string): Promise<void> { this.steered.push({ id, text }); }
   async interruptTurn(_id: SessionId): Promise<void> {}
-  async resolveApproval(id: ApprovalId, decision: "accept" | "decline" | "cancel"): Promise<void> { this.decisions.push({ id, decision }); }
+  async resolveApproval(id: ApprovalId, decision: "accept" | "acceptForSession" | "decline" | "cancel"): Promise<void> { this.decisions.push({ id, decision }); }
   async resolveInput(_id: string, _answers: Record<string, string>): Promise<void> {}
   subscribe(handler: (event: AgentEvent) => void): Unsubscribe { this.handlers.add(handler); return () => this.handlers.delete(handler); }
   emit(event: AgentEvent): void { for (const handler of this.handlers) handler(event); }
@@ -144,7 +144,7 @@ describe("session coordinator", () => {
     expect(messaging.statuses.map((view) => view.phase)).toEqual(["starting", "working"]);
   });
 
-  it("never offers session-wide command auto approve", async () => {
+  it("enables Codex auto approve from command cards only", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();
     const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
@@ -156,9 +156,18 @@ describe("session coordinator", () => {
     coordinators.push(coordinator);
     await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "run commands", receivedAt: Date.now() });
 
-    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "command", kind: "command", title: "Run command outside sandbox?", command: "pnpm test", occurredAt: Date.now() });
+    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "command", kind: "command", title: "Run command outside sandbox?", command: "pnpm test", canAutoApprove: true, occurredAt: Date.now() });
     await vi.waitFor(() => expect(messaging.approvals).toHaveLength(1));
-    expect(JSON.stringify(messaging.approvals[0]!.actionTokens)).not.toContain("autoApprove");
+    const autoApprove = messaging.approvals[0]!.actionTokens.autoApprove;
+    expect(autoApprove).toBeTruthy();
+    await messaging.action!({ eventId: "auto", actor, kind: "approval.acceptForSession", token: autoApprove!, receivedAt: Date.now() });
+
+    expect(driver.decisions).toEqual([{ id: "command", decision: "acceptForSession" }]);
+    expect(messaging.approvalUpdates).toEqual([expect.objectContaining({ decision: "acceptForSession" })]);
+
+    driver.emit({ type: "approval.requested", sessionId: "session", turnId: "turn", approvalId: "network", kind: "network", title: "Network access", network: [{ host: "example.com", protocol: "https" }], canAutoApprove: false, occurredAt: Date.now() });
+    await vi.waitFor(() => expect(messaging.approvals).toHaveLength(2));
+    expect(messaging.approvals[1]!.actionTokens.autoApprove).toBeUndefined();
   });
 
   it.each([

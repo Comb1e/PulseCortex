@@ -105,15 +105,14 @@ describe("Codex app-server contract", () => {
     await driver.stop();
   });
 
-  it("keeps command sandbox escape approval one-time only", async () => {
-    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "command-approval"], verifyVersion: false });
+  it("maps command auto approve to the native session decision", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "auto-approve"], verifyVersion: false });
     let complete!: () => void;
     const completed = new Promise<void>((resolve) => { complete = resolve; });
     driver.subscribe((event) => {
       if (event.type === "approval.requested") {
-        expect(event).toMatchObject({ kind: "command", title: "Run command outside sandbox?" });
-        expect(event).not.toHaveProperty("canAutoApprove");
-        void driver.resolveApproval(event.approvalId, "accept");
+        expect(event).toMatchObject({ kind: "command", title: "Run command outside sandbox?", canAutoApprove: true });
+        void driver.resolveApproval(event.approvalId, "acceptForSession");
       }
       if (event.type === "turn.completed") complete();
     });

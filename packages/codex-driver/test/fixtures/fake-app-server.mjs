@@ -127,10 +127,11 @@ lines.on("line", (line) => {
     } else if (scenario === "symlink-permission") {
       send({ id: "permission-rpc", method: "item/permissions/requestApproval", params: { threadId: sessionId, turnId, itemId: "permission", environmentId: null, startedAtMs: Date.now(), cwd: message.params.cwd, reason: "linked write path", permissions: { network: null, fileSystem: { read: null, write: null, entries: [{ access: "write", path: { type: "path", path: process.env["FAKE_PERMISSION_PATH"] } }] } } } });
     } else {
-      send({ id: "approval-rpc", method: "item/commandExecution/requestApproval", params: { threadId: sessionId, turnId, itemId: "cmd", startedAtMs: Date.now(), environmentId: null, command: "pnpm test", ...(scenario === "command-approval" ? {} : { networkApprovalContext: { host: "registry.npmjs.org", protocol: "https" } }) } });
+      send({ id: "approval-rpc", method: "item/commandExecution/requestApproval", params: { threadId: sessionId, turnId, itemId: "cmd", startedAtMs: Date.now(), environmentId: null, command: "pnpm test", ...(scenario === "auto-approve" || scenario === "command-approval" ? {} : { networkApprovalContext: { host: "registry.npmjs.org", protocol: "https" } }) } });
     }
   } else if (message.id === "approval-rpc") {
-    if (message.result?.decision !== "accept") process.exit(3);
+    const expectedDecision = scenario === "auto-approve" ? "acceptForSession" : "accept";
+    if (message.result?.decision !== expectedDecision) process.exit(3);
     send({ method: "item/commandExecution/outputDelta", params: { threadId: sessionId, turnId, itemId: "cmd", delta: "all tests passed\n" } });
     send({ method: "item/completed", params: { threadId: sessionId, turnId, completedAtMs: Date.now(), item: { type: "commandExecution", id: "cmd", command: "pnpm test", status: "completed", exitCode: 0 } } });
     send({ method: "turn/diff/updated", params: { threadId: sessionId, turnId, diff: "diff --git a/a b/a" } });

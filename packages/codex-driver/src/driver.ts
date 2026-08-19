@@ -133,6 +133,17 @@ function networkDestinations(params: CommandExecutionRequestApprovalParams): Net
   return (params.proposedNetworkPolicyAmendments ?? []).map((item) => ({ host: item.host, protocol: "network" }));
 }
 
+function canAutoApproveCommand(pending: PendingServerRequest): boolean {
+  if (pending.method === "execCommandApproval") return true;
+  if (pending.method !== "item/commandExecution/requestApproval") return false;
+  const params = pending.params as CommandExecutionRequestApprovalParams;
+  const available = params.availableDecisions;
+  return networkDestinations(params).length === 0
+    && !params.additionalPermissions?.network?.enabled
+    && !params.additionalPermissions?.fileSystem
+    && (!available || available.includes("acceptForSession"));
+}
+
 export class CodexAppServerDriver implements AgentDriver {
   private readonly transport: JsonlRpcTransport;
   private readonly handlers = new Set<(event: AgentEvent) => void>();
@@ -480,9 +491,12 @@ export class CodexAppServerDriver implements AgentDriver {
     await this.transport.request("turn/interrupt", { threadId: id, turnId });
   }
 
-  async resolveApproval(id: ApprovalId, decision: "accept" | "decline" | "cancel"): Promise<void> {
+  async resolveApproval(id: ApprovalId, decision: "accept" | "acceptForSession" | "decline" | "cancel"): Promise<void> {
     const pending = this.pending.get(id);
     if (!pending) throw new Error("Approval is stale or already resolved");
+    if (decision === "acceptForSession" && !canAutoApproveCommand(pending)) {
+      throw new Error("Auto approve is restricted to command requests");
+    }
     this.pending.delete(id);
     if (pending.method === "item/permissions/requestApproval") {
       if (decision === "accept") {
@@ -490,7 +504,7 @@ export class CodexAppServerDriver implements AgentDriver {
         this.transport.respond(pending.rpcId, { permissions: { ...(requested["network"] ? { network: requested["network"] } : {}), ...(requested["fileSystem"] ? { fileSystem: requested["fileSystem"] } : {}) }, scope: "turn" });
       } else this.transport.respondError(pending.rpcId, -32001, decision === "cancel" ? "Permission request cancelled" : "Permission request declined");
     } else if (pending.method === "execCommandApproval" || pending.method === "applyPatchApproval") {
-      this.transport.respond(pending.rpcId, { decision: decision === "accept" ? "approved" : decision === "decline" ? { denied: { rejection: "Denied by PulseCortex owner" } } : "abort" });
+      this.transport.respond(pending.rpcId, { decision: decision === "accept" ? "approved" : decision === "acceptForSession" ? "approved_for_session" : decision === "decline" ? { denied: { rejection: "Denied by PulseCortex owner" } } : "abort" });
     } else this.transport.respond(pending.rpcId, { decision });
   }
 
@@ -536,7 +550,7 @@ export class CodexAppServerDriver implements AgentDriver {
         return;
       }
       if (!this.registerPending(approvalId, { rpcId: request.id, method: request.method, params }, sessionId, turnId)) return;
-      this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: network.length ? "network" : "command", title: network.length ? "Network access requested" : "Run command outside sandbox?", ...(input.reason ? { reason: input.reason } : {}), ...(input.command ? { command: summarizeCommand(input.command) } : {}), ...(network.length ? { network } : {}), occurredAt: now() });
+      this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: network.length ? "network" : "command", title: network.length ? "Network access requested" : "Run command outside sandbox?", ...(input.reason ? { reason: input.reason } : {}), ...(input.command ? { command: summarizeCommand(input.command) } : {}), ...(network.length ? { network } : {}), canAutoApprove: canAutoApproveCommand({ rpcId: request.id, method: request.method, params }), occurredAt: now() });
       return;
     }
     if (request.method === "item/fileChange/requestApproval") {
@@ -583,7 +597,7 @@ export class CodexAppServerDriver implements AgentDriver {
       if (!this.registerPending(approvalId, { rpcId: request.id, method: request.method, params }, sessionId, turnId)) return;
       const command = Array.isArray(params["command"]) ? (params["command"] as string[]).join(" ") : undefined;
       const fileChanges = params["fileChanges"] && typeof params["fileChanges"] === "object" ? Object.keys(params["fileChanges"] as object) : [];
-      this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: command ? "command" : "file", title: command ? "Run command outside sandbox?" : "File change approval requested", ...(command ? { command: summarizeCommand(command) } : {}), ...(fileChanges.length ? { files: fileChanges } : {}), occurredAt: now() });
+      this.emit({ type: "approval.requested", sessionId, turnId, approvalId, kind: command ? "command" : "file", title: command ? "Run command outside sandbox?" : "File change approval requested", ...(command ? { command: summarizeCommand(command) } : {}), ...(fileChanges.length ? { files: fileChanges } : {}), canAutoApprove: command ? canAutoApproveCommand({ rpcId: request.id, method: request.method, params }) : false, occurredAt: now() });
       return;
     }
     if (request.method === "currentTime/read") {

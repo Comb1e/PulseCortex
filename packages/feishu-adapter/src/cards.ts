@@ -74,10 +74,14 @@ export function approvalCard(view: ApprovalView): Card {
   if (view.paths?.length) details.push(`**Paths:**\n${view.paths.map((item) => `- ${escapeMarkdown(item)}`).join("\n")}`);
   if (view.network?.length) details.push(`**Destinations:**\n${view.network.map((item) => `- ${escapeMarkdown(item.protocol)}://${escapeMarkdown(item.host)}${item.port ? `:${item.port}` : ""}`).join("\n")}`);
   details.push(`**Expires:** ${new Date(view.expiresAt).toISOString()}`);
+  const approvalButtons = [button("Allow once", "approval.accept", view.actionTokens.accept, undefined, "primary")];
+  if (view.kind === "command" && view.actionTokens.autoApprove) {
+    approvalButtons.push(button("Auto approve", "approval.acceptForSession", view.actionTokens.autoApprove, undefined, "primary"));
+  }
   return baseCard(view.title, [
     markdown(details.join("\n\n")),
     buttonRow([
-      button("Allow once", "approval.accept", view.actionTokens.accept, undefined, "primary"),
+      ...approvalButtons,
       button("Deny", "approval.decline", view.actionTokens.decline, undefined, "danger"),
       button("Stop turn", "turn.stop", view.actionTokens.cancel),
     ]),
@@ -85,8 +89,8 @@ export function approvalCard(view: ApprovalView): Card {
 }
 
 export function resolvedApprovalCard(view: ApprovalResolutionView): Card {
-  const label = view.decision === "accept" ? "Allowed once" : view.decision === "decline" ? "Denied" : "Turn stopped";
-  const template = view.decision === "accept" ? "green" : view.decision === "decline" ? "red" : "grey";
+  const label = view.decision === "accept" ? "Allowed once" : view.decision === "acceptForSession" ? "Auto approve enabled" : view.decision === "decline" ? "Denied" : "Turn stopped";
+  const template = view.decision === "accept" || view.decision === "acceptForSession" ? "green" : view.decision === "decline" ? "red" : "grey";
   return baseCard(view.title, [markdown(`**Choice executed:** ${label}\n**Resolved:** ${new Date(view.resolvedAt).toISOString()}`)], template);
 }
 
