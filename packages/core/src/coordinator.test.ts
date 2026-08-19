@@ -16,6 +16,7 @@ class FakeDriver implements AgentDriver {
   steered: Array<{ id: SessionId; text: string }> = [];
   instructionPresets: AgentInstructionPreset[] = [{ id: "Plan", label: "Plan", mode: "plan", reasoningEffort: "medium" }, { id: "Default", label: "Default", mode: "default" }];
   selectedInstructionPresets: Array<{ id: SessionId; presetId: string }> = [];
+  compactedSessions: SessionId[] = [];
   discovered: AgentSessionInfo[] = [];
   resumeError: Error | null = null;
   createdSessions: Array<{ id: SessionId; project: Project; options: SessionOptions }> = [];
@@ -35,6 +36,7 @@ class FakeDriver implements AgentDriver {
     if (!preset) throw new Error("missing preset");
     return preset;
   }
+  async compactSession(id: SessionId): Promise<void> { this.compactedSessions.push(id); }
   async startTurn(id: SessionId, prompt: string): Promise<TurnId> { this.started.push({ id, prompt }); return this.started.length === 1 ? "turn" : `turn-${this.started.length}`; }
   async steerTurn(id: SessionId, text: string): Promise<void> { this.steered.push({ id, text }); }
   async interruptTurn(_id: SessionId): Promise<void> {}
@@ -918,7 +920,9 @@ describe("session coordinator", () => {
     await messaging.action!({ eventId: "select-session", actor, kind: "session.select", token: messaging.choices[0]!.choices[0]!.token, receivedAt: Date.now() });
     await messaging.command!({ eventId: "instructions", messageId: "instructions", actor, name: "instructions", args: [], text: "/instructions", receivedAt: Date.now() });
 
-    expect(messaging.texts.at(-1)).toContain("/compact - summarize the chat and free context");
+    const commandCard = messaging.choices.find((view) => view.actionKind === "instructions.command")!;
+    expect(commandCard).toMatchObject({ title: "Run a Codex built-in command", actionKind: "instructions.command" });
+    expect(commandCard.choices.map((choice) => choice.label)).toEqual(["/init", "/compact"]);
     const presetCard = messaging.choices.at(-1)!;
     expect(presetCard).toMatchObject({ title: "Choose Codex instructions", actionKind: "instructions.select" });
     expect(presetCard.choices.map((choice) => choice.label)).toEqual(["Plan", "Default"]);
@@ -942,8 +946,8 @@ describe("session coordinator", () => {
 
     expect(db.getSession("session")?.projectId).toBe(project.id);
     expect(driver.started).toHaveLength(0);
-    expect(messaging.texts).toHaveLength(1);
-    expect(messaging.texts[0]).toContain("/init - create an AGENTS.md scaffold");
+    expect(messaging.texts).toHaveLength(0);
+    expect(messaging.choices.find((view) => view.actionKind === "instructions.command")?.choices.map((choice) => choice.label)).toEqual(["/init", "/compact"]);
     expect(messaging.choices.at(-1)).toMatchObject({ title: "Choose Codex instructions", actionKind: "instructions.select" });
     expect(messaging.choices.at(-1)?.description).toContain("New repo task");
   });
@@ -967,8 +971,8 @@ describe("session coordinator", () => {
     await messaging.command!({ eventId: "instructions", messageId: "instructions", actor, name: "instructions", args: [], text: "/instructions", receivedAt: Date.now() });
 
     expect(db.getSession("session")?.projectId).toBe(project.id);
-    expect(messaging.texts).toHaveLength(1);
-    expect(messaging.texts[0]).toContain("/compact - summarize the chat and free context");
+    expect(messaging.texts).toHaveLength(0);
+    expect(messaging.choices.find((view) => view.actionKind === "instructions.command")?.description).toContain("New repo task");
     expect(messaging.choices.at(-1)).toMatchObject({
       title: "Choose Codex instructions",
       description: expect.stringContaining("New repo task"),
@@ -993,9 +997,48 @@ describe("session coordinator", () => {
     await messaging.action!({ eventId: "choose-second", actor, kind: "project.select", token: projectChoice.token, receivedAt: Date.now() });
 
     expect(db.getSession("session")?.projectId).toBe(second.id);
+    expect(messaging.choices.some((view) => view.actionKind === "instructions.command")).toBe(true);
     expect(messaging.choices.at(-1)).toMatchObject({ title: "Choose Codex instructions", actionKind: "instructions.select" });
-    expect(messaging.texts).toHaveLength(2);
-    expect(messaging.texts.every((text) => text.includes("/init - create an AGENTS.md scaffold"))).toBe(true);
+    expect(messaging.texts).toHaveLength(0);
+  });
+
+  it("runs the selected Codex init command in the chosen session", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "instructions", messageId: "instructions", actor, name: "instructions", args: [], text: "/instructions", receivedAt: Date.now() });
+    const initChoice = messaging.choices.find((view) => view.actionKind === "instructions.command")!.choices.find((choice) => choice.value === "init")!;
+    await messaging.action!({ eventId: "init", actor, kind: "instructions.command", token: initChoice.token, receivedAt: Date.now() });
+
+    expect(driver.started).toHaveLength(1);
+    expect(driver.started[0]).toMatchObject({ id: "session", prompt: expect.stringContaining("Generate a file named AGENTS.md") });
+    expect(messaging.statuses.at(-1)).toMatchObject({ sessionId: "session", turnId: "turn" });
+  });
+
+  it("compacts the chosen session from the built-in command card", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "instructions", messageId: "instructions", actor, name: "instructions", args: [], text: "/instructions", receivedAt: Date.now() });
+    const compactChoice = messaging.choices.find((view) => view.actionKind === "instructions.command")!.choices.find((choice) => choice.value === "compact")!;
+    await messaging.action!({ eventId: "compact", actor, kind: "instructions.command", token: compactChoice.token, receivedAt: Date.now() });
+
+    expect(driver.compactedSessions).toEqual(["session"]);
+    expect(messaging.texts.at(-1)).toBe("Compacted New repo task.");
   });
 
   it("reports a session owned by another Codex runtime instead of failing silently", async () => {

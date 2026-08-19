@@ -167,7 +167,7 @@ lines.on("line", (line) => {
     if (hostResponses.size === 11) send({ method: "turn/completed", params: { threadId: sessionId, turn: { id: turnId, status: "completed", error: null } } });
   } else if (message.method === "environment/status") {
     send({ id: message.id, result: { status: "disconnected", error: { code: "offline", message: "tool host is offline", additionalDetails: null } } });
-  } else if (message.method === "turn/steer" || message.method === "turn/interrupt") {
+  } else if (message.method === "thread/compact/start" || message.method === "turn/steer" || message.method === "turn/interrupt") {
     send({ id: message.id, result: {} });
   }
 });

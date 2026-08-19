@@ -85,75 +85,51 @@ type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval
 const SESSION_DISCOVERY_INTERVAL_MS = 2_000;
 const IMPLEMENT_PLAN_PROMPT = "Implement the plan.";
 const FRESH_IMPLEMENT_PLAN_PROMPT = "A previous agent produced the plan below to accomplish the user's task. Implement the plan in a fresh context. Treat the plan as the source of user intent, re-read files as needed, and carry the work through implementation and verification.";
+const CODEX_INIT_PROMPT = `Generate a file named AGENTS.md that serves as a contributor guide for this repository.
+Before writing, check whether AGENTS.md already exists in the current working directory. If it does, do not overwrite or modify it.
+Your goal is to produce a clear, concise, and well-structured document with descriptive headings and actionable explanations for each section.
+Follow the outline below, but adapt as needed: add sections if relevant, and omit those that do not apply to this project.
 
-const CODEX_BUILTIN_COMMANDS = [
-  ["/init", "create an AGENTS.md scaffold"],
-  ["/compact", "summarize the chat and free context"],
-  ["/status", "show session configuration and usage"],
-  ["/permissions", "configure approval permissions"],
-  ["/ide", "include IDE context"],
-  ["/keymap", "configure keyboard shortcuts"],
-  ["/vim", "toggle Vim editing mode"],
-  ["/setup-default-sandbox", "set up the Windows sandbox"],
-  ["/sandbox-add-read-dir", "grant sandbox read access"],
-  ["/agent", "switch the active agent"],
-  ["/subagents", "switch the active agent"],
-  ["/apps", "browse connected apps"],
-  ["/plugins", "browse and manage plugins"],
-  ["/hooks", "inspect lifecycle hooks"],
-  ["/clear", "start a fresh chat"],
-  ["/rename", "rename the current chat"],
-  ["/archive", "archive the current session"],
-  ["/delete", "delete the current session"],
-  ["/copy", "copy the latest response"],
-  ["/exit", "exit Codex"],
-  ["/quit", "exit Codex"],
-  ["/experimental", "toggle experimental features"],
-  ["/approve", "retry a denied action"],
-  ["/memories", "configure memory use"],
-  ["/skills", "browse and use skills"],
-  ["/import", "import Claude Code or Cursor artifacts"],
-  ["/feedback", "send diagnostics to Codex"],
-  ["/logout", "clear local Codex credentials"],
-  ["/mcp", "list MCP servers and tools"],
-  ["/mention", "attach a file or directory"],
-  ["/model", "select the model and reasoning effort"],
-  ["/fast", "toggle the Fast service tier"],
-  ["/personality", "select a communication style"],
-  ["/goal", "manage the persistent task goal"],
-  ["/ps", "show background terminals"],
-  ["/clean", "stop background terminals"],
-  ["/app", "continue the session in the desktop app"],
-  ["/side", "start a temporary side chat"],
-  ["/btw", "start a temporary side chat"],
-  ["/raw", "toggle raw scrollback mode"],
-  ["/new", "start a new chat"],
-  ["/resume", "resume a saved chat"],
-  ["/review", "review the current working tree"],
-  ["/usage", "inspect token usage and rate limits"],
-  ["/debug-config", "show configuration diagnostics"],
-  ["/statusline", "configure status-line fields"],
-  ["/title", "configure terminal title fields"],
-  ["/theme", "select a syntax-highlighting theme"],
-  ["/pets", "select or hide a terminal pet"],
-  ["/pet", "select or hide a terminal pet"],
-  ["/fork", "fork the current chat"],
-  ["/plan", "enter plan mode"],
-  ["/diff", "show Git changes"],
+Document Requirements
+- Title the document "Repository Guidelines".
+- Use Markdown headings (#, ##, etc.) for structure.
+- Keep the document concise. 200-400 words is optimal.
+- Keep explanations short, direct, and specific to this repository.
+- Provide examples where helpful (commands, directory paths, naming patterns).
+- Maintain a professional, instructional tone.
+
+Recommended Sections
+Project Structure & Module Organization
+- Outline the project structure, including where the source code, tests, and assets are located.
+
+Build, Test, and Development Commands
+- List key commands for building, testing, and running locally (e.g., npm test, make build).
+- Briefly explain what each command does.
+
+Coding Style & Naming Conventions
+- Specify indentation rules, language-specific style preferences, and naming patterns.
+- Include any formatting or linting tools used.
+
+Testing Guidelines
+- Identify testing frameworks and coverage requirements.
+- State test naming conventions and how to run tests.
+
+Commit & Pull Request Guidelines
+- Summarize commit message conventions found in the project's Git history.
+- Outline pull request requirements (descriptions, linked issues, screenshots, etc.).
+
+(Optional) Add other sections if relevant, such as Security & Configuration Tips, Architecture Overview, or Agent-Specific Instructions.`;
+
+const SELECTABLE_CODEX_BUILTIN_COMMANDS = [
+  { id: "init", label: "/init", description: "Create an AGENTS.md file with instructions for Codex" },
+  { id: "compact", label: "/compact", description: "Summarize the conversation to free context" },
 ] as const;
-
-function codexBuiltinCommandText(): string {
-  return [
-    "Codex built-in commands:",
-    ...CODEX_BUILTIN_COMMANDS.map(([command, description]) => `${command} - ${description}`),
-  ].join("\n");
-}
 
 const HELP = `PulseCortex commands:
 /projects - choose a locally registered project
 /new [task] - create a Codex session in the chosen project (or use /new <project> [task])
 /sessions - discover and select allowlisted Codex sessions
-/instructions - show Codex built-in commands and choose instructions for the selected session
+/instructions - run available Codex built-in commands or choose instructions for the selected session
 /resume [session-id] - resume a session
 /send <message> - message the selected session, or create one if none is selected
 /send <session-id> <message> - message a specific session
@@ -163,9 +139,7 @@ const HELP = `PulseCortex commands:
 /diff - show the current unified diff
 /help - show this help
 
-Ordinary direct messages start work or steer the selected session.
-
-${codexBuiltinCommandText()}`;
+Ordinary direct messages start work or steer the selected session.`;
 
 export class SessionCoordinator {
   private readonly runtimes = new Map<string, RuntimeTurn>();
@@ -293,6 +267,7 @@ export class SessionCoordinator {
       case "diff.show": await this.sendPagedOutput("diff.show", record.sessionId, Number(record.payload["page"] ?? 1), record.turnId); break;
       case "project.select": await this.selectProject(record.requestId); break;
       case "session.select": await this.resumeStoredSession(record.requestId); break;
+      case "instructions.command": await this.selectBuiltinCommand(record.sessionId, record.requestId); break;
       case "instructions.select": await this.selectInstructionPreset(record.sessionId, record.requestId); break;
       case "plan.select": await this.selectPostPlanAction(record, action.value); break;
       case "session.continue": await this.resumeStoredSession(record.sessionId); break;
@@ -853,7 +828,6 @@ export class SessionCoordinator {
   }
 
   private async sendInstructionChoices(): Promise<void> {
-    await this.safeSend("text", codexBuiltinCommandText(), () => this.messaging.sendText(codexBuiltinCommandText()));
     await this.refreshSessions();
     let session = this.selectedSession;
     if (!session) {
@@ -866,13 +840,25 @@ export class SessionCoordinator {
         return;
       }
     }
+    const expiresAt = Date.now() + 15 * 60_000;
+    const commandView: ChoiceView = {
+      title: "Run a Codex built-in command",
+      description: `Choose a command to run in ${session.title}.`,
+      actionKind: "instructions.command",
+      choices: SELECTABLE_CODEX_BUILTIN_COMMANDS.map((command) => ({
+        label: command.label,
+        description: command.description,
+        value: command.id,
+        token: this.issue("instructions.command", session.id, session.lastTurnId ?? "none", command.id, expiresAt, {}),
+      })),
+    };
+    await this.safeSend("choices", commandView, () => this.messaging.sendChoices(commandView));
     const presets = await this.driver.listInstructionPresets();
     if (!presets.length) {
       const message = "Codex did not report any built-in instruction presets.";
       await this.safeSend("text", message, () => this.messaging.sendText(message));
       return;
     }
-    const expiresAt = Date.now() + 15 * 60_000;
     const view: ChoiceView = {
       title: "Choose Codex instructions",
       description: `Select the built-in instructions for ${session.title}. The choice applies to subsequent turns.`,
@@ -885,6 +871,47 @@ export class SessionCoordinator {
       })),
     };
     await this.safeSend("choices", view, () => this.messaging.sendChoices(view));
+  }
+
+  private async selectBuiltinCommand(sessionId: string, commandId: string): Promise<void> {
+    const session = this.store.getSession(sessionId);
+    if (!session) {
+      await this.messaging.sendText("That Codex session is no longer available.");
+      return;
+    }
+    if (this.runtimes.has(session.id)) {
+      await this.messaging.sendText("Codex built-in commands are unavailable while a turn is active.");
+      return;
+    }
+    const project = this.store.getProject(session.projectId);
+    if (!project) {
+      await this.messaging.sendText("The session project is no longer registered.");
+      return;
+    }
+    try {
+      switch (commandId) {
+        case "init":
+          await this.startTurn(session, CODEX_INIT_PROMPT);
+          return;
+        case "compact": {
+          await this.driver.resumeSession(session.id, project, { managed: session.botCreated });
+          await this.driver.compactSession(session.id);
+          this.selectedSession = session;
+          this.rememberProject(project.id);
+          const message = `Compacted ${session.title}.`;
+          await this.safeSend("text", message, () => this.messaging.sendText(message));
+          return;
+        }
+        default:
+          throw new Error("That Codex built-in command is no longer available");
+      }
+    } catch (error) {
+      const errorMessage = redact((error as Error).message, this.redactions).slice(0, 500);
+      this.store.audit({ eventType: "instructions.command.failed", summary: errorMessage, sessionId: session.id, ...(session.lastTurnId ? { turnId: session.lastTurnId } : {}) });
+      this.logger.warn({ sessionId: session.id, commandId, errorMessage }, "Could not run Codex built-in command");
+      const message = `Could not run the Codex built-in command: ${errorMessage}`;
+      await this.safeSend("text", message, () => this.messaging.sendText(message));
+    }
   }
 
   private async selectInstructionPreset(sessionId: string, presetId: string): Promise<void> {

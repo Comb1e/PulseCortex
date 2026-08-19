@@ -51,6 +51,7 @@ export interface AgentDriver {
   listSessions(projects: Project[]): Promise<AgentSessionInfo[]>;
   listInstructionPresets(): Promise<AgentInstructionPreset[]>;
   selectInstructionPreset(id: SessionId, presetId: string): Promise<AgentInstructionPreset>;
+  compactSession(id: SessionId): Promise<void>;
   startTurn(id: SessionId, prompt: string): Promise<TurnId>;
   steerTurn(id: SessionId, text: string): Promise<void>;
   interruptTurn(id: SessionId): Promise<void>;

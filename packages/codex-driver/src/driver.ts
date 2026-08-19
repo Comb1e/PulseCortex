@@ -397,6 +397,11 @@ export class CodexAppServerDriver implements AgentDriver {
     };
   }
 
+  async compactSession(id: SessionId): Promise<void> {
+    this.assertSession(id);
+    await this.transport.request("thread/compact/start", { threadId: id });
+  }
+
   private async fetchInstructionPresets(): Promise<CollaborationModeMask[]> {
     const response = await this.transport.request<CollaborationModeListResponse>("collaborationMode/list", {});
     return response.data;

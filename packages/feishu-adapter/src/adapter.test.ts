@@ -173,6 +173,18 @@ describe("Feishu card rendering", () => {
     expect(json).toContain("signed");
   });
 
+  it("renders executable Codex built-in commands as callback choices", () => {
+    const card = choiceCard({
+      title: "Run a Codex built-in command",
+      actionKind: "instructions.command",
+      choices: [{ label: "/init", description: "Create an AGENTS.md file", token: "signed", value: "init" }],
+    });
+    const json = JSON.stringify(card);
+    expect(json).toContain("instructions.command");
+    expect(json).toContain("/init");
+    expect(json).toContain("signed");
+  });
+
   it("renders the three post-plan actions", () => {
     const card = choiceCard({
       title: "Choose how Codex should proceed",
