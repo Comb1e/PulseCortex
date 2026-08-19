@@ -128,6 +128,7 @@ export class CodexAppServerDriver implements AgentDriver {
   private readonly handlers = new Set<(event: AgentEvent) => void>();
   private readonly pending = new Map<string, PendingServerRequest>();
   private readonly activeTurns = new Map<SessionId, TurnId>();
+  private readonly failedTurns = new Set<string>();
   private readonly projectRoots = new Map<SessionId, string>();
   private readonly sessionCwds = new Map<SessionId, string>();
   private readonly disconnectedEnvironments = new Map<SessionId, Set<string>>();
@@ -186,7 +187,7 @@ export class CodexAppServerDriver implements AgentDriver {
     }
   }
 
-  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.stderrBuffer = ""; this.activeTurns.clear(); this.projectRoots.clear(); this.sessionCwds.clear(); this.disconnectedEnvironments.clear(); this.directInputSessions.clear(); this.sessionSettings.clear(); this.pending.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
+  async stop(): Promise<void> { this.started = false; this.codexHome = null; this.stderrBuffer = ""; this.activeTurns.clear(); this.failedTurns.clear(); this.projectRoots.clear(); this.sessionCwds.clear(); this.disconnectedEnvironments.clear(); this.directInputSessions.clear(); this.sessionSettings.clear(); this.pending.clear(); this.eventBuffers.clear(); await this.transport.stop(); }
 
   async createSession(project: Project, options: SessionOptions): Promise<SessionId> {
     this.assertStarted();
@@ -388,6 +389,7 @@ export class CodexAppServerDriver implements AgentDriver {
   async startTurn(id: SessionId, prompt: string): Promise<TurnId> {
     this.assertSession(id);
     if (this.activeTurns.has(id)) throw new Error("This session already has an active turn");
+    for (const key of this.failedTurns) if (key.startsWith(`${id}:`)) this.failedTurns.delete(key);
     await this.assertEnvironmentAvailable(id);
     const root = this.projectRoots.get(id)!;
     const cwd = this.sessionCwds.get(id) ?? root;
@@ -402,12 +404,19 @@ export class CodexAppServerDriver implements AgentDriver {
         approvalsReviewer: "user",
         sandboxPolicy: { type: "workspaceWrite", writableRoots: [root], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true },
       });
-      this.activeTurns.set(id, response.turn.id);
+      if (!this.failedTurns.has(`${id}:${response.turn.id}`)) this.activeTurns.set(id, response.turn.id);
       try {
         await this.assertEnvironmentAvailable(id);
       } catch (error) {
+        const turnId = response.turn.id;
+        const wasActive = this.activeTurns.get(id) === turnId;
         this.activeTurns.delete(id);
+        this.clearPendingRequests(id, turnId);
         await this.transport.request("turn/interrupt", { threadId: id, turnId: response.turn.id }).catch(() => undefined);
+        if (wasActive) {
+          this.eventBuffers.delete(id);
+          this.emit({ type: "turn.failed", sessionId: id, turnId, error: (error as Error).message, occurredAt: now() });
+        }
         throw error;
       }
       setImmediate(() => this.flushEventBuffer(id));
@@ -567,7 +576,9 @@ export class CodexAppServerDriver implements AgentDriver {
     const sessionId = String(params["threadId"] ?? "");
     const turnId = String(params["turnId"] ?? (params["turn"] as Record<string, unknown> | undefined)?.["id"] ?? this.activeTurns.get(sessionId) ?? "");
     switch (message.method) {
-      case "turn/started": this.activeTurns.set(sessionId, turnId); this.emit({ type: "turn.started", sessionId, turnId, occurredAt: now() }); break;
+      case "turn/started":
+        if (this.failedTurns.has(`${sessionId}:${turnId}`)) break;
+        this.activeTurns.set(sessionId, turnId); this.emit({ type: "turn.started", sessionId, turnId, occurredAt: now() }); break;
       case "thread/environment/connected": {
         const environmentId = String(params["environmentId"] ?? "");
         const disconnected = this.disconnectedEnvironments.get(sessionId);
@@ -585,6 +596,7 @@ export class CodexAppServerDriver implements AgentDriver {
         const activeTurn = this.activeTurns.get(sessionId);
         if (activeTurn) {
           this.activeTurns.delete(sessionId);
+          this.failedTurns.add(`${sessionId}:${activeTurn}`);
           this.clearPendingRequests(sessionId, activeTurn);
           void this.transport.request("turn/interrupt", { threadId: sessionId, turnId: activeTurn }).catch(() => undefined);
           this.emit({ type: "turn.failed", sessionId, turnId: activeTurn, error: `Codex execution environment ${environmentId} disconnected; tool access is unavailable`, occurredAt: now() });
@@ -639,7 +651,14 @@ export class CodexAppServerDriver implements AgentDriver {
       }
       case "error": {
         const error = params["error"] as Record<string, unknown> | undefined;
-        if (!params["willRetry"]) this.emit({ type: "turn.failed", sessionId, turnId, error: String(error?.["message"] ?? "Codex turn error"), occurredAt: now() });
+        if (!params["willRetry"]) {
+          if (this.activeTurns.get(sessionId) === turnId) {
+            this.activeTurns.delete(sessionId);
+          }
+          if (sessionId && turnId) this.failedTurns.add(`${sessionId}:${turnId}`);
+          this.clearPendingRequests(sessionId, turnId);
+          this.emit({ type: "turn.failed", sessionId, turnId, error: String(error?.["message"] ?? "Codex turn error"), occurredAt: now() });
+        }
         break;
       }
     }
@@ -709,6 +728,7 @@ export class CodexAppServerDriver implements AgentDriver {
   private failToolArgumentTurn(sessionId: SessionId, turnId: TurnId, detail: string): void {
     if (this.activeTurns.get(sessionId) !== turnId) return;
     this.activeTurns.delete(sessionId);
+    this.failedTurns.add(`${sessionId}:${turnId}`);
     this.clearPendingRequests(sessionId, turnId);
     const error = "Codex could not parse tool-call arguments. The configured model provider may not preserve namespace tool schemas correctly.";
     this.reportDiagnostic("error", "Codex tool-call argument parsing failed; interrupting the turn", sessionId, { turnId, error: detail });
