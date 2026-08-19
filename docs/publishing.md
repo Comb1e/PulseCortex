@@ -48,6 +48,53 @@ and build steps, then inspect tarballs with `pnpm pack` from an individual
 package directory. Never use a personal password or a long-lived token in a
 command argument or committed file.
 
+## Install published packages
+
+Verify that the application packages are available from npm:
+
+```bash
+npm view @pulsecortex/cli version
+npm view @pulsecortex/daemon version
+```
+
+Install the CLI and daemon globally at the same version:
+
+```bash
+npm install --global @pulsecortex/cli@latest @pulsecortex/daemon@latest
+pulsectl --help
+pulsectl init
+```
+
+Both packages are required. `pulsectl` locates the daemon as an adjacent global
+package, and PulseCortex packages are released together with one shared version.
+Upgrade them together to avoid loading incompatible internal contracts:
+
+```bash
+npm install --global @pulsecortex/cli@latest @pulsecortex/daemon@latest
+```
+
+After initialization, configure the generated environment file, then register
+a project and install the service:
+
+```bash
+pulsectl project add pulsecortex /absolute/path/to/PulseCortex
+pulsectl diagnose
+pulsectl pair
+pulsectl service install
+pulsectl service status
+pulsectl shell install
+```
+
+Published library packages can be installed independently in another project:
+
+```bash
+npm install @pulsecortex/domain
+```
+
+Public packages from npmjs.org do not require a project `.npmrc` or an access
+token. A `404` from `npm view` means that package/version is not yet public or
+the configured npm registry is not `https://registry.npmjs.org/`.
+
 ## GitHub Packages
 
 GitHub Packages uses the `npm.pkg.github.com` registry and requires package

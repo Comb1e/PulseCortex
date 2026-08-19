@@ -10,7 +10,7 @@ Prompts, agent messages, source excerpts, command summaries, diffs, test results
 
 ## Requirements
 
-- Node.js 25.9.0 or newer and pnpm 11
+- Node.js 25.9.0 or newer; npm for package installation, or pnpm 11 for source development
 - An installed, authenticated Codex CLI `0.147.x`
 - A Feishu enterprise self-built application with bot capability
 - Outbound internet access to Feishu and the model provider
@@ -19,7 +19,27 @@ The app-server protocol snapshot in `packages/codex-driver/src/generated` was ge
 
 ## Installation
 
-### Windows
+### Install from npm
+
+Install the CLI and daemon globally at the same version. The CLI resolves the
+daemon from the adjacent global package, so both packages are required:
+
+```bash
+npm install --global @pulsecortex/cli@latest @pulsecortex/daemon@latest
+pulsectl --help
+pulsectl init
+```
+
+Confirm the published version before installation with
+`npm view @pulsecortex/cli version`. Public npm packages require no `.npmrc` or
+registry token. For later upgrades, install matching CLI and daemon versions in
+the same command.
+
+The commands below use `pnpm pulsectl` for a source checkout. With the global
+npm installation, run the same commands as `pulsectl ...`. Use
+`pulsectl service install` to start the packaged daemon instead of `pnpm start`.
+
+### Build from source on Windows
 
 ```powershell
 pnpm install
@@ -27,7 +47,7 @@ pnpm build
 pnpm pulsectl init
 ```
 
-### Linux
+### Build from source on Linux
 
 ```bash
 pnpm install
