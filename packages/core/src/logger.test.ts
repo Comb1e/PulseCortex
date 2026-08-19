@@ -14,14 +14,17 @@ function capture(stream: PassThrough): () => string {
 
 class TerminalScreen extends Writable {
   private readonly lines = [""];
+  private writes = 0;
   private row = 0;
   private column = 0;
 
-  constructor(readonly columns = Number.POSITIVE_INFINITY) { super(); }
+  constructor(readonly columns = Number.POSITIVE_INFINITY, readonly rows = Number.POSITIVE_INFINITY) { super(); }
 
   text(): string { return this.lines.join("\n").trimEnd(); }
+  writeCount(): number { return this.writes; }
 
   override _write(chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    this.writes += 1;
     const content = chunk.toString();
     for (let index = 0; index < content.length;) {
       const control = content.slice(index).match(/^\u001b\[(\d+)([AB])|^\u001b\[2K/);
@@ -98,6 +101,21 @@ describe("daemon logger", () => {
     expect(output).toContain('"phase": "completed"');
     expect(output.replaceAll("\n", "")).toContain(`"safeSummary": "${"y".repeat(200)}"`);
     expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
+    expect(terminal.writeCount()).toBe(2);
+  });
+
+  it("appends complete updates when a live message is taller than the terminal", () => {
+    const terminal = new TerminalScreen(40, 6);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: "x".repeat(200) } } }, "Feishu outbound message");
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed", safeSummary: "y".repeat(200) } } }, "Feishu outbound message");
+
+    const output = terminal.text().replaceAll("\n", "");
+    expect(output).toContain(`"safeSummary": "${"x".repeat(200)}"`);
+    expect(output).toContain(`"safeSummary": "${"y".repeat(200)}"`);
+    expect((output.match(/message-1/g) ?? [])).toHaveLength(2);
+    expect(output).not.toContain("\u001b[");
   });
 
   it("keeps only the latest resolved approval entry for a message ID", () => {

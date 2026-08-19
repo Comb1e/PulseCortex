@@ -11,7 +11,7 @@ const DIM = "\u001b[2m";
 const LOG_METADATA = new Set(["level", "time", "pid", "hostname", "service", "msg"]);
 const LIVE_MESSAGE_KINDS = new Set(["status", "approval", "result"]);
 
-interface LogTarget { write(content: string): unknown; columns?: number }
+interface LogTarget { write(content: string): unknown; columns?: number; rows?: number }
 
 export interface LoggerOptions {
   output?: LogTarget;
@@ -108,25 +108,25 @@ class PrettyLogStream extends Writable {
       if (this.liveStatus && liveKey) {
         const fingerprint = this.liveFingerprint(record);
         if (this.liveRecords.get(liveKey)?.fingerprint === fingerprint) return;
-        this.clearLiveRecords();
         const rendered = wrapForTerminal(formatLogRecord(record, false), this.terminalWidth());
+        const clear = this.prepareLiveRewrite();
         this.liveRecords.set(liveKey, { ...rendered, fingerprint });
-        this.renderLiveRecords();
+        const frame = `${clear}${this.renderLiveRecords()}`;
+        if (!this.liveRecordsFit()) this.liveRecords.clear();
+        this.target.write(frame);
         return;
       }
       if (this.liveStatus && this.liveRecords.size) {
-        this.clearLiveRecords();
-        this.target.write(formatLogRecord(record, this.color));
-        this.renderLiveRecords();
+        const clear = this.prepareLiveRewrite();
+        this.target.write(`${clear}${formatLogRecord(record, this.color)}${this.renderLiveRecords()}`);
         return;
       }
       this.target.write(formatLogRecord(record, this.color));
     }
     catch {
       if (this.liveStatus && this.liveRecords.size) {
-        this.clearLiveRecords();
-        this.target.write(`${line}\n`);
-        this.renderLiveRecords();
+        const clear = this.prepareLiveRewrite();
+        this.target.write(`${clear}${line}\n${this.renderLiveRecords()}`);
       } else this.target.write(`${line}\n`);
     }
   }
@@ -155,20 +155,31 @@ class PrettyLogStream extends Writable {
     return JSON.stringify(value) ?? String(value);
   }
 
-  private clearLiveRecords(): void {
-    if (!this.liveRecords.size) return;
+  private prepareLiveRewrite(): string {
+    if (!this.liveRecords.size) return "";
     const lines = [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
-    this.target.write(`\u001b[${lines}A`);
-    for (let index = 0; index < lines; index += 1) this.target.write(`\u001b[2K\u001b[1B`);
-    this.target.write(`\u001b[${lines}A\r`);
+    if (lines >= this.terminalRows()) {
+      this.liveRecords.clear();
+      return "";
+    }
+    return `\u001b[${lines}A${"\u001b[2K\u001b[1B".repeat(lines)}\u001b[${lines}A\r`;
   }
 
-  private renderLiveRecords(): void {
-    for (const entry of this.liveRecords.values()) this.target.write(entry.rendered);
+  private renderLiveRecords(): string {
+    return [...this.liveRecords.values()].map((entry) => entry.rendered).join("");
+  }
+
+  private liveRecordsFit(): boolean {
+    const lines = [...this.liveRecords.values()].reduce((total, entry) => total + entry.lines, 0);
+    return lines < this.terminalRows();
   }
 
   private terminalWidth(): number {
     return typeof this.target.columns === "number" && Number.isFinite(this.target.columns) ? Math.max(4, Math.floor(this.target.columns) - 1) : 119;
+  }
+
+  private terminalRows(): number {
+    return typeof this.target.rows === "number" && Number.isFinite(this.target.rows) ? Math.max(2, Math.floor(this.target.rows)) : Number.POSITIVE_INFINITY;
   }
 }
 
