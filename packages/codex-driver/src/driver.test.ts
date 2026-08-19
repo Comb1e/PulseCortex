@@ -105,6 +105,24 @@ describe("Codex app-server contract", () => {
     await driver.stop();
   });
 
+  it("emits the authoritative completed plan item", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "plan-complete"], verifyVersion: false });
+    const events: AgentEvent[] = [];
+    let complete!: () => void;
+    const completed = new Promise<void>((resolve) => { complete = resolve; });
+    driver.subscribe((event) => { events.push(event); if (event.type === "turn.completed") complete(); });
+    await driver.start();
+    const sessionId = await driver.createSession(project, {});
+    await driver.startTurn(sessionId, "plan the change");
+    await completed;
+
+    expect(events.find((event) => event.type === "plan.completed")).toMatchObject({
+      sessionId,
+      text: "# Plan\n\n1. Make the change.\n2. Run the tests.",
+    });
+    await driver.stop();
+  });
+
   it("maps command auto approve to the native session decision", async () => {
     const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "auto-approve"], verifyVersion: false });
     let complete!: () => void;

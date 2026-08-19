@@ -727,6 +727,7 @@ export class CodexAppServerDriver implements AgentDriver {
   }
 
   private handleItemCompleted(input: ItemCompletedNotification): void {
+    if (input.item.type === "plan") this.emit({ type: "plan.completed", sessionId: input.threadId, turnId: input.turnId, text: input.item.text, occurredAt: input.completedAtMs });
     if (input.item.type === "commandExecution") this.emit({ type: "command.completed", sessionId: input.threadId, turnId: input.turnId, commandId: input.item.id, ...(input.item.exitCode === null ? {} : { exitCode: input.item.exitCode }), occurredAt: input.completedAtMs });
   }
 

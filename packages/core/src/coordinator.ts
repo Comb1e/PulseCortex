@@ -50,6 +50,7 @@ interface RuntimeTurn {
   phase: TurnPhase;
   startedAt: number;
   safeSummary: string;
+  completedPlan: string | null;
   replies: Array<{ id: string; text: string }>;
   recentCommands: string[];
   diff: string;
@@ -467,6 +468,9 @@ export class SessionCoordinator {
       case "agent.message.delta":
         void this.commandLogs.append(runtime.turnId, "message", event.delta).catch(() => undefined);
         this.appendReply(runtime, event.messageId ?? "default", event.delta); runtime.dirty = true; break;
+      case "plan.completed":
+        void this.commandLogs.append(runtime.turnId, "message", event.text).catch(() => undefined);
+        runtime.completedPlan = redact(event.text, this.redactions).slice(0, 1_500); runtime.safeSummary = runtime.completedPlan; runtime.dirty = true; break;
       case "command.started":
         void this.commandLogs.append(runtime.turnId, "command", `$ ${event.command}\n`).catch(() => undefined);
         runtime.recentCommands = [...runtime.recentCommands.slice(-4), event.command]; if (!runtime.pendingApprovals.size) runtime.phase = "working"; runtime.dirty = true; break;
@@ -644,6 +648,11 @@ export class SessionCoordinator {
     await this.sendResult(runtime, status === "stopped" ? "stopped" : "completed");
     if (this.selectedSession?.id === runtime.session.id) this.selectedSession = { ...runtime.session, state: "completed", lastTurnId: runtime.turnId, updatedAt: Date.now() };
     this.runtimes.delete(runtime.session.id);
+    if (status === "completed" && runtime.completedPlan !== null) {
+      await this.sendPostPlanChoices(runtime.session).catch((error) => {
+        this.logger.warn({ sessionId: runtime.session.id, turnId: runtime.turnId, errorMessage: redact((error as Error).message, this.redactions).slice(0, 500) }, "Could not send post-plan mode choices");
+      });
+    }
   }
 
   private async failRuntime(runtime: RuntimeTurn, error: string): Promise<void> {
@@ -661,7 +670,7 @@ export class SessionCoordinator {
   private async sendResult(runtime: RuntimeTurn, status: TurnResultView["status"]): Promise<void> {
     const expiresAt = Date.now() + 14 * 86_400_000;
     const view: TurnResultView = {
-      sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, status, summary: status === "failed" ? runtime.safeSummary : status === "completed" ? this.latestReply(runtime) || runtime.safeSummary : this.replySummary(runtime) || runtime.safeSummary, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary,
+      sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, status, summary: status === "failed" ? runtime.safeSummary : status === "completed" ? runtime.completedPlan ?? (this.latestReply(runtime) || runtime.safeSummary) : this.replySummary(runtime) || runtime.safeSummary, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary,
       actionTokens: {
         diff: this.issue("diff.show", runtime.session.id, runtime.turnId, runtime.turnId, expiresAt, { page: 1 }),
         logs: this.issue("logs.show", runtime.session.id, runtime.turnId, runtime.turnId, expiresAt, { page: 1 }),
@@ -676,6 +685,25 @@ export class SessionCoordinator {
     } else {
       await this.safeSend("result", view, () => this.messaging.sendResult(view), view, queueKey);
     }
+  }
+
+  private async sendPostPlanChoices(session: StoredSession): Promise<void> {
+    const presets = await this.driver.listInstructionPresets();
+    if (!presets.length) return;
+    const ordered = [...presets].sort((left, right) => Number(right.mode === "default") - Number(left.mode === "default"));
+    const expiresAt = Date.now() + 15 * 60_000;
+    const view: ChoiceView = {
+      title: "Choose how Codex should proceed",
+      description: `The plan for ${session.title} is complete. Switch to Default mode to implement it, or choose another Codex mode to continue refining it. The choice applies to subsequent turns.`,
+      actionKind: "instructions.select",
+      choices: ordered.map((preset) => ({
+        label: preset.label,
+        description: [`Mode: ${preset.mode}`, ...(preset.model ? [`Model: ${preset.model}`] : []), ...(preset.reasoningEffort ? [`Reasoning: ${preset.reasoningEffort}`] : [])].join("\n"),
+        value: preset.id,
+        token: this.issue("instructions.select", session.id, session.lastTurnId ?? "none", preset.id, expiresAt, { source: "plan-complete" }),
+      })),
+    };
+    await this.safeSend("choices", view, () => this.messaging.sendChoices(view));
   }
 
   private async sendProjectChoices(description?: string): Promise<void> {
@@ -912,7 +940,7 @@ export class SessionCoordinator {
   private makeRuntime(session: StoredSession, project: Project, turnId: string, phase: TurnPhase, startedAt: number, safeSummary: string): RuntimeTurn {
     const expiresAt = Date.now() + 14 * 86_400_000;
     return {
-      session: { ...session, lastTurnId: turnId, state: phase, updatedAt: Date.now() }, project, turnId, phase, startedAt, safeSummary,
+      session: { ...session, lastTurnId: turnId, state: phase, updatedAt: Date.now() }, project, turnId, phase, startedAt, safeSummary, completedPlan: null,
       replies: [], recentCommands: [], diff: "", changedFileCount: 0, testSummary: "", statusRef: null, pendingApprovals: new Map(),
       actionTokens: {
         stop: this.issue("turn.stop", session.id, turnId, turnId, expiresAt, {}),

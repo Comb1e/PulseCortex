@@ -223,6 +223,7 @@ export interface InputQuestion {
 export type AgentEvent =
   | { type: "turn.started"; sessionId: SessionId; turnId: TurnId; occurredAt: number }
   | { type: "agent.message.delta"; sessionId: SessionId; turnId: TurnId; messageId?: string; delta: string; occurredAt: number }
+  | { type: "plan.completed"; sessionId: SessionId; turnId: TurnId; text: string; occurredAt: number }
   | { type: "command.started"; sessionId: SessionId; turnId: TurnId; commandId: string; command: string; occurredAt: number }
   | { type: "command.completed"; sessionId: SessionId; turnId: TurnId; commandId: string; exitCode?: number; occurredAt: number }
   | { type: "approval.requested"; sessionId: SessionId; turnId: TurnId; approvalId: ApprovalId; kind: ApprovalKind; title: string; reason?: string; command?: string; files?: string[]; paths?: string[]; network?: NetworkDestination[]; canAutoApprove?: boolean; occurredAt: number }

@@ -90,6 +90,11 @@ lines.on("line", (line) => {
     }
     send({ id: message.id, result: { turn: { id: turnId } } });
     send({ method: "turn/started", params: { threadId: sessionId, turn: { id: turnId } } });
+    if (scenario === "plan-complete") {
+      send({ method: "item/completed", params: { threadId: sessionId, turnId, completedAtMs: Date.now(), item: { type: "plan", id: "plan", text: "# Plan\n\n1. Make the change.\n2. Run the tests." } } });
+      send({ method: "turn/completed", params: { threadId: sessionId, turn: { id: turnId, status: "completed", error: null } } });
+      return;
+    }
     if (scenario === "resumed-cwd") {
       send({ method: "turn/completed", params: { threadId: sessionId, turn: { id: turnId, status: "completed", error: null } } });
       return;

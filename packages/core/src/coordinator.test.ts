@@ -291,6 +291,30 @@ describe("session coordinator", () => {
     expect(messaging.results[0]?.summary).toBe("Final answer");
   });
 
+  it("asks which Codex mode to use after a plan completes", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "plan the work", receivedAt: Date.now() });
+    driver.emit({ type: "agent.message.delta", sessionId: "session", turnId: "turn", messageId: "commentary", delta: "I am checking the repository.", occurredAt: Date.now() });
+    driver.emit({ type: "plan.completed", sessionId: "session", turnId: "turn", text: "# Plan\n\n1. Make the change.", occurredAt: Date.now() });
+    driver.emit({ type: "turn.completed", sessionId: "session", turnId: "turn", status: "completed", occurredAt: Date.now() });
+
+    await vi.waitFor(() => expect(messaging.choices.some((view) => view.title === "Choose how Codex should proceed")).toBe(true));
+    expect(messaging.results[0]?.summary).toBe("# Plan\n\n1. Make the change.");
+    const choice = messaging.choices.find((view) => view.title === "Choose how Codex should proceed")!;
+    expect(choice.choices.map((item) => item.label)).toEqual(["Default", "Plan"]);
+    await messaging.action!({ eventId: "select-default", actor, kind: "instructions.select", token: choice.choices[0]!.token, receivedAt: Date.now() });
+    expect(driver.selectedInstructionPresets).toContainEqual({ id: "session", presetId: "Default" });
+  });
+
   it("opens logs for the result card's turn after the session advances", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();
