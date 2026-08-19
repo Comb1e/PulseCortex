@@ -104,7 +104,7 @@ pnpm pulsectl diagnose
 pnpm pulsectl pair
 ```
 
-Start the daemon with `pnpm start`, direct-message `/pair <code>` to the bot, then use `/projects` or `/new pulsecortex`. Daemon events are formatted for terminal reading and saved below the data directory in `logs/YYYY-MM-DD/HH-NNNN.log`, split into 10 MiB chunks by local hour. During development, `pnpm dev` runs the TypeScript source directly.
+Start the daemon with `pnpm start`, direct-message `/pair <code>` to the bot, then use `/projects` or `/new pulsecortex`. Daemon events are formatted for terminal reading and saved below the data directory in `logs/YYYY-MM-DD/HH-NNNN.log`, split into 10 MiB chunks by local hour. The same folder contains exact terminal transcripts (`HH-terminal-NNNN.ansi`) and content-minimized renderer traces (`HH-renderer-NNNN.jsonl`) for diagnosing interactive display problems. During development, `pnpm dev` runs the TypeScript source directly.
 
 List registered projects or remove one by its name without deleting its files:
 

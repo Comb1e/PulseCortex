@@ -8,23 +8,27 @@ import { createLogger, formatLogRecord, retainDailyLogs } from "./logger.js";
 
 function capture(stream: PassThrough): () => string {
   const chunks: Buffer[] = [];
-  stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+  stream.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
   return () => Buffer.concat(chunks).toString("utf8");
 }
 
 class TerminalScreen extends Writable {
   private readonly lines = [""];
+  private readonly chunks: Buffer[] = [];
   private writes = 0;
   private row = 0;
   private column = 0;
+  private viewportTop = 0;
 
-  constructor(readonly columns = Number.POSITIVE_INFINITY, readonly rows = Number.POSITIVE_INFINITY) { super(); }
+  constructor(public columns = Number.POSITIVE_INFINITY, public rows = Number.POSITIVE_INFINITY) { super(); }
 
   text(): string { return this.lines.join("\n").trimEnd(); }
+  raw(): string { return Buffer.concat(this.chunks).toString("utf8"); }
   writeCount(): number { return this.writes; }
 
   override _write(chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
     this.writes += 1;
+    this.chunks.push(Buffer.from(chunk));
     const content = chunk.toString();
     for (let index = 0; index < content.length;) {
       const control = content.slice(index).match(/^\u001b\[(\d+)([AB])|^\u001b\[2K/);
@@ -32,7 +36,8 @@ class TerminalScreen extends Writable {
         if (control[0] === "\u001b[2K") { this.lines[this.row] = ""; this.column = 0; }
         else {
           const distance = Number(control[1]);
-          this.row = control[2] === "A" ? Math.max(0, this.row - distance) : this.row + distance;
+          const viewportBottom = Number.isFinite(this.rows) ? this.viewportTop + this.rows - 1 : Number.POSITIVE_INFINITY;
+          this.row = control[2] === "A" ? Math.max(this.viewportTop, this.row - distance) : Math.min(viewportBottom, this.row + distance);
           while (this.lines.length <= this.row) this.lines.push("");
         }
         index += control[0].length;
@@ -43,6 +48,7 @@ class TerminalScreen extends Writable {
         this.row += 1;
         this.column = 0;
         while (this.lines.length <= this.row) this.lines.push("");
+        if (Number.isFinite(this.rows) && this.row >= this.viewportTop + this.rows) this.viewportTop = this.row - this.rows + 1;
       } else if (character === "\r") this.column = 0;
       else {
         const line = this.lines[this.row] ?? "";
@@ -52,6 +58,7 @@ class TerminalScreen extends Writable {
           this.row += 1;
           this.column = 0;
           while (this.lines.length <= this.row) this.lines.push("");
+          if (Number.isFinite(this.rows) && this.row >= this.viewportTop + this.rows) this.viewportTop = this.row - this.rows + 1;
         }
       }
       index += 1;
@@ -98,9 +105,9 @@ describe("daemon logger", () => {
     logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed", safeSummary: "y".repeat(200) } } }, "Feishu outbound message");
 
     const output = terminal.text();
-    expect(output).not.toContain('"phase": "working"');
-    expect(output).toContain('"phase": "completed"');
-    expect(output.replaceAll("\n", "")).toContain(`"safeSummary": "${"y".repeat(200)}"`);
+    expect(output).not.toContain('phase="working"');
+    expect(output).toContain('phase="completed"');
+    expect(output).toContain("...");
     expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
     expect(terminal.writeCount()).toBe(2);
   });
@@ -112,9 +119,10 @@ describe("daemon logger", () => {
     logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: "x".repeat(200) } } }, "Feishu outbound message");
     logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed", safeSummary: "y".repeat(200) } } }, "Feishu outbound message");
 
-    const output = terminal.text().replaceAll("\n", "");
-    expect(output).not.toContain(`"safeSummary": "${"x".repeat(200)}"`);
-    expect(output).toContain(`"safeSummary": "${"y".repeat(200)}"`);
+    const output = terminal.text();
+    expect(output).not.toContain("x".repeat(20));
+    expect(output).toContain("message-1");
+    expect(output.split("\n")).toHaveLength(1);
     expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
   });
 
@@ -127,8 +135,8 @@ describe("daemon logger", () => {
     logger.info({ feishu: { kind: "approval", operation: "update", messageId: "approval-1", content: { title: "Run command", decision: "decline", resolvedAt: 2 } } }, "Feishu outbound message");
 
     const output = terminal.text();
-    expect(output).not.toContain('"decision": "accept"');
-    expect(output).toContain('"decision": "decline"');
+    expect(output).not.toContain('decision="accept"');
+    expect(output).toContain('decision="decline"');
     expect((output.match(/approval-1/g) ?? [])).toHaveLength(1);
   });
 
@@ -155,7 +163,7 @@ describe("daemon logger", () => {
     expect(output).not.toContain("\u001b[");
   });
 
-  it("replays interleaved terminal logs after replacing an earlier message ID", () => {
+  it("keeps interleaved terminal logs above the live footer", () => {
     const terminal = new TerminalScreen();
     const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
 
@@ -182,10 +190,72 @@ describe("daemon logger", () => {
     logger.info({ connected: true }, "Feishu connection state changed");
 
     const output = terminal.text();
-    expect(output).not.toContain('"phase": "working"');
-    expect(output).toContain('"status": "completed"');
+    expect(output).not.toContain('phase="working"');
+    expect(output).toContain('status="completed"');
     expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
     expect((output.match(/Feishu connection state changed/g) ?? [])).toHaveLength(1);
+  });
+
+  it("keeps a replaceable footer reachable while ordinary logs stream", () => {
+    const terminal = new TerminalScreen(80, 5);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working" } } }, "Feishu outbound message");
+    for (let index = 0; index < 12; index += 1) logger.info({ index }, `Ordinary log ${index}`);
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed" } } }, "Feishu outbound message");
+
+    const output = terminal.text();
+    expect(output).not.toContain('phase="working"');
+    expect(output).toContain('phase="completed"');
+    expect((output.match(/message-1/g) ?? [])).toHaveLength(1);
+    for (let index = 0; index < 12; index += 1) expect((output.match(new RegExp(`Ordinary log ${index}(?!\\d)`, "g")) ?? [])).toHaveLength(1);
+  });
+
+  it("writes exact terminal frames and content-minimized renderer traces", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pulse-daemon-log-"));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 19, 9, 5));
+    const terminal = new TerminalScreen(80, 10);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true, logDir: directory, terminalDiagnostics: true });
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: "sensitive summary" } } }, "Feishu outbound message");
+    logger.info({ connected: true }, "Connection changed");
+
+    const folder = path.join(directory, "2026-08-19");
+    expect((await readdir(folder)).sort()).toEqual(["09-0001.log", "09-renderer-0001.jsonl", "09-terminal-0001.ansi"]);
+    expect(await readFile(path.join(folder, "09-terminal-0001.ansi"), "utf8")).toBe(terminal.raw());
+    const traces = (await readFile(path.join(folder, "09-renderer-0001.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(traces.map((trace) => trace["transition"])).toEqual(["live-updated", "ordinary-with-footer"]);
+    expect(traces[1]).toMatchObject({ state: "live-footer", rows: 10, columns: 80, footerEntries: 1, clearedLines: 1 });
+    expect(traces[1]).not.toHaveProperty("messageId");
+    expect(JSON.stringify(traces)).not.toContain("sensitive summary");
+  });
+
+  it("suppresses an exact duplicate after its live entry is retired", () => {
+    const terminal = new TerminalScreen(100, 10);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+    const result = { feishu: { kind: "result", operation: "update", messageId: "message-1", content: { status: "completed", summary: "Done" } } };
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working" } } }, "Feishu outbound message");
+    logger.info(result, "Feishu outbound message");
+    logger.info("Retire settled footer");
+    const writes = terminal.writeCount();
+    logger.info(result, "Feishu outbound message");
+
+    expect(terminal.writeCount()).toBe(writes);
+    expect((terminal.text().match(/message-1/g) ?? [])).toHaveLength(1);
+  });
+
+  it("abandons stale footer geometry after a terminal resize", () => {
+    const terminal = new TerminalScreen(100, 10);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working" } } }, "Feishu outbound message");
+    terminal.columns = 40;
+    logger.info({ feishu: { kind: "status", operation: "update", messageId: "message-1", content: { phase: "completed" } } }, "Feishu outbound message");
+
+    expect(terminal.raw()).not.toContain("\u001b[");
+    expect((terminal.text().match(/message-1/g) ?? [])).toHaveLength(2);
   });
 
   it("stores every update while replacing it in the terminal", async () => {

@@ -12,7 +12,7 @@ async function main(): Promise<void> {
   await mkdir(config.logDir, { recursive: true, mode: 0o700 });
   await mkdir(config.commandLogDir, { recursive: true, mode: 0o700 });
   await retainDailyLogs(config.logDir, config.logRetentionDays, config.logMaxBytes);
-  const logger = createLogger(config.logLevel, { logDir: config.logDir, liveStatus: process.stdout.isTTY === true });
+  const logger = createLogger(config.logLevel, { logDir: config.logDir, liveStatus: process.stdout.isTTY === true, terminalDiagnostics: true });
   const patterns = config.redactionPatterns.map((pattern) => new RegExp(pattern, "giu"));
   const store = new ControllerStore(config.databasePath, config.settingsPath);
   const interrupted = store.markActiveTurnsInterrupted();

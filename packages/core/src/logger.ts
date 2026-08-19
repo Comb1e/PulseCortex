@@ -11,13 +11,14 @@ const DIM = "\u001b[2m";
 const LOG_METADATA = new Set(["level", "time", "pid", "hostname", "service", "msg"]);
 const LIVE_MESSAGE_KINDS = new Set(["status", "approval", "result"]);
 
-interface LogTarget { write(content: string): unknown; columns?: number }
+interface LogTarget { write(content: string): unknown; columns?: number; rows?: number }
 
 export interface LoggerOptions {
   output?: LogTarget;
   color?: boolean;
   liveStatus?: boolean;
   logDir?: string;
+  terminalDiagnostics?: boolean;
 }
 
 function pad(value: number): string { return String(value).padStart(2, "0"); }
@@ -61,41 +62,66 @@ function characterWidth(character: string): number {
   return character.codePointAt(0)! <= 0x7f ? 1 : 2;
 }
 
-function wrapForTerminal(value: string, maxCells: number): { rendered: string; lines: number } {
-  const wrapped = value.split("\n").flatMap((line) => {
-    if (!line) return [""];
-    const chunks: string[] = [];
-    let chunk = "";
-    let cells = 0;
-    for (const character of line) {
-      const width = characterWidth(character);
-      if (chunk && cells + width > maxCells) {
-        chunks.push(chunk);
-        chunk = "";
-        cells = 0;
-      }
-      chunk += character;
-      cells += width;
-    }
-    if (chunk) chunks.push(chunk);
-    return chunks;
-  }).join("\n");
-  return { rendered: wrapped, lines: Math.max(1, wrapped.split("\n").length - 1) };
+function truncateToCells(value: string, maxCells: number): string {
+  const totalCells = [...value].reduce((total, character) => total + characterWidth(character), 0);
+  if (totalCells <= maxCells) return value;
+  let output = "";
+  let cells = 0;
+  for (const character of value) {
+    const width = characterWidth(character);
+    if (cells + width > maxCells - 3) return `${output}...`;
+    output += character;
+    cells += width;
+  }
+  return output;
 }
 
-interface TerminalRecord {
+function formatLiveRecord(record: Record<string, unknown>, maxCells: number): string {
+  const feishu = record["feishu"] as Record<string, unknown>;
+  const content = feishu["content"] && typeof feishu["content"] === "object" ? feishu["content"] as Record<string, unknown> : null;
+  const level = LEVEL_NAMES[Number(record["level"])] ?? "LOG";
+  const details = ["phase", "status", "title", "decision", "safeSummary", "summary"]
+    .flatMap((key) => content?.[key] === undefined ? [] : [`${key}=${JSON.stringify(content[key])}`]);
+  const value = `${timestamp(record["time"])} ${level} ${String(feishu["messageId"])} [${String(feishu["kind"])}/${String(feishu["operation"])}]${details.length ? ` ${details.join(" ")}` : ""}`
+    .replaceAll(/\s+/gu, " ");
+  return `${truncateToCells(value, maxCells)}\n`;
+}
+
+interface LiveRecord {
   rendered: string;
-  lines: number;
-  liveKey?: string;
-  fingerprint?: string;
+  liveKey: string;
+  messageId: string;
+  fingerprint: string;
+  lifecycle: "active" | "settled";
+}
+
+interface RendererTrace {
+  at: number;
+  transition: string;
+  state: "idle" | "live-footer";
+  messageId?: string;
+  columns: number | null;
+  rows: number | null;
+  footerEntries: number;
+  footerLines: number;
+  clearedLines: number;
+  emittedBytes: number;
+  reason?: string;
 }
 
 class PrettyLogStream extends Writable {
   private buffered = "";
-  private readonly terminalRecords: TerminalRecord[] = [];
-  private readonly liveRecords = new Map<string, TerminalRecord>();
+  private readonly liveRecords = new Map<string, LiveRecord>();
+  private readonly recentFingerprints = new Map<string, string>();
+  private footerColumns: number | null | undefined;
 
-  constructor(private readonly target: LogTarget, private readonly color: boolean, private readonly liveStatus = false) { super(); }
+  constructor(
+    private readonly target: LogTarget,
+    private readonly color: boolean,
+    private readonly liveStatus = false,
+    private readonly terminalOutput?: DiagnosticLogWriter,
+    private readonly rendererTrace?: DiagnosticLogWriter,
+  ) { super(); }
 
   override _write(chunk: Buffer | string, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
     this.buffered += chunk.toString();
@@ -115,54 +141,83 @@ class PrettyLogStream extends Writable {
   }
 
   private writeLine(line: string): void {
+    let record: Record<string, unknown>;
     try {
-      const record = JSON.parse(line) as Record<string, unknown>;
-      const liveKey = this.liveKey(record);
-      if (this.liveStatus && liveKey) {
-        const fingerprint = this.liveFingerprint(record);
-        if (this.liveRecords.get(liveKey)?.fingerprint === fingerprint) return;
-        const rendered = wrapForTerminal(formatLogRecord(record, false), this.terminalWidth());
-        this.writeLiveRecord({ ...rendered, liveKey, fingerprint });
-        return;
-      }
-      this.writeTerminalRecord(formatLogRecord(record, this.color));
+      record = JSON.parse(line) as Record<string, unknown>;
     }
     catch {
-      this.writeTerminalRecord(`${line}\n`);
-    }
-  }
-
-  private writeLiveRecord(record: TerminalRecord & { liveKey: string; fingerprint: string }): void {
-    const previous = this.liveRecords.get(record.liveKey);
-    if (!previous) {
-      this.terminalRecords.push(record);
-      this.liveRecords.set(record.liveKey, record);
-      this.target.write(record.rendered);
+      this.writeTerminalRecord(`${line}\n`, Date.now());
       return;
     }
 
-    const previousIndex = this.terminalRecords.indexOf(previous);
-    if (previousIndex < 0) throw new Error(`Missing terminal record for ${record.liveKey}`);
-    const replay = this.terminalRecords.slice(previousIndex + 1);
-    const lines = previous.lines + replay.reduce((total, entry) => total + entry.lines, 0);
-    this.terminalRecords.splice(previousIndex, 1);
-    this.terminalRecords.push(record);
-    this.liveRecords.set(record.liveKey, record);
-    this.target.write(`${this.clearTerminalLines(lines)}${replay.map((entry) => entry.rendered).join("")}${record.rendered}`);
-    this.pruneTerminalHistory();
+    const liveEvent = this.liveEvent(record);
+    if (this.liveStatus && liveEvent) {
+      this.writeLiveRecord(record, liveEvent);
+      return;
+    }
+    this.writeTerminalRecord(formatLogRecord(record, this.color), this.recordTime(record));
   }
 
-  private writeTerminalRecord(content: string): void {
+  private writeLiveRecord(record: Record<string, unknown>, event: { liveKey: string; messageId: string; lifecycle: LiveRecord["lifecycle"] }): void {
+    const at = this.recordTime(record);
+    const fingerprint = this.liveFingerprint(record);
+    if (this.recentFingerprints.get(event.liveKey) === fingerprint) {
+      this.trace(at, "duplicate-skipped", event.messageId, 0, 0, "matching-fingerprint");
+      return;
+    }
+
+    if (!this.canClearFooter()) {
+      const abandoned = this.liveRecords.size;
+      this.liveRecords.clear();
+      const rendered = formatLiveRecord(record, this.terminalWidth());
+      if (event.lifecycle === "active") this.liveRecords.set(event.liveKey, { ...event, rendered, fingerprint });
+      this.rememberFingerprint(event.liveKey, fingerprint);
+      this.emitFrame(rendered, at, "footer-reset", event.messageId, 0, `footer-geometry-unreachable-with-${abandoned}-entries`);
+      return;
+    }
+
+    const clearedLines = this.liveRecords.size;
+    const committed = this.takeSettledExcept(event.liveKey);
+    this.liveRecords.delete(event.liveKey);
+    this.liveRecords.set(event.liveKey, {
+      ...event,
+      rendered: formatLiveRecord(record, this.terminalWidth()),
+      fingerprint,
+    });
+    this.rememberFingerprint(event.liveKey, fingerprint);
+
+    while (this.liveRecords.size >= this.terminalRows()) {
+      const oldestKey = this.liveRecords.keys().next().value as string | undefined;
+      if (!oldestKey) break;
+      committed.push(this.liveRecords.get(oldestKey)!.rendered);
+      this.liveRecords.delete(oldestKey);
+    }
+
+    const frame = `${this.clearTerminalLines(clearedLines)}${committed.join("")}${this.renderLiveRecords()}`;
+    const transition = event.lifecycle === "settled" ? "live-settled" : "live-updated";
+    this.emitFrame(frame, at, transition, event.messageId, clearedLines, committed.length ? "settled-or-overflow-committed" : undefined);
+  }
+
+  private writeTerminalRecord(content: string, at: number): void {
     if (!this.liveStatus || !this.liveRecords.size) {
-      this.target.write(content);
+      this.emitFrame(content, at, "ordinary", undefined, 0);
       return;
     }
-    const record = wrapForTerminal(content, this.terminalWidth());
-    this.terminalRecords.push(record);
-    this.target.write(record.rendered);
+
+    if (!this.canClearFooter()) {
+      const abandoned = this.liveRecords.size;
+      this.liveRecords.clear();
+      this.emitFrame(content, at, "footer-reset", undefined, 0, `footer-geometry-unreachable-with-${abandoned}-entries`);
+      return;
+    }
+
+    const clearedLines = this.liveRecords.size;
+    const settled = this.takeSettledExcept(null);
+    const frame = `${this.clearTerminalLines(clearedLines)}${settled.join("")}${content}${this.renderLiveRecords()}`;
+    this.emitFrame(frame, at, "ordinary-with-footer", undefined, clearedLines, settled.length ? "settled-committed" : undefined);
   }
 
-  private liveKey(record: Record<string, unknown>): string | null {
+  private liveEvent(record: Record<string, unknown>): { liveKey: string; messageId: string; lifecycle: LiveRecord["lifecycle"] } | null {
     if (record["msg"] !== "Feishu outbound message") return null;
     const feishu = record["feishu"];
     if (!feishu || typeof feishu !== "object") return null;
@@ -171,7 +226,8 @@ class PrettyLogStream extends Writable {
     const operation = String(value["operation"]);
     if (!LIVE_MESSAGE_KINDS.has(kind) || typeof value["messageId"] !== "string") return null;
     if (kind === "result" && operation !== "update") return null;
-    return `message:${value["messageId"]}`;
+    const lifecycle = kind === "result" || (kind === "approval" && operation !== "send") ? "settled" : "active";
+    return { liveKey: `message:${value["messageId"]}`, messageId: value["messageId"], lifecycle };
   }
 
   private liveFingerprint(record: Record<string, unknown>): string {
@@ -187,18 +243,137 @@ class PrettyLogStream extends Writable {
   }
 
   private clearTerminalLines(lines: number): string {
+    if (!lines) return "";
     return `\u001b[${lines}A${"\u001b[2K\u001b[1B".repeat(lines)}\u001b[${lines}A\r`;
   }
 
-  private pruneTerminalHistory(): void {
-    const firstLiveIndex = this.terminalRecords.findIndex((entry) => entry.liveKey !== undefined);
-    if (firstLiveIndex > 0) this.terminalRecords.splice(0, firstLiveIndex);
+  private takeSettledExcept(except: string | null): string[] {
+    const committed: string[] = [];
+    for (const [key, entry] of this.liveRecords) {
+      if (entry.lifecycle !== "settled" || key === except) continue;
+      committed.push(entry.rendered);
+      this.liveRecords.delete(key);
+    }
+    return committed;
+  }
+
+  private renderLiveRecords(): string {
+    return [...this.liveRecords.values()].map((entry) => entry.rendered).join("");
+  }
+
+  private canClearFooter(): boolean {
+    if (!this.liveRecords.size) return true;
+    return this.footerColumns === this.terminalColumns() && this.liveRecords.size < this.terminalRows();
+  }
+
+  private rememberFingerprint(key: string, fingerprint: string): void {
+    this.recentFingerprints.delete(key);
+    this.recentFingerprints.set(key, fingerprint);
+    if (this.recentFingerprints.size > 10_000) this.recentFingerprints.delete(this.recentFingerprints.keys().next().value!);
+  }
+
+  private emitFrame(frame: string, at: number, transition: string, messageId: string | undefined, clearedLines: number, reason?: string): void {
+    this.target.write(frame);
+    this.terminalOutput?.append(at, frame);
+    this.footerColumns = this.liveRecords.size ? this.terminalColumns() : undefined;
+    this.trace(at, transition, messageId, clearedLines, Buffer.byteLength(frame), reason);
+  }
+
+  private trace(at: number, transition: string, messageId: string | undefined, clearedLines: number, emittedBytes: number, reason?: string): void {
+    if (!this.rendererTrace) return;
+    const trace: RendererTrace = {
+      at,
+      transition,
+      state: this.liveRecords.size ? "live-footer" : "idle",
+      ...(messageId ? { messageId } : {}),
+      columns: this.terminalColumns(),
+      rows: this.terminalRowsValue(),
+      footerEntries: this.liveRecords.size,
+      footerLines: this.liveRecords.size,
+      clearedLines,
+      emittedBytes,
+      ...(reason ? { reason } : {}),
+    };
+    this.rendererTrace.append(at, `${JSON.stringify(trace)}\n`);
+  }
+
+  private recordTime(record: Record<string, unknown>): number {
+    return typeof record["time"] === "number" ? record["time"] : Date.now();
   }
 
   private terminalWidth(): number {
-    return typeof this.target.columns === "number" && Number.isFinite(this.target.columns) ? Math.max(4, Math.floor(this.target.columns) - 1) : 119;
+    return Math.max(4, (this.terminalColumns() ?? 120) - 1);
   }
 
+  private terminalColumns(): number | null {
+    return typeof this.target.columns === "number" && Number.isFinite(this.target.columns) ? Math.max(5, Math.floor(this.target.columns)) : null;
+  }
+
+  private terminalRowsValue(): number | null {
+    return typeof this.target.rows === "number" && Number.isFinite(this.target.rows) ? Math.max(2, Math.floor(this.target.rows)) : null;
+  }
+
+  private terminalRows(): number {
+    return this.terminalRowsValue() ?? Number.POSITIVE_INFINITY;
+  }
+
+}
+
+class DiagnosticLogWriter {
+  private activeDate: string | undefined;
+  private activeHour: string | undefined;
+  private activeChunk = 0;
+  private activePath: string | undefined;
+  private activeBytes = 0;
+
+  private static readonly MAX_CHUNK_BYTES = 10 * 1024 * 1024;
+
+  constructor(private readonly directory: string, private readonly kind: "terminal" | "renderer", private readonly extension: "ansi" | "jsonl") {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+  }
+
+  append(at: number, content: string): void {
+    const date = dateStamp(at);
+    const hour = hourStamp(at);
+    const bytes = Buffer.byteLength(content, "utf8");
+    if (date !== this.activeDate || hour !== this.activeHour) this.selectLatestChunk(date, hour);
+    if (this.activeBytes > 0 && this.activeBytes + bytes > DiagnosticLogWriter.MAX_CHUNK_BYTES) {
+      this.selectChunk(date, hour, this.activeChunk + 1, 0);
+    }
+    appendFileSync(this.activePath!, content, { encoding: "utf8", mode: 0o600 });
+    this.activeBytes += bytes;
+  }
+
+  private selectLatestChunk(date: string, hour: string): void {
+    const folder = path.join(this.directory, date);
+    mkdirSync(folder, { recursive: true, mode: 0o700 });
+    const prefix = `${hour}-${this.kind}-`;
+    const suffix = `.${this.extension}`;
+    const chunks = readdirSync(folder)
+      .filter((name) => name.startsWith(prefix) && name.endsWith(suffix))
+      .map((name) => Number(name.slice(prefix.length, -suffix.length)))
+      .filter((chunk) => Number.isSafeInteger(chunk) && chunk > 0)
+      .sort((left, right) => right - left);
+    const latest = chunks[0] ?? 0;
+    const latestPath = latest > 0 ? path.join(folder, this.chunkName(hour, latest)) : undefined;
+    const latestBytes = latestPath ? statSync(latestPath).size : 0;
+    if (latest > 0 && latestBytes < DiagnosticLogWriter.MAX_CHUNK_BYTES) this.selectChunk(date, hour, latest, latestBytes);
+    else this.selectChunk(date, hour, latest + 1, 0);
+  }
+
+  private selectChunk(date: string, hour: string, chunk: number, bytes: number): void {
+    const folder = path.join(this.directory, date);
+    mkdirSync(folder, { recursive: true, mode: 0o700 });
+    this.activeDate = date;
+    this.activeHour = hour;
+    this.activeChunk = chunk;
+    this.activePath = path.join(folder, this.chunkName(hour, chunk));
+    this.activeBytes = bytes;
+  }
+
+  private chunkName(hour: string, chunk: number): string {
+    return `${hour}-${this.kind}-${String(chunk).padStart(4, "0")}.${this.extension}`;
+  }
 }
 
 class DailyLogStream extends Writable {
@@ -324,7 +499,13 @@ async function directoryBytes(directory: string): Promise<number> {
 export function createLogger(level = "info", options: LoggerOptions = {}): Logger {
   const output = options.output ?? process.stdout;
   const useColor = options.color ?? (output === process.stdout && process.stdout.isTTY === true && process.env["NO_COLOR"] === undefined);
-  const streams: Array<StreamEntry<string>> = [{ level, stream: new PrettyLogStream(output, useColor, options.liveStatus ?? false) }];
+  const diagnostics = options.logDir && options.terminalDiagnostics
+    ? {
+        output: new DiagnosticLogWriter(options.logDir, "terminal", "ansi"),
+        trace: new DiagnosticLogWriter(options.logDir, "renderer", "jsonl"),
+      }
+    : undefined;
+  const streams: Array<StreamEntry<string>> = [{ level, stream: new PrettyLogStream(output, useColor, options.liveStatus ?? false, diagnostics?.output, diagnostics?.trace) }];
   if (options.logDir) streams.push({ level, stream: new DailyLogStream(options.logDir) });
   return pino({
     level,
