@@ -58,8 +58,42 @@ export function formatLogRecord(record: Record<string, unknown>, color = false, 
   return `${prefix} ${message}${fields.length ? `\n${fields.join("\n")}` : ""}\n`;
 }
 
-function characterWidth(character: string): number {
-  return character.codePointAt(0)! <= 0x7f ? 1 : 2;
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function isWideCodePoint(codePoint: number): boolean {
+  return (
+    (codePoint >= 0x1100 && codePoint <= 0x115f) ||
+    (codePoint >= 0x2329 && codePoint <= 0x232a) ||
+    (codePoint >= 0x2e80 && codePoint <= 0xa4cf) ||
+    (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+    (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+    (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+    (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
+    (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
+    (codePoint >= 0x1f300 && codePoint <= 0x1faff)
+  );
+}
+
+function isCombiningCodePoint(codePoint: number): boolean {
+  return (
+    (codePoint >= 0x300 && codePoint <= 0x36f) ||
+    (codePoint >= 0x1ab0 && codePoint <= 0x1aff) ||
+    (codePoint >= 0x1dc0 && codePoint <= 0x1dff) ||
+    (codePoint >= 0x20d0 && codePoint <= 0x20ff) ||
+    (codePoint >= 0xfe00 && codePoint <= 0xfe0f) ||
+    (codePoint >= 0x1f3fb && codePoint <= 0x1f3ff)
+  );
+}
+
+function graphemeWidth(grapheme: string): number {
+  let width = 0;
+  for (const character of grapheme) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint === 0x200d || isCombiningCodePoint(codePoint)) continue;
+    width = Math.max(width, isWideCodePoint(codePoint) ? 2 : 1);
+  }
+  return width;
 }
 
 function wrapForTerminal(value: string, maxCells: number): { rendered: string; lines: number } {
@@ -68,14 +102,14 @@ function wrapForTerminal(value: string, maxCells: number): { rendered: string; l
     const chunks: string[] = [];
     let chunk = "";
     let cells = 0;
-    for (const character of line) {
-      const width = characterWidth(character);
+    for (const { segment: grapheme } of graphemeSegmenter.segment(line)) {
+      const width = graphemeWidth(grapheme);
       if (chunk && cells + width > maxCells) {
         chunks.push(chunk);
         chunk = "";
         cells = 0;
       }
-      chunk += character;
+      chunk += grapheme;
       cells += width;
     }
     if (chunk) chunks.push(chunk);

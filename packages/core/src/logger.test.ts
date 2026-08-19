@@ -112,6 +112,28 @@ describe("daemon logger", () => {
     expect(terminal.writeCount()).toBe(2);
   });
 
+  it("keeps grapheme clusters together when wrapping a status log", () => {
+    const terminal = new TerminalScreen(40);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+    const summary = `${"x".repeat(104)}e\u0301`;
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: summary } } }, "Feishu outbound message");
+
+    const output = terminal.text();
+    expect(output).toContain("e\u0301");
+    expect(output).not.toContain("e\n\u0301");
+  });
+
+  it("uses terminal cell widths for non-ASCII status text", () => {
+    const terminal = new TerminalScreen(40);
+    const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
+    const summary = `${"x".repeat(104)}é`;
+
+    logger.info({ feishu: { kind: "status", operation: "send", messageId: "message-1", content: { phase: "working", safeSummary: summary } } }, "Feishu outbound message");
+
+    expect(terminal.text()).toContain("é");
+  });
+
   it("replaces a status entry after recent commands reach the retention limit", () => {
     const terminal = new TerminalScreen(120, 25);
     const logger = createLogger("info", { output: terminal, color: false, liveStatus: true });
