@@ -83,6 +83,8 @@ interface SessionRefreshResult {
 
 type DeliveryKind = "text" | "status" | "status.update" | "approval" | "approval.update" | "approval.remove" | "result" | "result.update" | "choices" | "question" | "question.update" | "output";
 const SESSION_DISCOVERY_INTERVAL_MS = 2_000;
+const IMPLEMENT_PLAN_PROMPT = "Implement the plan.";
+const FRESH_IMPLEMENT_PLAN_PROMPT = "A previous agent produced the plan below to accomplish the user's task. Implement the plan in a fresh context. Treat the plan as the source of user intent, re-read files as needed, and carry the work through implementation and verification.";
 
 const CODEX_BUILTIN_COMMANDS = [
   ["/init", "create an AGENTS.md scaffold"],
@@ -292,6 +294,7 @@ export class SessionCoordinator {
       case "project.select": await this.selectProject(record.requestId); break;
       case "session.select": await this.resumeStoredSession(record.requestId); break;
       case "instructions.select": await this.selectInstructionPreset(record.sessionId, record.requestId); break;
+      case "plan.select": await this.selectPostPlanAction(record, action.value); break;
       case "session.continue": await this.resumeStoredSession(record.sessionId); break;
       case "task.new": await this.promptForNewSession(null); break;
       case "sessions.more": await this.sendSessionChoices(Number(record.payload["page"] ?? 1), false); break;
@@ -421,9 +424,9 @@ export class SessionCoordinator {
     await this.messaging.sendText(acknowledgement);
   }
 
-  private async createSelectedSession(project: Project, prompt: string | null, announceEmpty = true): Promise<StoredSession> {
+  private async createSelectedSession(project: Project, prompt: string | null, announceEmpty = true, titleOverride?: string): Promise<StoredSession> {
     this.rememberProject(project.id);
-    const title = redact(prompt?.trim() || `New ${project.name} task`, this.redactions).slice(0, 120);
+    const title = redact(titleOverride?.trim() || prompt?.trim() || `New ${project.name} task`, this.redactions).slice(0, 120);
     const id = await this.driver.createSession(project, { title });
     const session = this.store.createSession({ id, projectId: project.id, title });
     this.selectedSession = session;
@@ -478,7 +481,7 @@ export class SessionCoordinator {
         this.appendReply(runtime, event.messageId ?? "default", event.delta); runtime.dirty = true; break;
       case "plan.completed":
         void this.commandLogs.append(runtime.turnId, "message", event.text).catch(() => undefined);
-        runtime.completedPlan = redact(event.text, this.redactions).slice(0, 1_500); runtime.safeSummary = runtime.completedPlan; runtime.dirty = true; break;
+        runtime.completedPlan = redact(event.text, this.redactions); runtime.safeSummary = runtime.completedPlan.slice(0, 1_500); runtime.dirty = true; break;
       case "command.started":
         void this.commandLogs.append(runtime.turnId, "command", `$ ${event.command}\n`).catch(() => undefined);
         runtime.recentCommands = [...runtime.recentCommands.slice(-4), event.command]; if (!runtime.pendingApprovals.size) runtime.phase = "working"; runtime.dirty = true; break;
@@ -678,7 +681,7 @@ export class SessionCoordinator {
     if (this.selectedSession?.id === runtime.session.id) this.selectedSession = { ...runtime.session, state: "completed", lastTurnId: runtime.turnId, updatedAt: Date.now() };
     this.runtimes.delete(runtime.session.id);
     if (status === "completed" && runtime.completedPlan !== null) {
-      await this.sendPostPlanChoices(runtime.session).catch((error) => {
+      await this.sendPostPlanChoices(runtime.session, runtime.turnId, runtime.completedPlan).catch((error) => {
         this.logger.warn({ sessionId: runtime.session.id, turnId: runtime.turnId, errorMessage: redact((error as Error).message, this.redactions).slice(0, 500) }, "Could not send post-plan mode choices");
       });
     }
@@ -700,7 +703,7 @@ export class SessionCoordinator {
   private async sendResult(runtime: RuntimeTurn, status: TurnResultView["status"]): Promise<void> {
     const expiresAt = Date.now() + 14 * 86_400_000;
     const view: TurnResultView = {
-      sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, status, summary: status === "failed" ? runtime.safeSummary : status === "completed" ? runtime.completedPlan ?? (this.latestReply(runtime) || runtime.safeSummary) : this.replySummary(runtime) || runtime.safeSummary, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary,
+      sessionId: runtime.session.id, turnId: runtime.turnId, title: runtime.session.title, projectName: runtime.project.name, status, summary: status === "failed" ? runtime.safeSummary : status === "completed" ? runtime.completedPlan?.slice(0, 1_500) ?? (this.latestReply(runtime) || runtime.safeSummary) : this.replySummary(runtime) || runtime.safeSummary, changedFileCount: runtime.changedFileCount, testSummary: runtime.testSummary,
       actionTokens: {
         diff: this.issue("diff.show", runtime.session.id, runtime.turnId, runtime.turnId, expiresAt, { page: 1 }),
         logs: this.issue("logs.show", runtime.session.id, runtime.turnId, runtime.turnId, expiresAt, { page: 1 }),
@@ -717,23 +720,70 @@ export class SessionCoordinator {
     }
   }
 
-  private async sendPostPlanChoices(session: StoredSession): Promise<void> {
+  private async sendPostPlanChoices(session: StoredSession, turnId: string, plan: string): Promise<void> {
     const presets = await this.driver.listInstructionPresets();
-    if (!presets.length) return;
-    const ordered = [...presets].sort((left, right) => Number(right.mode === "default") - Number(left.mode === "default"));
+    const defaultPreset = presets.find((preset) => preset.mode === "default");
+    const planPreset = presets.find((preset) => preset.mode === "plan");
+    if (!defaultPreset || !planPreset) return;
     const expiresAt = Date.now() + 15 * 60_000;
+    const token = this.issue("plan.select", session.id, turnId, turnId, expiresAt, { plan, defaultPresetId: defaultPreset.id, planPresetId: planPreset.id });
     const view: ChoiceView = {
       title: "Choose how Codex should proceed",
-      description: `The plan for ${session.title} is complete. Switch to Default mode to implement it, or choose another Codex mode to continue refining it. The choice applies to subsequent turns.`,
-      actionKind: "instructions.select",
-      choices: ordered.map((preset) => ({
-        label: preset.label,
-        description: [`Mode: ${preset.mode}`, ...(preset.model ? [`Model: ${preset.model}`] : []), ...(preset.reasoningEffort ? [`Reasoning: ${preset.reasoningEffort}`] : [])].join("\n"),
-        value: preset.id,
-        token: this.issue("instructions.select", session.id, session.lastTurnId ?? "none", preset.id, expiresAt, { source: "plan-complete" }),
-      })),
+      description: `The plan for ${session.title} is complete.`,
+      actionKind: "plan.select",
+      choices: [
+        { label: "Yes, implement this plan", description: "Switch to Default and start coding.", value: "implement", token },
+        { label: "Yes, clear context and implement", description: "Start a fresh Default-mode session with the approved plan.", value: "fresh", token },
+        { label: "No, stay in Plan mode", description: "Continue planning with the model.", value: "stay", token },
+      ],
     };
     await this.safeSend("choices", view, () => this.messaging.sendChoices(view));
+  }
+
+  private async selectPostPlanAction(record: InteractionRecord, choice?: string): Promise<void> {
+    const session = this.store.getSession(record.sessionId);
+    if (!session) { await this.messaging.sendText("That Codex session is no longer available."); return; }
+    const project = this.store.getProject(session.projectId);
+    if (!project) { await this.messaging.sendText("The session project is no longer registered."); return; }
+    if (this.runtimes.has(session.id)) { await this.messaging.sendText("That Codex session already has an active turn."); return; }
+    const defaultPresetId = typeof record.payload["defaultPresetId"] === "string" ? record.payload["defaultPresetId"] : null;
+    const planPresetId = typeof record.payload["planPresetId"] === "string" ? record.payload["planPresetId"] : null;
+    try {
+      switch (choice) {
+        case "stay": {
+          if (!planPresetId) throw new Error("Codex Plan mode is no longer available");
+          await this.driver.resumeSession(session.id, project, { managed: session.botCreated });
+          await this.driver.selectInstructionPreset(session.id, planPresetId);
+          this.selectedSession = session;
+          this.rememberProject(project.id);
+          const message = "Staying in Plan mode. Send any changes or questions to continue refining the plan.";
+          await this.safeSend("text", message, () => this.messaging.sendText(message));
+          return;
+        }
+        case "implement":
+          if (!defaultPresetId) throw new Error("Codex Default mode is no longer available");
+          await this.driver.resumeSession(session.id, project, { managed: session.botCreated });
+          await this.driver.selectInstructionPreset(session.id, defaultPresetId);
+          await this.startTurn(session, IMPLEMENT_PLAN_PROMPT);
+          return;
+        case "fresh": {
+          if (!defaultPresetId) throw new Error("Codex Default mode is no longer available");
+          const plan = typeof record.payload["plan"] === "string" ? record.payload["plan"].trim() : "";
+          if (!plan) throw new Error("The approved plan is no longer available");
+          const freshSession = await this.createSelectedSession(project, null, false, `Implement ${session.title}`);
+          await this.driver.selectInstructionPreset(freshSession.id, defaultPresetId);
+          await this.startTurn(freshSession, `${FRESH_IMPLEMENT_PLAN_PROMPT}\n\n${plan}`);
+          return;
+        }
+        default:
+          throw new Error("That post-plan choice is no longer available");
+      }
+    } catch (error) {
+      const errorMessage = redact((error as Error).message, this.redactions).slice(0, 500);
+      this.store.audit({ eventType: "plan.select.failed", summary: errorMessage, sessionId: session.id, turnId: record.turnId });
+      this.logger.warn({ sessionId: session.id, turnId: record.turnId, choice, errorMessage }, "Could not apply post-plan choice");
+      await this.safeSend("text", `Could not apply the post-plan choice: ${errorMessage}`, () => this.messaging.sendText(`Could not apply the post-plan choice: ${errorMessage}`));
+    }
   }
 
   private async sendProjectChoices(description?: string): Promise<void> {

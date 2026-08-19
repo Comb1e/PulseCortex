@@ -18,9 +18,14 @@ class FakeDriver implements AgentDriver {
   selectedInstructionPresets: Array<{ id: SessionId; presetId: string }> = [];
   discovered: AgentSessionInfo[] = [];
   resumeError: Error | null = null;
+  createdSessions: Array<{ id: SessionId; project: Project; options: SessionOptions }> = [];
   async start(): Promise<AgentCapabilities> { return { cliVersion: "0.147.0", protocolMajor: 2, userAgent: "fake", supportsSteer: true, supportsApprovals: true, supportsNamespaceTools: true }; }
   async stop(): Promise<void> {}
-  async createSession(_project: Project, _options: SessionOptions): Promise<SessionId> { return "session"; }
+  async createSession(project: Project, options: SessionOptions): Promise<SessionId> {
+    const id = this.createdSessions.length === 0 ? "session" : `session-${this.createdSessions.length + 1}`;
+    this.createdSessions.push({ id, project, options });
+    return id;
+  }
   async resumeSession(id: SessionId, project: Project, options: ResumeSessionOptions): Promise<void> { this.resumed.push({ id, project, options }); if (this.resumeError) throw this.resumeError; }
   async listSessions(_projects: Project[]): Promise<AgentSessionInfo[]> { return this.discovered; }
   async listInstructionPresets(): Promise<AgentInstructionPreset[]> { return this.instructionPresets; }
@@ -353,7 +358,7 @@ describe("session coordinator", () => {
     expect(messaging.results[0]?.summary).toBe("Final answer");
   });
 
-  it("asks which Codex mode to use after a plan completes", async () => {
+  it("offers the local Codex choices and implements the plan in the current session", async () => {
     const db = new ControllerStore(":memory:"); stores.push(db);
     const { code } = db.createPairingCode();
     const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
@@ -372,9 +377,62 @@ describe("session coordinator", () => {
     await vi.waitFor(() => expect(messaging.choices.some((view) => view.title === "Choose how Codex should proceed")).toBe(true));
     expect(messaging.results[0]?.summary).toBe("# Plan\n\n1. Make the change.");
     const choice = messaging.choices.find((view) => view.title === "Choose how Codex should proceed")!;
-    expect(choice.choices.map((item) => item.label)).toEqual(["Default", "Plan"]);
-    await messaging.action!({ eventId: "select-default", actor, kind: "instructions.select", token: choice.choices[0]!.token, receivedAt: Date.now() });
+    expect(choice.actionKind).toBe("plan.select");
+    expect(choice.choices.map((item) => item.label)).toEqual(["Yes, implement this plan", "Yes, clear context and implement", "No, stay in Plan mode"]);
+    expect(new Set(choice.choices.map((item) => item.token))).toHaveLength(1);
+    await messaging.action!({ eventId: "implement", actor, kind: "plan.select", token: choice.choices[0]!.token, value: choice.choices[0]!.value, receivedAt: Date.now() });
     expect(driver.selectedInstructionPresets).toContainEqual({ id: "session", presetId: "Default" });
+    expect(driver.started).toContainEqual({ id: "session", prompt: "Implement the plan." });
+  });
+
+  it("starts plan implementation in a fresh session with the approved plan", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "plan the work", receivedAt: Date.now() });
+    driver.emit({ type: "plan.completed", sessionId: "session", turnId: "turn", text: "# Plan\n\n1. Make the change.\n2. Run the tests.", occurredAt: Date.now() });
+    driver.emit({ type: "turn.completed", sessionId: "session", turnId: "turn", status: "completed", occurredAt: Date.now() });
+
+    await vi.waitFor(() => expect(messaging.choices.some((view) => view.title === "Choose how Codex should proceed")).toBe(true));
+    const choice = messaging.choices.find((view) => view.title === "Choose how Codex should proceed")!.choices[1]!;
+    await messaging.action!({ eventId: "fresh", actor, kind: "plan.select", token: choice.token, value: choice.value, receivedAt: Date.now() });
+
+    expect(driver.createdSessions[1]).toMatchObject({ id: "session-2", options: { title: "Implement plan the work" } });
+    expect(driver.selectedInstructionPresets).toContainEqual({ id: "session-2", presetId: "Default" });
+    expect(driver.started[1]).toMatchObject({ id: "session-2" });
+    expect(driver.started[1]!.prompt).toContain("Implement the plan in a fresh context.");
+    expect(driver.started[1]!.prompt).toContain("# Plan\n\n1. Make the change.\n2. Run the tests.");
+  });
+
+  it("keeps the completed session in Plan mode for refinement", async () => {
+    const db = new ControllerStore(":memory:"); stores.push(db);
+    const { code } = db.createPairingCode();
+    const actor = { tenantId: "tenant", userId: "owner", chatId: "chat", chatType: "p2p" as const };
+    db.consumePairingCode(code, actor); db.setOwnerChat(actor, actor.chatId);
+    db.addProject("repo", process.cwd());
+    const logs = new CommandLogStore(await mkdtemp(path.join(os.tmpdir(), "pulse-logs-")));
+    const driver = new FakeDriver(); const messaging = new FakeMessaging();
+    const coordinator = new SessionCoordinator(db, logs, driver, messaging, "x".repeat(32), { statusUpdateIntervalMs: 10_000, approvalTtlMs: 60_000 }, pino({ level: "silent" }));
+    coordinators.push(coordinator);
+
+    await messaging.command!({ eventId: "start", messageId: "start", actor, name: "text", args: [], text: "plan the work", receivedAt: Date.now() });
+    driver.emit({ type: "plan.completed", sessionId: "session", turnId: "turn", text: "# Plan\n\n1. Make the change.", occurredAt: Date.now() });
+    driver.emit({ type: "turn.completed", sessionId: "session", turnId: "turn", status: "completed", occurredAt: Date.now() });
+
+    await vi.waitFor(() => expect(messaging.choices.some((view) => view.title === "Choose how Codex should proceed")).toBe(true));
+    const choice = messaging.choices.find((view) => view.title === "Choose how Codex should proceed")!.choices[2]!;
+    await messaging.action!({ eventId: "stay", actor, kind: "plan.select", token: choice.token, value: choice.value, receivedAt: Date.now() });
+
+    expect(driver.selectedInstructionPresets).toContainEqual({ id: "session", presetId: "Plan" });
+    expect(driver.started).toHaveLength(1);
+    expect(messaging.texts.at(-1)).toContain("Staying in Plan mode");
   });
 
   it("opens logs for the result card's turn after the session advances", async () => {

@@ -173,6 +173,23 @@ describe("Feishu card rendering", () => {
     expect(json).toContain("signed");
   });
 
+  it("renders the three post-plan actions", () => {
+    const card = choiceCard({
+      title: "Choose how Codex should proceed",
+      actionKind: "plan.select",
+      choices: [
+        { label: "Yes, implement this plan", token: "shared", value: "implement" },
+        { label: "Yes, clear context and implement", token: "shared", value: "fresh" },
+        { label: "No, stay in Plan mode", token: "shared", value: "stay" },
+      ],
+    });
+    const json = JSON.stringify(card);
+    expect(json).toContain("plan.select");
+    expect(json).toContain("Yes, implement this plan");
+    expect(json).toContain("Yes, clear context and implement");
+    expect(json).toContain("No, stay in Plan mode");
+  });
+
   it("partitions each Codex reply in the status card", () => {
     const card = statusCard({ sessionId: "s", turnId: "t", title: "Task", projectName: "app", phase: "working", startedAt: 0, updatedAt: 10_000, safeSummary: "First reply\n\nSecond reply", replies: ["First reply", "Second reply"], recentCommands: [], actionTokens: { stop: "s", logs: "l", diff: "d" } });
     const json = JSON.stringify(card);

@@ -128,7 +128,7 @@ export interface TurnResultView {
 export interface ChoiceView {
   title: string;
   description?: string;
-  actionKind: "project.select" | "session.select" | "instructions.select";
+  actionKind: "project.select" | "session.select" | "instructions.select" | "plan.select";
   choices: Array<{ label: string; description?: string; token: string; value: string }>;
   previousToken?: string;
   nextToken?: string;
@@ -207,6 +207,7 @@ export type ChannelActionKind =
   | "project.select"
   | "session.select"
   | "instructions.select"
+  | "plan.select"
   | "input.answer";
 
 export interface ChannelAction {
