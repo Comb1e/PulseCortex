@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/domain",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Channel-neutral domain contracts and state rules for PulseCortex",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/Comb1e/PulseCortex.git", "directory": "packages/domain" },

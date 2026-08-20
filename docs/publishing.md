@@ -39,6 +39,11 @@ The command rewrites `workspace:*` dependencies in the tarballs and publishes
 packages in dependency order. Check the job log before retrying a partial
 release.
 
+Published npm versions cannot be overwritten. Rerunning a failed workflow
+retries the exact commit and tag that triggered it; after changing a package,
+commit the change, update every workspace version, and push a new tag (for
+example `v0.1.2`) to publish the new tarballs.
+
 To preview a release locally without changing the registry, run the validation
 and build steps, then inspect tarballs with `pnpm pack` from an individual
 package directory. Never use a personal password or a long-lived token in a

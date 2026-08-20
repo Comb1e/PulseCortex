@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/installer",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "User-level startup and shell integration installers for PulseCortex",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/Comb1e/PulseCortex.git", "directory": "packages/installer" },
