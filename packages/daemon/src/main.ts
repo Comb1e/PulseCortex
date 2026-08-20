@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { mkdir } from "node:fs/promises";
 import { loadConfig } from "@pulsecortex/config";
 import { CodexAppServerDriver } from "@pulsecortex/codex-driver";

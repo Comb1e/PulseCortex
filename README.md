@@ -36,8 +36,20 @@ registry token. For later upgrades, install matching CLI and daemon versions in
 the same command.
 
 The commands below use `pnpm pulsectl` for a source checkout. With the global
-npm installation, run the same commands as `pulsectl ...`. Use
-`pulsectl service install` to start the packaged daemon instead of `pnpm start`.
+npm installation, run the same commands as `pulsectl ...`. The daemon package
+also installs the `pulsecortex` command. Run it in a terminal after configuring
+Feishu credentials to start the daemon in the foreground:
+
+```bash
+pulsectl project add pulsecortex /absolute/path/to/project
+pulsectl pair
+pulsecortex
+```
+
+Keep that terminal open while using PulseCortex. To start it automatically in
+the background at user login, use `pulsectl service install` instead. For a
+one-off run without a global installation, use
+`npx --yes @pulsecortex/daemon@latest` after initializing the CLI configuration.
 
 ### Build from source on Windows
 
@@ -88,8 +100,9 @@ creates the secret environment file with mode `0600`.
 
    Keep these values out of `config.json`, SQLite, logs, command arguments, and
    this repository.
-5. In a separate terminal, start the daemon with `pnpm start` so Feishu can
-   detect its outbound WebSocket connection.
+5. In a separate terminal, start the daemon with `pulsecortex` when using the
+   npm installation, or `pnpm start` from a built source checkout, so Feishu
+   can detect its outbound WebSocket connection.
 6. Open **Events and Callbacks > Event Configuration**, select **Long
    Connection**, and subscribe to `im.message.receive_v1`.
 7. Open **Events and Callbacks > Callback Configuration**, select **Long

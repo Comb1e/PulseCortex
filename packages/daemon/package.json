@@ -10,6 +10,8 @@
   "publishConfig": { "access": "public" },
   "type": "module",
   "main": "dist/main.js",
+  "bin": { "pulsecortex": "dist/main.js" },
+  "scripts": { "start": "node dist/main.js" },
   "dependencies": {
     "@pulsecortex/codex-driver": "workspace:*",
     "@pulsecortex/config": "workspace:*",
