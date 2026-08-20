@@ -1,16 +1,28 @@
 {
   "name": "@pulsecortex/cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Local administration CLI and Codex shell integration for PulseCortex",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/Comb1e/PulseCortex.git", "directory": "packages/cli" },
-  "bugs": { "url": "https://github.com/Comb1e/PulseCortex/issues" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Comb1e/PulseCortex.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/Comb1e/PulseCortex/issues"
+  },
   "homepage": "https://github.com/Comb1e/PulseCortex#readme",
-  "files": ["dist"],
-  "publishConfig": { "access": "public" },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "dist/main.js",
-  "bin": { "pulsectl": "dist/main.js" },
+  "bin": {
+    "pulsectl": "dist/main.js"
+  },
   "dependencies": {
     "@pulsecortex/codex-driver": "workspace:*",
     "@pulsecortex/config": "workspace:*",

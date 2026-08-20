@@ -1,16 +1,35 @@
 {
   "name": "@pulsecortex/codex-driver",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Loopback Codex app-server WebSocket driver for PulseCortex",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/Comb1e/PulseCortex.git", "directory": "packages/codex-driver" },
-  "bugs": { "url": "https://github.com/Comb1e/PulseCortex/issues" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Comb1e/PulseCortex.git",
+    "directory": "packages/codex-driver"
+  },
+  "bugs": {
+    "url": "https://github.com/Comb1e/PulseCortex/issues"
+  },
   "homepage": "https://github.com/Comb1e/PulseCortex#readme",
-  "files": ["dist"],
-  "publishConfig": { "access": "public" },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "dependencies": { "@pulsecortex/domain": "workspace:*", "@pulsecortex/persistence": "workspace:*", "zod": "4.1.12" }
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@pulsecortex/domain": "workspace:*",
+    "@pulsecortex/persistence": "workspace:*",
+    "zod": "4.1.12"
+  }
 }
