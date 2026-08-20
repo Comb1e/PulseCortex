@@ -1,8 +1,7 @@
-# Publishing packages
+# Publishing Packages
 
-PulseCortex publishes the packages in `packages/*` to the public npm registry
-from GitHub Actions. The repository itself remains private in the package
-manager, so the root workspace is never published.
+GitHub Actions publishes the packages in `packages/*` to the public npm
+registry. The private root workspace is never published.
 
 ## One-time setup
 
@@ -15,8 +14,8 @@ manager, so the root workspace is never published.
    as an environment secret named `NPM_TOKEN`, and require a reviewer for that
    environment if releases need approval.
 
-The workflow uses npm provenance and the minimum GitHub permissions needed for
-the build and attestation. The token is only available to the publishing job.
+The workflow uses npm provenance and minimum GitHub permissions. The token is
+available only to the publishing job.
 
 ## Release a version
 
@@ -29,19 +28,16 @@ git tag -a v0.1.0 -m "Release v0.1.0"
 git push origin v0.1.0
 ```
 
-The `publish` workflow is intentionally triggered only by a pushed `v*` tag.
-It installs from the lockfile, checks that every version matches the tag, runs
-typecheck/tests/build, and then runs:
+The workflow runs only for a pushed `v*` tag. It checks that every package
+version matches the tag, runs typecheck/tests/build, and then runs:
 
 ```bash
 pnpm publish -r --access public --provenance --no-git-checks
 ```
 
-The command rewrites `workspace:*` dependencies to the released versions in
-the tarballs and publishes packages in dependency order. A failed or cancelled
-run can be retried from the Actions page; npm will skip packages that already
-exist at that exact version only when the publish command supports it, so check
-the job log before retrying a partially completed release.
+The command rewrites `workspace:*` dependencies in the tarballs and publishes
+packages in dependency order. Check the job log before retrying a partial
+release.
 
 To preview a release locally without changing the registry, run the validation
 and build steps, then inspect tarballs with `pnpm pack` from an individual
@@ -50,14 +46,15 @@ command argument or committed file.
 
 ## Install published packages
 
-Verify that the application packages are available from npm:
+Verify that the application packages are public:
 
 ```bash
 npm view @pulsecortex/cli version
 npm view @pulsecortex/daemon version
 ```
 
-Install the CLI and daemon globally at the same version:
+Install the CLI and daemon globally at the same version. See the
+[README quick start](../README.md#quick-start-from-npm) for setup:
 
 ```bash
 npm install --global @pulsecortex/cli@latest @pulsecortex/daemon@latest
@@ -65,24 +62,11 @@ pulsectl --help
 pulsectl init
 ```
 
-Both packages are required. `pulsectl` locates the daemon as an adjacent global
-package, and PulseCortex packages are released together with one shared version.
-Upgrade them together to avoid loading incompatible internal contracts:
+Both packages are required; `pulsectl` locates the daemon as an adjacent global
+package. Upgrade them together to avoid incompatible internal contracts:
 
 ```bash
 npm install --global @pulsecortex/cli@latest @pulsecortex/daemon@latest
-```
-
-After initialization, configure the generated environment file, then register
-a project and install the service:
-
-```bash
-pulsectl project add pulsecortex /absolute/path/to/PulseCortex
-pulsectl diagnose
-pulsectl pair
-pulsectl service install
-pulsectl service status
-pulsectl shell install
 ```
 
 Published library packages can be installed independently in another project:
