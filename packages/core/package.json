@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/core",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Authorization and session coordination for PulseCortex",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/Comb1e/PulseCortex.git", "directory": "packages/core" },

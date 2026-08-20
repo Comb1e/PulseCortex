@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/persistence",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "SQLite persistence, settings, audit, delivery, and logs for PulseCortex",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/Comb1e/PulseCortex.git", "directory": "packages/persistence" },

@@ -1,4 +1,4 @@
-export const SUPPORTED_CODEX_CLI_SERIES = "0.147";
+export const SUPPORTED_CODEX_CLI_SERIES = "0.148";
 export const SUPPORTED_PROTOCOL_MAJOR = 2;
 export const MAX_JSONL_LINE_BYTES = 10 * 1024 * 1024;
 
