@@ -1,53 +1,60 @@
-# PulseCortex Repository Guide
+# Repository Guidelines
 
-## Overview
+## Project Structure
 
-PulseCortex is a TypeScript/pnpm monorepo for a local Feishu-to-Codex daemon.
-The packages are layered from channel-neutral domain contracts through persistence,
-the Codex app-server driver, Feishu integration, coordination, daemon startup,
-CLI administration, and platform installers.
+PulseCortex is a TypeScript monorepo managed with pnpm. Runtime code lives under
+`packages/*/src` and is split by responsibility:
 
-## Development Commands
+- `domain`: shared contracts, paths, text helpers, and state machines
+- `config` and `persistence`: configuration, SQLite storage, migrations, audit, and logs
+- `codex-driver`: Codex app-server WebSocket transport and generated protocol types
+- `feishu-adapter`: Feishu SDK integration, payload normalization, and cards
+- `core`: authorization and session coordination
+- `daemon`, `cli`, and `installer`: process entry points, `pulsectl`, and platform setup
 
-- Install dependencies with `pnpm install`.
-- Run type checking with `pnpm typecheck`.
-- Run the test suite with `pnpm test`.
-- Build all packages with `pnpm build`.
-- Run the daemon from TypeScript with `pnpm dev`.
-- Use `pnpm pulsectl ...` for local CLI administration.
+Tests are colocated with implementation files as `*.test.ts`. Root configuration
+includes `package.json`, `pnpm-workspace.yaml`, `tsconfig*.json`, and
+`vitest.config.ts`; operational and security guidance is in `docs/`.
 
-Run focused Vitest tests while iterating, then run `pnpm typecheck`, `pnpm test`,
-and `pnpm build` for changes that cross package boundaries or affect runtime
-behavior.
+## Build, Test, and Development
 
-## Package Boundaries
+Run `pnpm install` first (Node `>=25.9.0`, pnpm `11.21.0`). Common commands:
 
-- `packages/domain`: normalized contracts, state rules, paths, and safe text
-- `packages/persistence`: SQLite migrations, settings, audit, delivery, and logs
-- `packages/codex-driver`: generated app-server protocol and WebSocket driver
-- `packages/feishu-adapter`: Feishu SDK transport, cards, and normalization
-- `packages/core`: authorization and session coordination
-- `packages/daemon`: supervised process entry point
-- `packages/cli`: `pulsectl` administration commands
-- `packages/installer`: user-level startup and shell integration
+- `pnpm typecheck` - check all project references without emitting files
+- `pnpm test` - run the Vitest suite once; use `pnpm test:watch` while iterating
+- `pnpm build` - compile all packages; `pnpm clean` removes build output
+- `pnpm dev` - run the daemon from TypeScript
+- `pnpm pulsectl ...` - run local administration commands
+- `pnpm protocol:generate` - regenerate Codex protocol files when required
 
-Keep adapter-specific payloads out of coordinator behavior and preserve the
-domain contracts between packages. Protocol files under
-`packages/codex-driver/src/generated` are generated artifacts; regenerate them
-only with the supported Codex CLI via `pnpm protocol:generate`.
+## Coding Style and Naming
 
-## Change Guidelines
+Use the existing TypeScript style: four-space indentation, semicolons, and
+double-quoted strings. Keep functions and variables `camelCase`, types and
+classes `PascalCase`, and constants `UPPER_SNAKE_CASE` only when truly constant.
+Prefer shared domain contracts over adapter-specific payloads and validate
+project paths through the existing allowlist/canonicalization APIs. Do not edit
+`packages/codex-driver/src/generated`; regenerate it with the supported command.
 
-- Use Git for code management and keep commits focused.
-- Preserve unrelated user changes in a dirty worktree.
-- Prefer existing package patterns and shared contracts over new abstractions.
-- Add or update focused tests for behavioral changes.
-- Keep secrets out of source, configuration committed to the repository, logs,
-  command arguments, and test fixtures.
-- Validate project paths through the existing allowlist and canonicalization APIs.
+## Testing Guidelines
 
-## Documentation
+Add a colocated `*.test.ts` for behavioral changes and keep tests deterministic.
+Run the focused Vitest file first, then `pnpm typecheck`, `pnpm test`, and
+`pnpm build` for cross-package or runtime changes. No separate coverage threshold
+is configured; meaningful regression coverage is expected.
 
-Consult `README.md`, `docs/architecture.md`, `docs/operations.md`, and
-`docs/security.md` for runtime, deployment, and security constraints before
-changing cross-package or externally visible behavior.
+## Commits and Pull Requests
+
+Recent history uses concise conventional prefixes such as `feat:`, `fix:`,
+`docs:`, and `chore:` (for example, `fix: support Codex CLI 0.148`). Keep each
+commit focused and written in the imperative mood. Pull requests should explain
+the behavior change, identify affected packages, link relevant issues, list
+validation commands and results, and call out configuration, migration, or
+security implications. Include screenshots or captured output when changing
+operator-facing CLI or Feishu cards.
+
+## Security and Configuration
+
+Never commit secrets or place them in source, arguments, logs, or fixtures.
+Review `docs/security.md` and `docs/operations.md` before changing externally
+visible behavior, persistence, or deployment paths.
