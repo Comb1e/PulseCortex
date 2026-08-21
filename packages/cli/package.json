@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/cli",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Local administration CLI and Codex shell integration for PulseCortex",
   "license": "MIT",
   "repository": {

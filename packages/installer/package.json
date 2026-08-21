@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/installer",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "User-level startup and shell integration installers for PulseCortex",
   "license": "MIT",
   "repository": {

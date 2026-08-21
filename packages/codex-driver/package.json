@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/codex-driver",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Loopback Codex app-server WebSocket driver for PulseCortex",
   "license": "MIT",
   "repository": {

@@ -1,6 +1,6 @@
 {
   "name": "@pulsecortex/daemon",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Supervised Feishu-to-Codex PulseCortex daemon",
   "license": "MIT",
   "repository": {
