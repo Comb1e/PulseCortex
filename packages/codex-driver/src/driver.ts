@@ -32,7 +32,10 @@ import type { ThreadStartResponse } from "./generated/v2/ThreadStartResponse";
 import type { ToolRequestUserInputParams } from "./generated/v2/ToolRequestUserInputParams";
 import type { TurnCompletedNotification } from "./generated/v2/TurnCompletedNotification";
 import type { TurnStartResponse } from "./generated/v2/TurnStartResponse";
-import { SUPPORTED_CODEX_CLI_SERIES, SUPPORTED_PROTOCOL_MAJOR, type JsonRpcNotification, type JsonRpcRequest } from "./protocol.js";
+import {
+  isSupportedCodexVersion, SUPPORTED_CODEX_CLI_REQUIREMENT, SUPPORTED_CODEX_CLI_SERIES, SUPPORTED_PROTOCOL_MAJOR,
+  type JsonRpcNotification, type JsonRpcRequest,
+} from "./protocol.js";
 import { JsonlRpcTransport, type TransportOptions } from "./transport.js";
 import { codexEnvironment, resolveCodexInvocation } from "./launcher.js";
 
@@ -78,7 +81,7 @@ export async function detectCodexVersion(executable?: string): Promise<{ version
   const invocation = resolveCodexInvocation(executable);
   const { stdout } = await execFileAsync(invocation.executable, [...invocation.prefixArgs, "--version"], { env: codexEnvironment(), windowsHide: true });
   const version = parseVersion(stdout);
-  return { version, compatible: version.startsWith(`${SUPPORTED_CODEX_CLI_SERIES}.`) || version === SUPPORTED_CODEX_CLI_SERIES };
+  return { version, compatible: isSupportedCodexVersion(version) };
 }
 
 function extractPaths(params: PermissionsRequestApprovalParams): string[] {
@@ -188,8 +191,12 @@ export class CodexAppServerDriver implements AgentDriver {
       const detected = await detectCodexVersion(this.options.executable);
       this.cliVersion = detected.version;
       const supported = this.options.supportedCliSeries ?? SUPPORTED_CODEX_CLI_SERIES;
-      if (!this.cliVersion.startsWith(`${supported}.`) && this.cliVersion !== supported) {
-        throw new Error(`Unsupported Codex CLI ${this.cliVersion}; PulseCortex protocol snapshot requires ${supported}.x`);
+      const compatible = this.options.supportedCliSeries
+        ? this.cliVersion.startsWith(`${supported}.`) || this.cliVersion === supported
+        : isSupportedCodexVersion(this.cliVersion);
+      if (!compatible) {
+        const requirement = this.options.supportedCliSeries ? `${supported}.x` : SUPPORTED_CODEX_CLI_REQUIREMENT;
+        throw new Error(`Unsupported Codex CLI ${this.cliVersion}; PulseCortex protocol snapshot requires ${requirement}`);
       }
     } else this.cliVersion = this.options.supportedCliSeries ?? `${SUPPORTED_CODEX_CLI_SERIES}.0`;
     try {

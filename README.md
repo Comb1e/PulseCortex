@@ -7,7 +7,7 @@ Codex uses a loopback-only app-server shared by Feishu and local terminals.
 ## Before You Start
 
 - Node.js 25.9.0 or newer
-- Codex CLI `0.148.x`, installed and authenticated
+- Codex CLI `0.147.x` or `0.148.x`, installed and authenticated
 - A Feishu enterprise self-built app with a bot
 - Outbound access to Feishu and your model provider
 

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { access, mkdir, stat, writeFile } from "node:fs/promises";
 import { Command } from "commander";
 import { loadConfig, defaultCodexAppServerUrl, defaultDataDir } from "@pulsecortex/config";
-import { codexEnvironment, detectCodexVersion, resolveCodexInvocation, SUPPORTED_CODEX_CLI_SERIES } from "@pulsecortex/codex-driver";
+import { codexEnvironment, detectCodexVersion, resolveCodexInvocation, SUPPORTED_CODEX_CLI_REQUIREMENT } from "@pulsecortex/codex-driver";
 import { canonicalProjectPath, isPathInside } from "@pulsecortex/domain";
 import { installCodexShell, installService, serviceArtifact, serviceStatus, uninstallCodexShell, uninstallService } from "@pulsecortex/installer";
 import { CommandLogStore, ControllerStore } from "@pulsecortex/persistence";
@@ -116,7 +116,7 @@ program.command("diagnose").description("Check Codex, database, pairing, project
   const childEnvironment = codexEnvironment();
   const codexHome = childEnvironment["CODEX_HOME"] ?? path.join(childEnvironment["HOME"] ?? os.homedir(), ".codex");
   const temporaryDirectory = childEnvironment["TEMP"] ?? childEnvironment["TMP"] ?? childEnvironment["TMPDIR"] ?? os.tmpdir();
-  try { const codex = await detectCodexVersion(config.codexExecutable); checks.push({ name: "Codex", ok: codex.compatible, detail: `${codex.version}${codex.compatible ? "" : ` (unsupported; requires ${SUPPORTED_CODEX_CLI_SERIES}.x)`}` }); }
+  try { const codex = await detectCodexVersion(config.codexExecutable); checks.push({ name: "Codex", ok: codex.compatible, detail: `${codex.version}${codex.compatible ? "" : ` (unsupported; requires ${SUPPORTED_CODEX_CLI_REQUIREMENT})`}` }); }
   catch (error) { checks.push({ name: "Codex", ok: false, detail: (error as Error).message }); }
   checks.push({ name: "Codex executable", ok: true, detail: [invocation.executable, ...invocation.prefixArgs].join(" ") });
   checks.push({ name: "Permission profile", ok: true, detail: config.codexPermissionProfile });

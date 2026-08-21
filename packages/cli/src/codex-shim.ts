@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "@pulsecortex/config";
-import { codexEnvironment, type CodexInvocation } from "@pulsecortex/codex-driver";
+import { codexEnvironment, resolveCodexInvocation, type CodexInvocation } from "@pulsecortex/codex-driver";
 
 const DIRECT_SUBCOMMANDS = new Set([
   "app", "app-server", "apply", "cloud", "completion", "debug", "doctor", "exec", "exec-server", "features",
@@ -58,7 +58,9 @@ function parseInvocation(value: unknown): CodexInvocation {
 async function run(): Promise<void> {
   const args = process.argv.slice(2);
   if (args[0] !== "--invocation-file" || !args[1] || args[2] !== "--") throw new Error("The PulseCortex Codex shim was invoked incorrectly");
-  const invocation = parseInvocation(JSON.parse(await readFile(args[1], "utf8")) as unknown);
+  const configured = parseInvocation(JSON.parse(await readFile(args[1], "utf8")) as unknown);
+  const resolved = resolveCodexInvocation(configured.executable, { excludedDirectories: [path.dirname(args[1])] });
+  const invocation = { executable: resolved.executable, prefixArgs: [...resolved.prefixArgs, ...configured.prefixArgs] };
   const forwarded = args.slice(3);
   const shouldRoute = shouldUsePulseCortex(forwarded);
   let routed = forwarded;
