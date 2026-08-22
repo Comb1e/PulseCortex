@@ -10,6 +10,13 @@ const fixture = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../t
 const project: Project = { id: "project", name: "test", canonicalPath: process.cwd(), createdAt: Date.now() };
 
 describe("Codex app-server contract", () => {
+  it("fails startup when required app-server capabilities have incompatible response shapes", async () => {
+    const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "invalid-capabilities"], verifyVersion: false });
+
+    await expect(driver.start()).rejects.toThrow("app-server failed compatibility checks");
+    await driver.stop();
+  });
+
   it("discovers controllable threads in registered project subdirectories", async () => {
     const driver = new CodexAppServerDriver({ executable: process.execPath, args: [fixture, "reject-redundant-resume"], verifyVersion: false });
     await driver.start();

@@ -33,7 +33,8 @@ import type { ToolRequestUserInputParams } from "./generated/v2/ToolRequestUserI
 import type { TurnCompletedNotification } from "./generated/v2/TurnCompletedNotification";
 import type { TurnStartResponse } from "./generated/v2/TurnStartResponse";
 import {
-  isSupportedCodexVersion, SUPPORTED_CODEX_CLI_REQUIREMENT, SUPPORTED_CODEX_CLI_SERIES, SUPPORTED_PROTOCOL_MAJOR,
+  CODEX_PROTOCOL_SNAPSHOT_SERIES, isCodexVersionNewerThanSnapshot, isSupportedCodexVersion,
+  SUPPORTED_CODEX_CLI_REQUIREMENT, SUPPORTED_CODEX_CLI_SERIES, SUPPORTED_PROTOCOL_MAJOR,
   type JsonRpcNotification, type JsonRpcRequest,
 } from "./protocol.js";
 import { JsonlRpcTransport, type TransportOptions } from "./transport.js";
@@ -77,11 +78,37 @@ function parseVersion(output: string): string {
   return match[1];
 }
 
-export async function detectCodexVersion(executable?: string): Promise<{ version: string; compatible: boolean }> {
+export async function detectCodexVersion(executable?: string): Promise<{ version: string; compatible: boolean; newerThanSnapshot: boolean }> {
   const invocation = resolveCodexInvocation(executable);
   const { stdout } = await execFileAsync(invocation.executable, [...invocation.prefixArgs, "--version"], { env: codexEnvironment(), windowsHide: true });
   const version = parseVersion(stdout);
-  return { version, compatible: isSupportedCodexVersion(version) };
+  return { version, compatible: isSupportedCodexVersion(version), newerThanSnapshot: isCodexVersionNewerThanSnapshot(version) };
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function validateInitializeResponse(value: unknown): asserts value is InitializeResponse {
+  const response = record(value);
+  if (!response || typeof response["userAgent"] !== "string" || typeof response["codexHome"] !== "string") {
+    throw new Error("initialize returned an invalid response");
+  }
+}
+
+function validateProviderCapabilities(value: unknown): asserts value is ModelProviderCapabilitiesReadResponse {
+  const response = record(value);
+  if (!response || typeof response["namespaceTools"] !== "boolean") {
+    throw new Error("modelProvider/capabilities/read returned an invalid response");
+  }
+}
+
+function validatePage(method: string, value: unknown, itemType: "string" | "object"): void {
+  const response = record(value);
+  if (!response || !Array.isArray(response["data"]) || !response["data"].every((item) => typeof item === itemType && item !== null)
+    || !(response["nextCursor"] === null || typeof response["nextCursor"] === "string")) {
+    throw new Error(`${method} returned an invalid response`);
+  }
 }
 
 function extractPaths(params: PermissionsRequestApprovalParams): string[] {
@@ -201,14 +228,34 @@ export class CodexAppServerDriver implements AgentDriver {
     } else this.cliVersion = this.options.supportedCliSeries ?? `${SUPPORTED_CODEX_CLI_SERIES}.0`;
     try {
       await this.transport.start();
-      const initialized = await this.transport.request<InitializeResponse>("initialize", {
-        clientInfo: { name: "pulsecortex", title: "PulseCortex", version: "0.1.0" },
-        capabilities: { experimentalApi: true, requestAttestation: false },
-      });
-      this.transport.notify("initialized");
+      let initialized: unknown;
+      let providerCapabilities: unknown;
+      try {
+        initialized = await this.transport.request<unknown>("initialize", {
+          clientInfo: { name: "pulsecortex", title: "PulseCortex", version: "0.1.0" },
+          capabilities: { experimentalApi: true, requestAttestation: false },
+        });
+        validateInitializeResponse(initialized);
+        this.transport.notify("initialized");
+        providerCapabilities = await this.transport.request<unknown>("modelProvider/capabilities/read", {});
+        validateProviderCapabilities(providerCapabilities);
+        const loaded = await this.transport.request<unknown>("thread/loaded/list", { cursor: null, limit: 1 });
+        validatePage("thread/loaded/list", loaded, "string");
+        const listed = await this.transport.request<unknown>("thread/list", {
+          cursor: null, limit: 1, sortKey: "updated_at", sortDirection: "desc",
+          sourceKinds: ["cli", "vscode", "appServer"], archived: false, useStateDbOnly: true,
+        });
+        validatePage("thread/list", listed, "object");
+      } catch (error) {
+        throw new Error(`Codex CLI ${this.cliVersion} app-server failed compatibility checks: ${(error as Error).message}`, { cause: error });
+      }
       this.codexHome = initialized.codexHome;
-      const providerCapabilities = await this.transport.request<ModelProviderCapabilitiesReadResponse>("modelProvider/capabilities/read", {});
       this.started = true;
+      if (!this.options.supportedCliSeries && isCodexVersionNewerThanSnapshot(this.cliVersion)) {
+        this.reportDiagnostic("warn", "Codex CLI is newer than the PulseCortex protocol snapshot; required app-server compatibility checks passed", undefined, {
+          cliVersion: this.cliVersion, protocolSnapshot: `${CODEX_PROTOCOL_SNAPSHOT_SERIES}.x`,
+        });
+      }
       this.reportDiagnostic(providerCapabilities.namespaceTools ? "info" : "warn", providerCapabilities.namespaceTools
         ? "Codex model provider reports namespace-tool support"
         : "Codex model provider does not support namespace tools; PulseCortex-managed sessions use single-agent tools", undefined, providerCapabilities);

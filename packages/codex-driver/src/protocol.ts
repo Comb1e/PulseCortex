@@ -1,6 +1,7 @@
 export const MINIMUM_SUPPORTED_CODEX_CLI_SERIES = "0.147";
-export const SUPPORTED_CODEX_CLI_SERIES = "0.148";
-export const SUPPORTED_CODEX_CLI_REQUIREMENT = `${MINIMUM_SUPPORTED_CODEX_CLI_SERIES}.x through ${SUPPORTED_CODEX_CLI_SERIES}.x`;
+export const CODEX_PROTOCOL_SNAPSHOT_SERIES = "0.148";
+export const SUPPORTED_CODEX_CLI_SERIES = CODEX_PROTOCOL_SNAPSHOT_SERIES;
+export const SUPPORTED_CODEX_CLI_REQUIREMENT = `${MINIMUM_SUPPORTED_CODEX_CLI_SERIES}.x or newer`;
 export const SUPPORTED_PROTOCOL_MAJOR = 2;
 export const MAX_JSONL_LINE_BYTES = 10 * 1024 * 1024;
 
@@ -17,8 +18,13 @@ function compareSeries(left: [number, number], right: [number, number]): number 
 export function isSupportedCodexVersion(version: string): boolean {
   const series = parseSeries(version);
   const minimum = parseSeries(MINIMUM_SUPPORTED_CODEX_CLI_SERIES)!;
-  const maximum = parseSeries(SUPPORTED_CODEX_CLI_SERIES)!;
-  return series !== null && compareSeries(series, minimum) >= 0 && compareSeries(series, maximum) <= 0;
+  return series !== null && compareSeries(series, minimum) >= 0;
+}
+
+export function isCodexVersionNewerThanSnapshot(version: string): boolean {
+  const series = parseSeries(version);
+  const snapshot = parseSeries(CODEX_PROTOCOL_SNAPSHOT_SERIES)!;
+  return series !== null && compareSeries(series, snapshot) > 0;
 }
 
 export interface JsonRpcRequest {

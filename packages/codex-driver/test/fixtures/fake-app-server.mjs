@@ -24,7 +24,7 @@ lines.on("line", (line) => {
       send({ method: "warning", params: { threadId: null, message: "fake app-server warning" } });
     }
   } else if (message.method === "modelProvider/capabilities/read") {
-    send({ id: message.id, result: { namespaceTools: scenario !== "no-namespace-tools", imageGeneration: true, webSearch: true } });
+    send({ id: message.id, result: scenario === "invalid-capabilities" ? { namespaceTools: "yes" } : { namespaceTools: scenario !== "no-namespace-tools", imageGeneration: true, webSearch: true } });
   } else if (message.method === "thread/start") {
     if (message.params.permissions !== ":workspace"
       || message.params.sandbox !== undefined

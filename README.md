@@ -7,7 +7,7 @@ Codex uses a loopback-only app-server shared by Feishu and local terminals.
 ## Before You Start
 
 - Node.js 25.9.0 or newer
-- Codex CLI `0.147.x` or `0.148.x`, installed and authenticated
+- Codex CLI `0.147.x` or newer, installed and authenticated
 - A Feishu enterprise self-built app with a bot
 - Outbound access to Feishu and your model provider
 
@@ -138,6 +138,10 @@ Regenerate the app-server protocol only with the supported Codex CLI:
 ```bash
 pnpm protocol:generate
 ```
+
+Runtime accepts newer Codex releases after read-only app-server compatibility
+checks. Protocol generation remains pinned to the snapshot series in
+`packages/codex-driver/src/protocol.ts`.
 
 See the [architecture](docs/architecture.md), [operations](docs/operations.md),
 [security](docs/security.md), and [publishing](docs/publishing.md) guides for
